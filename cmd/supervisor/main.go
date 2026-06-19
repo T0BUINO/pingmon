@@ -1410,6 +1410,7 @@ const dashboardHTML = `<!doctype html>
         updateLiveState('实时', false);
       };
       ws.onmessage = event => {
+        if (event.data === 'connected') return;
         if (event.data === 'refresh') {
           refreshDashboard().catch(handleRefreshError);
           return;
