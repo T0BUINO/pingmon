@@ -1,0 +1,30 @@
+listen = ":8080"
+storage = "sqlite"
+data_file = "data/results.jsonl"
+sqlite_path = "data/pingmon.db"
+dashboard_user = "admin"
+dashboard_password = "change-me"
+dashboard_ranges = ["12h", "24h", "3d", "7d", "14d", "30d", "60d"]
+default_range = "24h"
+retention_days = 365
+failure_threshold = 3
+task_interval_seconds = 30
+
+[params]
+count = 3
+interval_millis = 1000
+timeout_millis = 2000
+enable_ipv6 = true
+schedule_seconds = 30
+
+[[targets]]
+name = "local-ssh"
+address = "127.0.0.1"
+port = 22
+labels = ["local", "ssh"]
+
+[[targets]]
+name = "cloudflare-dns"
+address = "1.1.1.1"
+port = 53
+labels = ["dns", "public"]
