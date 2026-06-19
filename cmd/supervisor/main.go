@@ -494,7 +494,8 @@ const dashboardHTML = `<!doctype html>
     .metric strong { display: block; margin-top: 3px; font-size: 15px; overflow-wrap: anywhere; }
     .mini-chart { height: 86px; }
     .detail-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-    .chart-wrap { height: 390px; }
+    .chart-scroll { width: 100%; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }
+    .chart-wrap { position: relative; height: 390px; min-width: 720px; }
     .toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 12px; }
     .toolbar label { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; background: #fbfcfe; font-size: 13px; line-height: 1.2; }
     .toolbar input[type="checkbox"] { width: 14px; height: 14px; margin: 0; padding: 0; }
@@ -525,8 +526,13 @@ const dashboardHTML = `<!doctype html>
     @media (max-width: 760px) {
       main { padding: 16px; }
       header { align-items: flex-start; flex-direction: column; }
+      .page-actions { width: 100%; overflow-x: auto; }
       .cards { grid-template-columns: 1fr; }
       .detail-grid { grid-template-columns: repeat(2, 1fr); }
+      .toolbar { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch; }
+      .toolbar label { flex: 0 0 auto; max-width: 240px; }
+      .chart-scroll { margin: 0 -16px; padding: 0 16px; }
+      .chart-wrap { height: 340px; min-width: 680px; }
       .table-scroll { -webkit-overflow-scrolling: touch; }
     }
   </style>
@@ -560,7 +566,7 @@ const dashboardHTML = `<!doctype html>
         <h2>目标延迟</h2>
         <div class="toolbar" id="labelFilters"></div>
         <div class="toolbar" id="targetToggles"></div>
-        <div class="chart-wrap"><canvas id="latency"></canvas></div>
+        <div class="chart-scroll"><div class="chart-wrap"><canvas id="latency"></canvas></div></div>
       </section>
       <section class="panel">
         <h2>告警日志</h2>
@@ -698,7 +704,9 @@ const dashboardHTML = `<!doctype html>
           borderColor: colors[index % colors.length],
           backgroundColor: colors[index % colors.length],
           tension: 0,
-          pointRadius: compacted.length > 300 ? 0 : 2,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          pointHitRadius: 10,
           borderWidth: 2,
           spanGaps: false
         };
