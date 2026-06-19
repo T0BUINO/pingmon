@@ -527,12 +527,13 @@ const dashboardHTML = `<!doctype html>
     .chart-wrap { position: relative; height: 390px; width: 100%; touch-action: pan-y; }
     .chart-wrap canvas { cursor: grab; }
     .chart-wrap canvas.dragging { cursor: grabbing; }
-    .chart-tooltip { position: fixed; z-index: 1000; max-width: min(560px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 24px)); overflow: auto; pointer-events: none; border-radius: 6px; padding: 9px 10px; background: rgba(24, 24, 27, .92); color: #fff; font-size: 13px; line-height: 1.35; box-shadow: 0 16px 40px rgba(15, 23, 42, .24); opacity: 0; transform: translate3d(0, 0, 0); }
+    .chart-tooltip { position: fixed; z-index: 1000; max-width: min(560px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 24px)); overflow: hidden; pointer-events: none; border-radius: 6px; padding: 9px 10px; background: rgba(24, 24, 27, .92); color: #fff; font-size: 13px; line-height: 1.35; box-shadow: 0 16px 40px rgba(15, 23, 42, .24); opacity: 0; transform: translate3d(0, 0, 0); transition: opacity .12s ease; }
     .chart-tooltip-title { margin-bottom: 6px; font-weight: 700; white-space: nowrap; }
     .chart-tooltip-row { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 6px; white-space: nowrap; }
     .chart-tooltip-swatch { width: 10px; height: 10px; border-radius: 2px; }
     .chart-tooltip-name { overflow: hidden; text-overflow: ellipsis; }
     .chart-tooltip-value { font-variant-numeric: tabular-nums; }
+    .chart-tooltip-more { margin-top: 4px; color: #cbd5e1; font-size: 12px; }
     .toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 12px; }
     .toolbar label { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; background: #fbfcfe; font-size: 13px; line-height: 1.2; }
     .toolbar input[type="checkbox"] { width: 14px; height: 14px; margin: 0; padding: 0; }
@@ -540,10 +541,10 @@ const dashboardHTML = `<!doctype html>
     .live-badge::before { content: ""; width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
     .live-badge.reconnecting { border-color: #fed7aa; background: #fff7ed; color: #9a3412; }
     input { height: 34px; border: 1px solid transparent; border-radius: 6px; padding: 0 11px; background: #f8fafc; color: var(--ink); font-size: 14px; line-height: 34px; }
-    .range-menu { position: relative; }
+    .range-menu { position: relative; flex: 0 0 auto; }
     .range-button { min-width: 78px; justify-content: space-between; gap: 10px; }
     .range-button::after { content: ""; width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid #475569; }
-    .range-options { position: absolute; top: calc(100% + 6px); left: 0; z-index: 20; display: none; min-width: 96px; padding: 4px; border: 1px solid var(--border); border-radius: 8px; background: #fff; box-shadow: 0 12px 26px rgba(15, 23, 42, .14); }
+    .range-options { position: absolute; top: calc(100% + 6px); left: 0; z-index: 1200; display: none; min-width: 96px; padding: 4px; border: 1px solid var(--border); border-radius: 8px; background: #fff; box-shadow: 0 12px 26px rgba(15, 23, 42, .14); }
     .range-menu.open .range-options { display: block; }
     .range-option { display: block; width: 100%; height: 30px; padding: 0 10px; border: 0; background: transparent; text-align: left; border-radius: 6px; }
     .range-option:hover, .range-option.active { background: #eef2f7; }
@@ -563,13 +564,19 @@ const dashboardHTML = `<!doctype html>
     @media (max-width: 760px) {
       main { padding: 16px; }
       header { align-items: flex-start; flex-direction: column; }
-      .page-actions { width: 100%; overflow-x: auto; }
+      .page-actions { width: 100%; overflow: visible; }
       .cards { grid-template-columns: 1fr; }
       .detail-grid { grid-template-columns: repeat(2, 1fr); }
       .toolbar { flex-wrap: wrap; overflow: visible; padding-bottom: 0; }
       .toolbar label { max-width: 100%; }
       .chart-tools { justify-content: flex-start; }
       .chart-wrap { height: 340px; }
+      .chart-tooltip { max-width: min(320px, calc(100vw - 20px)); max-height: min(260px, calc(100vh - 20px)); padding: 7px 8px; font-size: 12px; }
+      .chart-tooltip-title { margin-bottom: 4px; }
+      .chart-tooltip-row { gap: 5px; }
+      .page-actions .range-menu { width: auto; }
+      .range-options { left: 0; right: auto; min-width: 100%; width: max-content; max-width: calc(100vw - 32px); }
+      .range-option { min-width: 72px; }
       .table-scroll { -webkit-overflow-scrolling: touch; }
     }
   </style>
@@ -872,6 +879,14 @@ const dashboardHTML = `<!doctype html>
       document.body.appendChild(tooltip);
       return tooltip;
     }
+    function hideChartTooltip(chart) {
+      const tooltip = document.getElementById('chartTooltip');
+      if (tooltip) tooltip.style.opacity = '0';
+      if (chart && chart.tooltip) {
+        chart.tooltip.setActiveElements([], {x: 0, y: 0});
+        chart.update('none');
+      }
+    }
     function externalTooltip(context) {
       const tooltipModel = context.tooltip;
       const tooltip = chartTooltip();
@@ -884,7 +899,9 @@ const dashboardHTML = `<!doctype html>
       title.className = 'chart-tooltip-title';
       title.textContent = tooltipModel.dataPoints.length ? new Date(tooltipModel.dataPoints[0].parsed.x).toLocaleString() : '';
       tooltip.appendChild(title);
-      tooltipModel.dataPoints.forEach(item => {
+      const compactTooltip = window.matchMedia('(max-width: 760px), (pointer: coarse)').matches;
+      const maxItems = compactTooltip ? 8 : 18;
+      tooltipModel.dataPoints.slice(0, maxItems).forEach(item => {
         const row = document.createElement('div');
         row.className = 'chart-tooltip-row';
         const swatch = document.createElement('span');
@@ -899,6 +916,13 @@ const dashboardHTML = `<!doctype html>
         row.append(swatch, name, value);
         tooltip.appendChild(row);
       });
+      const hiddenCount = tooltipModel.dataPoints.length - maxItems;
+      if (hiddenCount > 0) {
+        const more = document.createElement('div');
+        more.className = 'chart-tooltip-more';
+        more.textContent = '还有 ' + hiddenCount + ' 项';
+        tooltip.appendChild(more);
+      }
       tooltip.style.opacity = '1';
       tooltip.style.left = '0px';
       tooltip.style.top = '0px';
@@ -918,6 +942,7 @@ const dashboardHTML = `<!doctype html>
     function attachChartZoomHandlers(chart) {
       const canvas = chart.canvas;
       canvas.addEventListener('touchstart', event => {
+        hideChartTooltip(chart);
         if (event.touches.length === 1 && chartViewRange) {
           panStart = {
             x: event.touches[0].clientX,
@@ -962,9 +987,16 @@ const dashboardHTML = `<!doctype html>
       canvas.addEventListener('touchend', event => {
         if (event.touches.length < 2) pinchStart = null;
         if (event.touches.length === 0) panStart = null;
+        hideChartTooltip(chart);
+      });
+      canvas.addEventListener('touchcancel', () => {
+        panStart = null;
+        pinchStart = null;
+        hideChartTooltip(chart);
       });
       canvas.addEventListener('wheel', event => {
         if (!event.ctrlKey && !event.metaKey) return;
+        hideChartTooltip(chart);
         event.preventDefault();
         zoomDetailChart(event.deltaY < 0 ? 0.75 : 1.35, chartValueAtClientX(chart, event.clientX));
       }, {passive: false});
@@ -989,8 +1021,11 @@ const dashboardHTML = `<!doctype html>
       });
       window.addEventListener('blur', () => {
         panStart = null;
+        pinchStart = null;
         canvas.classList.remove('dragging');
+        hideChartTooltip(chart);
       });
+      window.addEventListener('scroll', () => hideChartTooltip(chart), {passive: true});
     }
     function summarizeAgent(rows) {
       const latest = rows[rows.length - 1];
@@ -1063,7 +1098,7 @@ const dashboardHTML = `<!doctype html>
                 mode: 'x',
                 intersect: false,
                 external: externalTooltip,
-                itemSort: (a, b) => a.dataset.label.localeCompare(b.dataset.label),
+                itemSort: (a, b) => b.parsed.y - a.parsed.y || a.dataset.label.localeCompare(b.dataset.label),
               }
             }
           }
@@ -1177,7 +1212,7 @@ const dashboardHTML = `<!doctype html>
               mode: 'x',
               intersect: false,
               external: externalTooltip,
-              itemSort: (a, b) => a.dataset.label.localeCompare(b.dataset.label),
+              itemSort: (a, b) => b.parsed.y - a.parsed.y || a.dataset.label.localeCompare(b.dataset.label),
             }
           }
         }
@@ -1264,6 +1299,7 @@ const dashboardHTML = `<!doctype html>
         rangeButton.textContent = selectedRange;
         document.querySelectorAll('.range-option').forEach(item => item.classList.toggle('active', item === option));
         rangeMenu.classList.remove('open');
+        hideChartTooltip(detailChart);
         chartViewRange = null;
         const url = new URL(location.href);
         url.searchParams.set('range', selectedRange);
@@ -1273,6 +1309,16 @@ const dashboardHTML = `<!doctype html>
     });
     document.addEventListener('click', event => {
       if (!rangeMenu.contains(event.target)) rangeMenu.classList.remove('open');
+      const chartTooltip = document.getElementById('chartTooltip');
+      if (chartTooltip && !event.target.closest('canvas')) hideChartTooltip(detailChart);
+    });
+    document.addEventListener('touchstart', event => {
+      if (!rangeMenu.contains(event.target)) rangeMenu.classList.remove('open');
+      if (!event.target.closest('canvas')) hideChartTooltip(detailChart);
+    }, {passive: true});
+    window.addEventListener('resize', () => {
+      rangeMenu.classList.remove('open');
+      hideChartTooltip(detailChart);
     });
     refreshDashboard().catch(handleRefreshError);
     function connectLiveRefresh() {
