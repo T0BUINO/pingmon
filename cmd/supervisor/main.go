@@ -525,6 +525,14 @@ const dashboardHTML = `<!doctype html>
     .chart-tools button { width: 34px; padding: 0; font-size: 18px; font-weight: 600; }
     .chart-tools button:disabled { color: #94a3b8; cursor: not-allowed; }
     .chart-wrap { position: relative; height: 390px; width: 100%; touch-action: pan-y; }
+    .chart-wrap canvas { cursor: grab; }
+    .chart-wrap canvas.dragging { cursor: grabbing; }
+    .chart-tooltip { position: fixed; z-index: 1000; max-width: min(560px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 24px)); overflow: auto; pointer-events: none; border-radius: 6px; padding: 9px 10px; background: rgba(24, 24, 27, .92); color: #fff; font-size: 13px; line-height: 1.35; box-shadow: 0 16px 40px rgba(15, 23, 42, .24); opacity: 0; transform: translate3d(0, 0, 0); }
+    .chart-tooltip-title { margin-bottom: 6px; font-weight: 700; white-space: nowrap; }
+    .chart-tooltip-row { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 6px; white-space: nowrap; }
+    .chart-tooltip-swatch { width: 10px; height: 10px; border-radius: 2px; }
+    .chart-tooltip-name { overflow: hidden; text-overflow: ellipsis; }
+    .chart-tooltip-value { font-variant-numeric: tabular-nums; }
     .toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 12px; }
     .toolbar label { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; background: #fbfcfe; font-size: 13px; line-height: 1.2; }
     .toolbar input[type="checkbox"] { width: 14px; height: 14px; margin: 0; padding: 0; }
@@ -741,7 +749,8 @@ const dashboardHTML = `<!doctype html>
           data: compacted,
           borderColor: colors[index % colors.length],
           backgroundColor: colors[index % colors.length],
-          tension: 0,
+          tension: 0.18,
+          cubicInterpolationMode: 'monotone',
           pointRadius: 0,
           pointHoverRadius: 4,
           pointHitRadius: 10,
@@ -843,6 +852,69 @@ const dashboardHTML = `<!doctype html>
       const scale = chart.scales.x;
       return scale.getValueForPixel(clientX - rect.left);
     }
+    function panChartByPixels(chart, dx) {
+      if (!panStart || !chartViewRange) return;
+      const width = Math.max(1, chart.chartArea.right - chart.chartArea.left);
+      const span = panStart.range.max - panStart.range.min;
+      const delta = -dx / width * span;
+      chartViewRange = clampViewRange({
+        min: panStart.range.min + delta,
+        max: panStart.range.max + delta
+      });
+      applyDetailChartRange();
+    }
+    function chartTooltip() {
+      let tooltip = document.getElementById('chartTooltip');
+      if (tooltip) return tooltip;
+      tooltip = document.createElement('div');
+      tooltip.id = 'chartTooltip';
+      tooltip.className = 'chart-tooltip';
+      document.body.appendChild(tooltip);
+      return tooltip;
+    }
+    function externalTooltip(context) {
+      const tooltipModel = context.tooltip;
+      const tooltip = chartTooltip();
+      if (!tooltipModel || tooltipModel.opacity === 0) {
+        tooltip.style.opacity = '0';
+        return;
+      }
+      tooltip.innerHTML = '';
+      const title = document.createElement('div');
+      title.className = 'chart-tooltip-title';
+      title.textContent = tooltipModel.dataPoints.length ? new Date(tooltipModel.dataPoints[0].parsed.x).toLocaleString() : '';
+      tooltip.appendChild(title);
+      tooltipModel.dataPoints.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'chart-tooltip-row';
+        const swatch = document.createElement('span');
+        swatch.className = 'chart-tooltip-swatch';
+        swatch.style.background = item.dataset.borderColor;
+        const name = document.createElement('span');
+        name.className = 'chart-tooltip-name';
+        name.textContent = item.dataset.label;
+        const value = document.createElement('span');
+        value.className = 'chart-tooltip-value';
+        value.textContent = item.parsed.y.toFixed(2) + ' ms';
+        row.append(swatch, name, value);
+        tooltip.appendChild(row);
+      });
+      tooltip.style.opacity = '1';
+      tooltip.style.left = '0px';
+      tooltip.style.top = '0px';
+      const rect = context.chart.canvas.getBoundingClientRect();
+      const tooltipRect = tooltip.getBoundingClientRect();
+      let left = rect.left + tooltipModel.caretX + 14;
+      let top = rect.top + tooltipModel.caretY + 14;
+      if (left + tooltipRect.width > window.innerWidth - 12) {
+        left = rect.left + tooltipModel.caretX - tooltipRect.width - 14;
+      }
+      if (top + tooltipRect.height > window.innerHeight - 12) {
+        top = window.innerHeight - tooltipRect.height - 12;
+      }
+      tooltip.style.left = Math.max(12, left) + 'px';
+      tooltip.style.top = Math.max(12, top) + 'px';
+    }
     function attachChartZoomHandlers(chart) {
       const canvas = chart.canvas;
       canvas.addEventListener('touchstart', event => {
@@ -870,14 +942,7 @@ const dashboardHTML = `<!doctype html>
           const dy = touch.clientY - panStart.y;
           if (Math.abs(dx) < 6 || Math.abs(dx) < Math.abs(dy)) return;
           event.preventDefault();
-          const width = Math.max(1, chart.chartArea.right - chart.chartArea.left);
-          const span = panStart.range.max - panStart.range.min;
-          const delta = -dx / width * span;
-          chartViewRange = clampViewRange({
-            min: panStart.range.min + delta,
-            max: panStart.range.max + delta
-          });
-          applyDetailChartRange();
+          panChartByPixels(chart, dx);
           return;
         }
         if (!pinchStart || event.touches.length !== 2 || !pinchStart.range) return;
@@ -903,6 +968,29 @@ const dashboardHTML = `<!doctype html>
         event.preventDefault();
         zoomDetailChart(event.deltaY < 0 ? 0.75 : 1.35, chartValueAtClientX(chart, event.clientX));
       }, {passive: false});
+      canvas.addEventListener('mousedown', event => {
+        if (event.button !== 0 || !chartViewRange) return;
+        event.preventDefault();
+        panStart = {
+          x: event.clientX,
+          y: event.clientY,
+          range: chartViewRange
+        };
+        canvas.classList.add('dragging');
+      });
+      window.addEventListener('mousemove', event => {
+        if (!panStart || !chartViewRange || event.buttons !== 1) return;
+        event.preventDefault();
+        panChartByPixels(chart, event.clientX - panStart.x);
+      });
+      window.addEventListener('mouseup', () => {
+        panStart = null;
+        canvas.classList.remove('dragging');
+      });
+      window.addEventListener('blur', () => {
+        panStart = null;
+        canvas.classList.remove('dragging');
+      });
     }
     function summarizeAgent(rows) {
       const latest = rows[rows.length - 1];
@@ -965,9 +1053,19 @@ const dashboardHTML = `<!doctype html>
             responsive: true,
             maintainAspectRatio: false,
             animation: false,
+            interaction: {mode: 'x', axis: 'x', intersect: false},
             scales: {x: {type: 'linear', display: false}, y: {display: false, beginAtZero: true}},
             elements: {point: {radius: 0}},
-            plugins: {legend: {display: false}, tooltip: {enabled: false}}
+            plugins: {
+              legend: {display: false},
+              tooltip: {
+                enabled: false,
+                mode: 'x',
+                intersect: false,
+                external: externalTooltip,
+                itemSort: (a, b) => a.dataset.label.localeCompare(b.dataset.label),
+              }
+            }
           }
         });
         miniCharts.push(miniChart);
@@ -1063,7 +1161,7 @@ const dashboardHTML = `<!doctype html>
           responsive: true,
           maintainAspectRatio: false,
           animation: false,
-          interaction: {mode: 'nearest', intersect: false},
+          interaction: {mode: 'x', axis: 'x', intersect: false},
           scales: {
             x: {
               type: 'linear',
@@ -1075,10 +1173,11 @@ const dashboardHTML = `<!doctype html>
           plugins: {
             legend: {display: false},
             tooltip: {
-              enabled: true,
-              callbacks: {
-                title: items => items.length ? new Date(items[0].parsed.x).toLocaleString() : ''
-              }
+              enabled: false,
+              mode: 'x',
+              intersect: false,
+              external: externalTooltip,
+              itemSort: (a, b) => a.dataset.label.localeCompare(b.dataset.label),
             }
           }
         }
