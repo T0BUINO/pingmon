@@ -4,9 +4,11 @@ data_file = "data/results.jsonl"
 sqlite_path = "data/pingmon.db"
 dashboard_user = "admin"
 dashboard_password = "change-me"
-dashboard_ranges = ["12h", "24h", "3d", "7d", "14d", "30d", "60d"]
+dashboard_ranges = ["12h", "24h", "3d", "7d", "14d", "30d", "60d", "180d", "365d"]
 default_range = "24h"
 retention_days = 365
+raw_retention_days = 30
+rollup_interval_minutes = 60
 failure_threshold = 3
 task_interval_seconds = 30
 

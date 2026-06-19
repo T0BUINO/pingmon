@@ -154,7 +154,7 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	selectedRange := s.selectedRange(r)
-	results, err := s.store.ResultsSince(time.Now().Add(-rangeDuration(selectedRange)))
+	results, err := s.resultsSince(time.Now().Add(-rangeDuration(selectedRange)))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -184,7 +184,7 @@ func (s *server) handleResults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	selectedRange := s.selectedRange(r)
-	results, err := s.store.ResultsSince(time.Now().Add(-rangeDuration(selectedRange)))
+	results, err := s.resultsSince(time.Now().Add(-rangeDuration(selectedRange)))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -209,6 +209,14 @@ func (s *server) selectedRange(r *http.Request) string {
 		return s.cfg.DashboardRanges[0]
 	}
 	return "24h"
+}
+
+func (s *server) resultsSince(since time.Time) ([]model.Result, error) {
+	rawCutoff := time.Now().AddDate(0, 0, -s.cfg.RawRetentionDays)
+	if since.Before(rawCutoff) {
+		return s.store.ResultsSinceCompacted(since, rawCutoff)
+	}
+	return s.store.ResultsSince(since)
 }
 
 func rangeDuration(raw string) time.Duration {
@@ -443,14 +451,33 @@ func (s *server) startRetentionCleaner() {
 }
 
 func (s *server) cleanOldData() {
-	cutoff := time.Now().AddDate(0, 0, -s.cfg.RetentionDays)
-	deleted, err := s.store.DeleteBefore(cutoff)
+	now := time.Now()
+	rawCutoff := now.AddDate(0, 0, -s.cfg.RawRetentionDays)
+	retentionCutoff := now.AddDate(0, 0, -s.cfg.RetentionDays)
+	rollupInterval := time.Duration(s.cfg.RollupIntervalMins) * time.Minute
+
+	rolled, err := s.store.RollupBefore(rawCutoff, rollupInterval)
 	if err != nil {
-		log.Printf("retention cleanup failed: %v", err)
+		log.Printf("retention rollup failed: %v", err)
 		return
 	}
-	if deleted > 0 {
-		log.Printf("retention cleanup deleted %d old records", deleted)
+
+	rawDeleteCutoff := rawCutoff.UTC().Truncate(rollupInterval)
+	deletedRaw, err := s.store.DeleteBefore(rawDeleteCutoff)
+	if err != nil {
+		log.Printf("retention raw cleanup failed: %v", err)
+		return
+	}
+	deletedRollups, err := s.store.DeleteRollupsBefore(retentionCutoff)
+	if err != nil {
+		log.Printf("retention rollup cleanup failed: %v", err)
+		return
+	}
+	if rolled > 0 || deletedRaw > 0 || deletedRollups > 0 {
+		log.Printf("retention cleanup rolled=%d deleted_raw=%d deleted_rollups=%d", rolled, deletedRaw, deletedRollups)
+		if err := s.store.Vacuum(); err != nil {
+			log.Printf("retention vacuum failed: %v", err)
+		}
 	}
 }
 
@@ -494,8 +521,10 @@ const dashboardHTML = `<!doctype html>
     .metric strong { display: block; margin-top: 3px; font-size: 15px; overflow-wrap: anywhere; }
     .mini-chart { height: 86px; }
     .detail-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-    .chart-scroll { width: 100%; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }
-    .chart-wrap { position: relative; height: 390px; min-width: 720px; }
+    .chart-tools { justify-content: flex-end; margin-top: -6px; }
+    .chart-tools button { width: 34px; padding: 0; font-size: 18px; font-weight: 600; }
+    .chart-tools button:disabled { color: #94a3b8; cursor: not-allowed; }
+    .chart-wrap { position: relative; height: 390px; width: 100%; touch-action: pan-y; }
     .toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 12px; }
     .toolbar label { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; background: #fbfcfe; font-size: 13px; line-height: 1.2; }
     .toolbar input[type="checkbox"] { width: 14px; height: 14px; margin: 0; padding: 0; }
@@ -529,10 +558,10 @@ const dashboardHTML = `<!doctype html>
       .page-actions { width: 100%; overflow-x: auto; }
       .cards { grid-template-columns: 1fr; }
       .detail-grid { grid-template-columns: repeat(2, 1fr); }
-      .toolbar { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch; }
-      .toolbar label { flex: 0 0 auto; max-width: 240px; }
-      .chart-scroll { margin: 0 -16px; padding: 0 16px; }
-      .chart-wrap { height: 340px; min-width: 680px; }
+      .toolbar { flex-wrap: wrap; overflow: visible; padding-bottom: 0; }
+      .toolbar label { max-width: 100%; }
+      .chart-tools { justify-content: flex-start; }
+      .chart-wrap { height: 340px; }
       .table-scroll { -webkit-overflow-scrolling: touch; }
     }
   </style>
@@ -566,7 +595,12 @@ const dashboardHTML = `<!doctype html>
         <h2>目标延迟</h2>
         <div class="toolbar" id="labelFilters"></div>
         <div class="toolbar" id="targetToggles"></div>
-        <div class="chart-scroll"><div class="chart-wrap"><canvas id="latency"></canvas></div></div>
+        <div class="toolbar chart-tools" id="chartTools">
+          <button type="button" id="zoomInButton" title="放大">+</button>
+          <button type="button" id="zoomOutButton" title="缩小">-</button>
+          <button type="button" id="zoomResetButton" title="复位">↺</button>
+        </div>
+        <div class="chart-wrap"><canvas id="latency"></canvas></div>
       </section>
       <section class="panel">
         <h2>告警日志</h2>
@@ -610,6 +644,10 @@ const dashboardHTML = `<!doctype html>
     let miniCharts = [];
     let selectedLabels = null;
     let currentAgentRows = [];
+    let chartFullRange = null;
+    let chartViewRange = null;
+    let pinchStart = null;
+    let panStart = null;
     document.querySelectorAll('.local-time').forEach(cell => {
       const date = new Date(cell.dataset.time);
       if (!Number.isNaN(date.getTime())) cell.textContent = date.toLocaleString();
@@ -712,6 +750,159 @@ const dashboardHTML = `<!doctype html>
         };
       });
       return {datasets};
+    }
+    function dataRange(chartData) {
+      let min = Infinity;
+      let max = -Infinity;
+      chartData.datasets.forEach(dataset => {
+        dataset.data.forEach(point => {
+          if (point.y === null) return;
+          min = Math.min(min, point.x);
+          max = Math.max(max, point.x);
+        });
+      });
+      return Number.isFinite(min) && Number.isFinite(max) && min < max ? {min, max} : null;
+    }
+    function clampViewRange(range) {
+      if (!chartFullRange || !range) return null;
+      const fullSpan = chartFullRange.max - chartFullRange.min;
+      let span = Math.min(range.max - range.min, fullSpan);
+      const minSpan = Math.max(60 * 1000, fullSpan / 200);
+      span = Math.max(span, Math.min(minSpan, fullSpan));
+      let min = range.min;
+      let max = range.max;
+      if (min < chartFullRange.min) {
+        min = chartFullRange.min;
+        max = min + span;
+      }
+      if (max > chartFullRange.max) {
+        max = chartFullRange.max;
+        min = max - span;
+      }
+      return {min, max};
+    }
+    function updateZoomButtons() {
+      const zoomIn = document.getElementById('zoomInButton');
+      const zoomOut = document.getElementById('zoomOutButton');
+      const zoomReset = document.getElementById('zoomResetButton');
+      if (!zoomIn || !zoomOut || !zoomReset) return;
+      const canZoom = Boolean(chartFullRange);
+      zoomIn.disabled = !canZoom;
+      zoomOut.disabled = !canZoom || chartViewRange === null;
+      zoomReset.disabled = !canZoom || chartViewRange === null;
+    }
+    function applyDetailChartRange(mode) {
+      if (!detailChart) return;
+      const xScale = detailChart.options.scales.x;
+      if (chartViewRange) {
+        xScale.min = chartViewRange.min;
+        xScale.max = chartViewRange.max;
+      } else {
+        delete xScale.min;
+        delete xScale.max;
+      }
+      detailChart.update(mode || 'none');
+      updateZoomButtons();
+    }
+    function syncChartRange(chartData) {
+      const nextFullRange = dataRange(chartData);
+      chartFullRange = nextFullRange;
+      chartViewRange = clampViewRange(chartViewRange);
+      if (!chartFullRange) chartViewRange = null;
+    }
+    function zoomDetailChart(factor, center) {
+      if (!chartFullRange) return;
+      const current = chartViewRange || chartFullRange;
+      const currentSpan = current.max - current.min;
+      const fullSpan = chartFullRange.max - chartFullRange.min;
+      const minSpan = Math.max(60 * 1000, fullSpan / 200);
+      const nextSpan = Math.max(Math.min(currentSpan * factor, fullSpan), Math.min(minSpan, fullSpan));
+      if (nextSpan >= fullSpan) {
+        chartViewRange = null;
+        applyDetailChartRange();
+        return;
+      }
+      const pivot = Number.isFinite(center) ? center : (current.min + current.max) / 2;
+      const ratio = (pivot - current.min) / currentSpan;
+      chartViewRange = clampViewRange({
+        min: pivot - nextSpan * ratio,
+        max: pivot + nextSpan * (1 - ratio)
+      });
+      applyDetailChartRange();
+    }
+    function touchDistance(touches) {
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      return Math.hypot(dx, dy);
+    }
+    function touchCenterX(touches) {
+      return (touches[0].clientX + touches[1].clientX) / 2;
+    }
+    function chartValueAtClientX(chart, clientX) {
+      const rect = chart.canvas.getBoundingClientRect();
+      const scale = chart.scales.x;
+      return scale.getValueForPixel(clientX - rect.left);
+    }
+    function attachChartZoomHandlers(chart) {
+      const canvas = chart.canvas;
+      canvas.addEventListener('touchstart', event => {
+        if (event.touches.length === 1 && chartViewRange) {
+          panStart = {
+            x: event.touches[0].clientX,
+            y: event.touches[0].clientY,
+            range: chartViewRange
+          };
+          return;
+        }
+        if (event.touches.length === 2) {
+          pinchStart = {
+            distance: touchDistance(event.touches),
+            range: chartViewRange || chartFullRange,
+            center: chartValueAtClientX(chart, touchCenterX(event.touches))
+          };
+          panStart = null;
+        }
+      }, {passive: true});
+      canvas.addEventListener('touchmove', event => {
+        if (panStart && chartViewRange && event.touches.length === 1) {
+          const touch = event.touches[0];
+          const dx = touch.clientX - panStart.x;
+          const dy = touch.clientY - panStart.y;
+          if (Math.abs(dx) < 6 || Math.abs(dx) < Math.abs(dy)) return;
+          event.preventDefault();
+          const width = Math.max(1, chart.chartArea.right - chart.chartArea.left);
+          const span = panStart.range.max - panStart.range.min;
+          const delta = -dx / width * span;
+          chartViewRange = clampViewRange({
+            min: panStart.range.min + delta,
+            max: panStart.range.max + delta
+          });
+          applyDetailChartRange();
+          return;
+        }
+        if (!pinchStart || event.touches.length !== 2 || !pinchStart.range) return;
+        event.preventDefault();
+        const distance = touchDistance(event.touches);
+        if (distance <= 0) return;
+        const factor = pinchStart.distance / distance;
+        const span = pinchStart.range.max - pinchStart.range.min;
+        const nextSpan = span * factor;
+        const ratio = (pinchStart.center - pinchStart.range.min) / span;
+        chartViewRange = clampViewRange({
+          min: pinchStart.center - nextSpan * ratio,
+          max: pinchStart.center + nextSpan * (1 - ratio)
+        });
+        applyDetailChartRange();
+      }, {passive: false});
+      canvas.addEventListener('touchend', event => {
+        if (event.touches.length < 2) pinchStart = null;
+        if (event.touches.length === 0) panStart = null;
+      });
+      canvas.addEventListener('wheel', event => {
+        if (!event.ctrlKey && !event.metaKey) return;
+        event.preventDefault();
+        zoomDetailChart(event.deltaY < 0 ? 0.75 : 1.35, chartValueAtClientX(chart, event.clientX));
+      }, {passive: false});
     }
     function summarizeAgent(rows) {
       const latest = rows[rows.length - 1];
@@ -858,9 +1049,10 @@ const dashboardHTML = `<!doctype html>
     }
     function updateDetailChart(rows) {
       const chartData = buildDatasets(filterRowsByLabels(rows, selectedLabels));
+      syncChartRange(chartData);
       if (detailChart) {
         detailChart.data = chartData;
-        detailChart.update('none');
+        applyDetailChartRange('none');
         renderToggles(detailChart);
         return;
       }
@@ -876,7 +1068,7 @@ const dashboardHTML = `<!doctype html>
             x: {
               type: 'linear',
               title: {display: true, text: '检查时间'},
-              ticks: {maxTicksLimit: 8, callback: value => formatTimeTick(value)}
+              ticks: {maxTicksLimit: window.innerWidth <= 760 ? 4 : 8, callback: value => formatTimeTick(value)}
             },
             y: {beginAtZero: true, title: {display: true, text: '平均延迟 ms'}}
           },
@@ -891,6 +1083,8 @@ const dashboardHTML = `<!doctype html>
           }
         }
       });
+      attachChartZoomHandlers(detailChart);
+      applyDetailChartRange('none');
       renderToggles(detailChart);
     }
     function renderLabelFilters(rows) {
@@ -952,6 +1146,16 @@ const dashboardHTML = `<!doctype html>
     document.getElementById('refreshButton').addEventListener('click', () => {
       refreshDashboard().catch(handleRefreshError);
     });
+    const zoomInButton = document.getElementById('zoomInButton');
+    const zoomOutButton = document.getElementById('zoomOutButton');
+    const zoomResetButton = document.getElementById('zoomResetButton');
+    if (zoomInButton) zoomInButton.addEventListener('click', () => zoomDetailChart(0.65));
+    if (zoomOutButton) zoomOutButton.addEventListener('click', () => zoomDetailChart(1.55));
+    if (zoomResetButton) zoomResetButton.addEventListener('click', () => {
+      chartViewRange = null;
+      applyDetailChartRange();
+    });
+    updateZoomButtons();
     const rangeMenu = document.getElementById('rangeMenu');
     const rangeButton = document.getElementById('rangeButton');
     rangeButton.addEventListener('click', () => rangeMenu.classList.toggle('open'));
@@ -961,6 +1165,7 @@ const dashboardHTML = `<!doctype html>
         rangeButton.textContent = selectedRange;
         document.querySelectorAll('.range-option').forEach(item => item.classList.toggle('active', item === option));
         rangeMenu.classList.remove('open');
+        chartViewRange = null;
         const url = new URL(location.href);
         url.searchParams.set('range', selectedRange);
         history.replaceState(null, '', url);

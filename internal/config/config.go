@@ -23,6 +23,8 @@ type Config struct {
 	DashboardRanges     []string           `json:"dashboard_ranges"`
 	DefaultRange        string             `json:"default_range"`
 	RetentionDays       int                `json:"retention_days"`
+	RawRetentionDays    int                `json:"raw_retention_days"`
+	RollupIntervalMins  int                `json:"rollup_interval_minutes"`
 	FailureThreshold    int                `json:"failure_threshold"`
 	TaskIntervalSeconds int                `json:"task_interval_seconds"`
 	Params              model.PingParams   `json:"params"`
@@ -46,9 +48,11 @@ func DefaultConfig() Config {
 		SQLitePath:          "data/pingmon.db",
 		DashboardUser:       "admin",
 		DashboardPassword:   "admin",
-		DashboardRanges:     []string{"12h", "24h", "3d", "7d", "14d", "30d", "60d"},
+		DashboardRanges:     []string{"12h", "24h", "3d", "7d", "14d", "30d", "60d", "180d", "365d"},
 		DefaultRange:        "24h",
 		RetentionDays:       365,
+		RawRetentionDays:    30,
+		RollupIntervalMins:  60,
 		FailureThreshold:    3,
 		TaskIntervalSeconds: 30,
 		Params: model.PingParams{
@@ -182,6 +186,15 @@ func applyDefaults(cfg *Config) {
 	if cfg.RetentionDays <= 0 {
 		cfg.RetentionDays = def.RetentionDays
 	}
+	if cfg.RawRetentionDays <= 0 {
+		cfg.RawRetentionDays = def.RawRetentionDays
+	}
+	if cfg.RawRetentionDays > cfg.RetentionDays {
+		cfg.RawRetentionDays = cfg.RetentionDays
+	}
+	if cfg.RollupIntervalMins <= 0 {
+		cfg.RollupIntervalMins = def.RollupIntervalMins
+	}
 	if cfg.FailureThreshold <= 0 {
 		cfg.FailureThreshold = def.FailureThreshold
 	}
@@ -300,6 +313,10 @@ func setConfigValue(cfg *Config, key, value string) error {
 		cfg.DefaultRange = parseString(value)
 	case "retention_days":
 		cfg.RetentionDays = mustInt(key, value)
+	case "raw_retention_days":
+		cfg.RawRetentionDays = mustInt(key, value)
+	case "rollup_interval_minutes":
+		cfg.RollupIntervalMins = mustInt(key, value)
 	case "failure_threshold":
 		cfg.FailureThreshold = mustInt(key, value)
 	case "task_interval_seconds":

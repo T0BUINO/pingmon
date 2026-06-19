@@ -22,7 +22,11 @@ type Store interface {
 	SaveResult(model.Result) error
 	RecentResults(limit int) ([]model.Result, error)
 	ResultsSince(since time.Time) ([]model.Result, error)
+	ResultsSinceCompacted(since, rawCutoff time.Time) ([]model.Result, error)
+	RollupBefore(cutoff time.Time, interval time.Duration) (int, error)
 	DeleteBefore(cutoff time.Time) (int, error)
+	DeleteRollupsBefore(cutoff time.Time) (int, error)
+	Vacuum() error
 	ConsecutiveFailures(targetName, address string, port int) (int, error)
 }
 
@@ -80,6 +84,27 @@ CREATE TABLE IF NOT EXISTS results (
 );
 CREATE INDEX IF NOT EXISTS idx_results_checked_at ON results(checked_at DESC);
 CREATE INDEX IF NOT EXISTS idx_results_target ON results(target_name, address, port, checked_at DESC);
+
+CREATE TABLE IF NOT EXISTS result_rollups (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	agent TEXT NOT NULL,
+	agent_ip TEXT NOT NULL,
+	target_name TEXT NOT NULL,
+	address TEXT NOT NULL,
+	port INTEGER NOT NULL,
+	labels TEXT NOT NULL,
+	bucket_start TEXT NOT NULL,
+	interval_seconds INTEGER NOT NULL,
+	sample_count INTEGER NOT NULL,
+	success_count INTEGER NOT NULL,
+	failure_count INTEGER NOT NULL,
+	average_latency_ms REAL NOT NULL,
+	success_rate REAL NOT NULL,
+	error TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_result_rollups_unique
+ON result_rollups(agent, agent_ip, target_name, address, port, labels, bucket_start, interval_seconds);
+CREATE INDEX IF NOT EXISTS idx_result_rollups_bucket ON result_rollups(bucket_start DESC);
 `)
 	if err != nil {
 		return err
@@ -151,6 +176,103 @@ ORDER BY checked_at DESC`, since.UTC().Format(time.RFC3339Nano))
 	return results, rows.Err()
 }
 
+func (s *SQLiteStore) ResultsSinceCompacted(since, rawCutoff time.Time) ([]model.Result, error) {
+	if since.After(rawCutoff) || since.Equal(rawCutoff) {
+		return s.ResultsSince(since)
+	}
+	results := make([]model.Result, 0)
+	rollups, err := s.rollupsSince(since, rawCutoff)
+	if err != nil {
+		return nil, err
+	}
+	results = append(results, rollups...)
+	raw, err := s.ResultsSince(rawCutoff)
+	if err != nil {
+		return nil, err
+	}
+	results = append(results, raw...)
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].CheckedAt.After(results[j].CheckedAt)
+	})
+	return results, nil
+}
+
+func (s *SQLiteStore) rollupsSince(since, before time.Time) ([]model.Result, error) {
+	rows, err := s.db.Query(`SELECT agent, agent_ip, target_name, address, port, labels, bucket_start,
+success_count, failure_count, average_latency_ms, success_rate, COALESCE(error, '') FROM result_rollups
+WHERE bucket_start >= ? AND bucket_start < ?
+ORDER BY bucket_start DESC`, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanResults(rows)
+}
+
+func (s *SQLiteStore) RollupBefore(cutoff time.Time, interval time.Duration) (int, error) {
+	if interval <= 0 {
+		return 0, nil
+	}
+	cutoff = truncateUTC(cutoff, interval)
+	if cutoff.IsZero() {
+		return 0, nil
+	}
+	seconds := int(interval.Seconds())
+	res, err := s.db.Exec(`
+INSERT OR IGNORE INTO result_rollups (
+	agent, agent_ip, target_name, address, port, labels, bucket_start, interval_seconds,
+	sample_count, success_count, failure_count, average_latency_ms, success_rate, error
+)
+SELECT
+	agent,
+	agent_ip,
+	target_name,
+	address,
+	port,
+	labels,
+	bucket_start,
+	?,
+	COUNT(*),
+	SUM(success_count),
+	SUM(failure_count),
+	CASE WHEN SUM(success_count) > 0
+		THEN SUM(average_latency_ms * success_count) / SUM(success_count)
+		ELSE 0
+	END,
+	CASE WHEN SUM(success_count) + SUM(failure_count) > 0
+		THEN CAST(SUM(success_count) AS REAL) / CAST(SUM(success_count) + SUM(failure_count) AS REAL)
+		ELSE 0
+	END,
+	CASE WHEN SUM(CASE WHEN failure_count > 0 OR success_rate < 1 OR COALESCE(error, '') != '' THEN 1 ELSE 0 END) > 0
+		THEN 'rollup contains problem samples'
+		ELSE ''
+	END
+FROM (
+	SELECT
+		agent,
+		COALESCE(agent_ip, '') AS agent_ip,
+		target_name,
+		address,
+		port,
+		COALESCE(labels, '') AS labels,
+		strftime('%Y-%m-%dT%H:%M:%SZ', (unixepoch(checked_at) / ?) * ?, 'unixepoch') AS bucket_start,
+		success_count,
+		failure_count,
+		average_latency_ms,
+		success_rate,
+		error
+	FROM results
+	WHERE checked_at < ?
+)
+GROUP BY agent, agent_ip, target_name, address, port, labels, bucket_start`,
+		seconds, seconds, seconds, cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 func (s *SQLiteStore) DeleteBefore(cutoff time.Time) (int, error) {
 	res, err := s.db.Exec("DELETE FROM results WHERE checked_at < ?", cutoff.UTC().Format(time.RFC3339Nano))
 	if err != nil {
@@ -158,6 +280,20 @@ func (s *SQLiteStore) DeleteBefore(cutoff time.Time) (int, error) {
 	}
 	n, err := res.RowsAffected()
 	return int(n), err
+}
+
+func (s *SQLiteStore) DeleteRollupsBefore(cutoff time.Time) (int, error) {
+	res, err := s.db.Exec("DELETE FROM result_rollups WHERE bucket_start < ?", cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
+func (s *SQLiteStore) Vacuum() error {
+	_, err := s.db.Exec("VACUUM")
+	return err
 }
 
 func (s *SQLiteStore) ConsecutiveFailures(targetName, address string, port int) (int, error) {
@@ -187,6 +323,24 @@ type resultScanner interface {
 	Scan(dest ...any) error
 }
 
+type resultRows interface {
+	resultScanner
+	Next() bool
+	Err() error
+}
+
+func scanResults(rows resultRows) ([]model.Result, error) {
+	var results []model.Result
+	for rows.Next() {
+		result, err := scanResult(rows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, result)
+	}
+	return results, rows.Err()
+}
+
 func scanResult(scanner resultScanner) (model.Result, error) {
 	var result model.Result
 	var labels string
@@ -211,6 +365,10 @@ func scanResult(scanner resultScanner) (model.Result, error) {
 
 func isDuplicateColumnError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "duplicate column")
+}
+
+func truncateUTC(t time.Time, d time.Duration) time.Time {
+	return t.UTC().Truncate(d)
 }
 
 type FileStore struct {
@@ -279,6 +437,14 @@ func (s *FileStore) ResultsSince(since time.Time) ([]model.Result, error) {
 	return filtered, nil
 }
 
+func (s *FileStore) ResultsSinceCompacted(since, rawCutoff time.Time) ([]model.Result, error) {
+	return s.ResultsSince(since)
+}
+
+func (s *FileStore) RollupBefore(cutoff time.Time, interval time.Duration) (int, error) {
+	return 0, nil
+}
+
 func (s *FileStore) DeleteBefore(cutoff time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -311,6 +477,14 @@ func (s *FileStore) DeleteBefore(cutoff time.Time) (int, error) {
 		return 0, err
 	}
 	return deleted, os.Rename(tmp, s.path)
+}
+
+func (s *FileStore) DeleteRollupsBefore(cutoff time.Time) (int, error) {
+	return 0, nil
+}
+
+func (s *FileStore) Vacuum() error {
+	return nil
 }
 
 func (s *FileStore) ConsecutiveFailures(targetName, address string, port int) (int, error) {

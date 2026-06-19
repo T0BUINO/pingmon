@@ -90,15 +90,17 @@ http://127.0.0.1:8080/dashboard
 - `sqlite_path`：SQLite 数据库路径。
 - `data_file`：使用 `storage = "file"` 时的 JSONL 结果文件路径。
 - `dashboard_user` / `dashboard_password`：Dashboard 和 `/api/results` 的 Basic Auth 账号密码。
-- `dashboard_ranges`：Dashboard 可选时间范围，例如 `["12h", "24h", "3d", "7d", "14d", "30d", "60d"]`。
+- `dashboard_ranges`：Dashboard 可选时间范围，例如 `["12h", "24h", "3d", "7d", "14d", "30d", "60d", "180d", "365d"]`。
 - `default_range`：Dashboard 默认时间范围，例如 `24h`。
 - `retention_days`：数据保留天数，默认 `365`。
+- `raw_retention_days`：原始上报数据保留天数，默认 `30`。更早的原始数据会先聚合再删除。
+- `rollup_interval_minutes`：聚合粒度，默认 `60`，表示旧数据按 1 小时聚合。
 - `failure_threshold`：连续失败次数超过该值时在日志打印告警。
 - `task_interval_seconds`：任务建议执行频率。
 - `[params]`：探测次数、间隔、超时和 IPv6 开关。
 - `[[targets]]`：探测目标列表。
 
-Dashboard landing 按 agent 展示卡片，详情页按 target 展示曲线和日志。图表数据按时间范围查询，支持 `h` 小时、`d` 天、`w` 周、`mo` 月，其中 `mo` 按 30 天估算。页面会连接 `/ws`，agent 上报新结果后通过 WebSocket 自动刷新当前视图。
+Dashboard landing 按 agent 展示卡片，详情页按 target 展示曲线和日志。图表数据按时间范围查询，支持 `h` 小时、`d` 天、`w` 周、`mo` 月，其中 `mo` 按 30 天估算。超过 `raw_retention_days` 的旧数据会从 SQLite `result_rollups` 聚合表读取，近期数据仍保留原始粒度。页面会连接 `/ws`，agent 上报新结果后通过 WebSocket 自动刷新当前视图。
 
 详情页日志只显示最近的 WARN / ERROR 结果，最多 200 条，避免长期运行后成功上报把页面拉得过长。延迟图使用时间戳横轴，并对每条目标曲线做前端采样，长时间范围也会保持可读。
 
