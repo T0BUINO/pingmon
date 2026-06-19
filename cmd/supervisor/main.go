@@ -558,6 +558,7 @@ const dashboardHTML = `<!doctype html>
       </section>
       <section class="panel">
         <h2>目标延迟</h2>
+        <div class="toolbar" id="labelFilters"></div>
         <div class="toolbar" id="targetToggles"></div>
         <div class="chart-wrap"><canvas id="latency"></canvas></div>
       </section>
@@ -601,6 +602,8 @@ const dashboardHTML = `<!doctype html>
     let selectedRange = '{{.SelectedRange}}';
     let detailChart = null;
     let miniCharts = [];
+    let selectedLabels = null;
+    let currentAgentRows = [];
     document.querySelectorAll('.local-time').forEach(cell => {
       const date = new Date(cell.dataset.time);
       if (!Number.isNaN(date.getTime())) cell.textContent = date.toLocaleString();
@@ -613,6 +616,19 @@ const dashboardHTML = `<!doctype html>
     }
     function targetKey(row) {
       return row.target_name + ' (' + row.address + ':' + row.port + ')';
+    }
+    function rowLabels(row) {
+      return Array.isArray(row.labels) ? row.labels.filter(label => label) : [];
+    }
+    function availableLabels(rows) {
+      const labels = new Set();
+      rows.forEach(row => rowLabels(row).forEach(label => labels.add(label)));
+      return Array.from(labels).sort((a, b) => a.localeCompare(b));
+    }
+    function filterRowsByLabels(rows, labels) {
+      if (labels === null) return rows;
+      if (!labels.size) return [];
+      return rows.filter(row => rowLabels(row).some(label => labels.has(label)));
     }
     function timeValue(row) {
       const ts = new Date(row.checked_at).getTime();
@@ -816,6 +832,10 @@ const dashboardHTML = `<!doctype html>
     function renderToggles(chart) {
       const wrap = document.getElementById('targetToggles');
       wrap.innerHTML = '';
+      if (!chart.data.datasets.length) {
+        wrap.textContent = '当前 label 下暂无可绘制目标';
+        return;
+      }
       chart.data.datasets.forEach((dataset, index) => {
         const label = document.createElement('label');
         const input = document.createElement('input');
@@ -825,6 +845,76 @@ const dashboardHTML = `<!doctype html>
           chart.update();
         });
         label.append(input, document.createTextNode(dataset.label));
+        wrap.appendChild(label);
+      });
+    }
+    function updateDetailChart(rows) {
+      const chartData = buildDatasets(filterRowsByLabels(rows, selectedLabels));
+      if (detailChart) {
+        detailChart.data = chartData;
+        detailChart.update('none');
+        renderToggles(detailChart);
+        return;
+      }
+      detailChart = new Chart(document.getElementById('latency'), {
+        type: 'line',
+        data: chartData,
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          interaction: {mode: 'nearest', intersect: false},
+          scales: {
+            x: {
+              type: 'linear',
+              title: {display: true, text: '检查时间'},
+              ticks: {maxTicksLimit: 8, callback: value => formatTimeTick(value)}
+            },
+            y: {beginAtZero: true, title: {display: true, text: '平均延迟 ms'}}
+          },
+          plugins: {
+            legend: {display: false},
+            tooltip: {
+              enabled: true,
+              callbacks: {
+                title: items => items.length ? new Date(items[0].parsed.x).toLocaleString() : ''
+              }
+            }
+          }
+        }
+      });
+      renderToggles(detailChart);
+    }
+    function renderLabelFilters(rows) {
+      const wrap = document.getElementById('labelFilters');
+      if (!wrap) return;
+      const labels = availableLabels(rows);
+      wrap.innerHTML = '';
+      if (!labels.length) {
+        wrap.textContent = '暂无 label';
+        selectedLabels = null;
+        return;
+      }
+      const valid = new Set(labels);
+      if (selectedLabels === null) {
+        selectedLabels = new Set(labels);
+      } else {
+        selectedLabels = new Set(Array.from(selectedLabels).filter(label => valid.has(label)));
+      }
+      labels.forEach(labelText => {
+        const label = document.createElement('label');
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = selectedLabels.has(labelText);
+        input.addEventListener('change', () => {
+          if (input.checked) {
+            selectedLabels.add(labelText);
+          } else {
+            selectedLabels.delete(labelText);
+          }
+          updateDetailChart(currentAgentRows);
+        });
+        label.append(input, document.createTextNode('label: ' + labelText));
         wrap.appendChild(label);
       });
     }
@@ -839,43 +929,11 @@ const dashboardHTML = `<!doctype html>
         renderProblemLog(rows);
         return;
       }
+      currentAgentRows = rows;
       renderAgentInfo(rows);
       renderProblemLog(rows);
-      const chartData = buildDatasets(rows);
-      if (detailChart) {
-        detailChart.data = chartData;
-        detailChart.update('none');
-        renderToggles(detailChart);
-      } else {
-        detailChart = new Chart(document.getElementById('latency'), {
-          type: 'line',
-          data: chartData,
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            animation: false,
-            interaction: {mode: 'nearest', intersect: false},
-            scales: {
-              x: {
-                type: 'linear',
-                title: {display: true, text: '检查时间'},
-                ticks: {maxTicksLimit: 8, callback: value => formatTimeTick(value)}
-              },
-              y: {beginAtZero: true, title: {display: true, text: '平均延迟 ms'}}
-            },
-            plugins: {
-              legend: {display: false},
-              tooltip: {
-                enabled: true,
-                callbacks: {
-                  title: items => items.length ? new Date(items[0].parsed.x).toLocaleString() : ''
-                }
-              }
-            }
-          }
-        });
-        renderToggles(detailChart);
-      }
+      renderLabelFilters(rows);
+      updateDetailChart(rows);
     }
     function handleRefreshError(err) {
       const targetToggles = document.getElementById('targetToggles');
