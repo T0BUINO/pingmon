@@ -116,3 +116,8 @@ supervisor_url = "http://127.0.0.1:8080"
 agent_name = "agent-1"
 poll_interval_seconds = 30
 ```
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0.
+See the [LICENSE](./LICENSE) file for details.
