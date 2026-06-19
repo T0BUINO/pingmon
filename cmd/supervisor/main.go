@@ -39,6 +39,11 @@ type websocketHub struct {
 	clients map[net.Conn]struct{}
 }
 
+type websocketEvent struct {
+	Type    string         `json:"type"`
+	Results []model.Result `json:"results,omitempty"`
+}
+
 const maxProblemLogRows = 200
 
 func main() {
@@ -108,19 +113,21 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agentIP := remoteIP(r.RemoteAddr)
+	saved := make([]model.Result, 0, len(results))
 	for _, result := range results {
 		normalizeReport(&result, agentIP)
 		if err := s.store.SaveResult(result); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		saved = append(saved, result)
 		failures, err := s.store.ConsecutiveFailures(result.TargetName, result.Address, result.Port)
 		if err == nil && failures > s.cfg.FailureThreshold {
 			log.Printf("[ALERT] target=%s address=%s:%d consecutive_failures=%d threshold=%d",
 				result.TargetName, result.Address, result.Port, failures, s.cfg.FailureThreshold)
 		}
 	}
-	s.hub.broadcast("refresh")
+	s.hub.broadcastJSON(websocketEvent{Type: "results", Results: saved})
 	writeJSON(w, map[string]any{"status": "ok", "saved": len(results)})
 }
 
@@ -377,6 +384,16 @@ func (h *websocketHub) broadcast(message string) {
 			h.remove(conn)
 		}
 	}
+}
+
+func (h *websocketHub) broadcastJSON(event websocketEvent) {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("websocket marshal failed: %v", err)
+		h.broadcast("refresh")
+		return
+	}
+	h.broadcast(string(payload))
 }
 
 func writeWebSocketText(conn net.Conn, message string) error {
@@ -658,6 +675,7 @@ const dashboardHTML = `<!doctype html>
     let detailChart = null;
     let miniCharts = [];
     let selectedLabels = null;
+    let currentRows = [];
     let currentAgentRows = [];
     let chartFullRange = null;
     let chartViewRange = null;
@@ -672,6 +690,56 @@ const dashboardHTML = `<!doctype html>
       const res = await fetch('/api/results?range=' + encodeURIComponent(selectedRange) + agentParam);
       if (!res.ok) throw new Error('结果数据加载失败，状态码：' + res.status);
       return (await res.json()).reverse();
+    }
+    function parseRangeMillis(raw) {
+      const value = String(raw || '24h').trim().toLowerCase();
+      const match = value.match(/^(\d+)(h|d|w|mo)$/);
+      if (!match) return 24 * 60 * 60 * 1000;
+      const amount = Number(match[1]);
+      const multipliers = {
+        h: 60 * 60 * 1000,
+        d: 24 * 60 * 60 * 1000,
+        w: 7 * 24 * 60 * 60 * 1000,
+        mo: 30 * 24 * 60 * 60 * 1000
+      };
+      return amount > 0 ? amount * multipliers[match[2]] : 24 * 60 * 60 * 1000;
+    }
+    function rowFingerprint(row) {
+      return [
+        row.agent,
+        row.agent_ip || '',
+        row.target_name,
+        row.address,
+        row.port,
+        JSON.stringify(row.labels || []),
+        row.checked_at,
+        row.success_count,
+        row.failure_count,
+        row.average_latency_ms,
+        row.success_rate,
+        row.error || ''
+      ].join('|');
+    }
+    function rowsForCurrentView(rows) {
+      const cutoff = Date.now() - parseRangeMillis(selectedRange);
+      return rows.filter(row => {
+        const ts = timeValue(row);
+        return ts !== null && ts >= cutoff && (!selectedAgent || row.agent === selectedAgent);
+      });
+    }
+    function sortRowsByTime(rows) {
+      return rows.slice().sort((a, b) => (timeValue(a) || 0) - (timeValue(b) || 0));
+    }
+    function mergeRows(existing, incoming) {
+      const seen = new Set(existing.map(rowFingerprint));
+      const merged = existing.slice();
+      for (const row of rowsForCurrentView(incoming)) {
+        const fingerprint = rowFingerprint(row);
+        if (seen.has(fingerprint)) continue;
+        seen.add(fingerprint);
+        merged.push(row);
+      }
+      return sortRowsByTime(rowsForCurrentView(merged));
     }
     function targetKey(row) {
       return row.target_name + ' (' + row.address + ':' + row.port + ')';
@@ -1254,28 +1322,42 @@ const dashboardHTML = `<!doctype html>
         wrap.appendChild(label);
       });
     }
-    async function refreshDashboard() {
-      const rows = await loadResults();
+    function renderDashboardRows(rows) {
+      currentRows = sortRowsByTime(rowsForCurrentView(rows));
       if (!selectedAgent) {
-        renderLanding(rows);
+        renderLanding(currentRows);
         return;
       }
-      if (!rows.length) {
+      if (!currentRows.length) {
         document.getElementById('agentInfo').innerHTML = '<div class="metric"><span>状态</span><strong>暂无数据</strong></div>';
-        renderProblemLog(rows);
+        renderProblemLog(currentRows);
         return;
       }
-      currentAgentRows = rows;
-      renderAgentInfo(rows);
-      renderProblemLog(rows);
-      renderLabelFilters(rows);
-      updateDetailChart(rows);
+      currentAgentRows = currentRows;
+      renderAgentInfo(currentRows);
+      renderProblemLog(currentRows);
+      renderLabelFilters(currentRows);
+      updateDetailChart(currentRows);
+    }
+    async function refreshDashboard() {
+      renderDashboardRows(await loadResults());
+    }
+    function applyLiveResults(rows) {
+      if (!Array.isArray(rows) || !rows.length) return;
+      currentRows = mergeRows(currentRows, rows);
+      renderDashboardRows(currentRows);
     }
     function handleRefreshError(err) {
       const targetToggles = document.getElementById('targetToggles');
       const agentCards = document.getElementById('agentCards');
       if (targetToggles) targetToggles.textContent = '加载失败：' + err.message;
       if (agentCards) agentCards.innerHTML = '<div class="panel">加载失败：' + err.message + '</div>';
+    }
+    function updateLiveState(text, reconnecting) {
+      const liveState = document.getElementById('liveState');
+      if (!liveState) return;
+      liveState.textContent = text;
+      liveState.classList.toggle('reconnecting', reconnecting);
     }
     document.getElementById('refreshButton').addEventListener('click', () => {
       refreshDashboard().catch(handleRefreshError);
@@ -1324,17 +1406,23 @@ const dashboardHTML = `<!doctype html>
     function connectLiveRefresh() {
       const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
       const ws = new WebSocket(proto + location.host + '/ws');
-      const liveState = document.getElementById('liveState');
       ws.onopen = () => {
-        liveState.textContent = '实时';
-        liveState.classList.remove('reconnecting');
+        updateLiveState('实时', false);
       };
       ws.onmessage = event => {
-        if (event.data === 'refresh') refreshDashboard().catch(handleRefreshError);
+        if (event.data === 'refresh') {
+          refreshDashboard().catch(handleRefreshError);
+          return;
+        }
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === 'results') applyLiveResults(message.results);
+        } catch (err) {
+          console.warn('未知实时消息', err);
+        }
       };
       ws.onclose = () => {
-        liveState.textContent = '重连中';
-        liveState.classList.add('reconnecting');
+        updateLiveState('重连中', true);
         setTimeout(connectLiveRefresh, 3000);
       };
       ws.onerror = () => ws.close();
