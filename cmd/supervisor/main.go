@@ -480,7 +480,7 @@ const dashboardHTML = `<!doctype html>
     .subtle { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; margin-top: 4px; }
     .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 18px; }
     .page-actions { display: flex; align-items: center; gap: 8px; padding: 4px; border: 1px solid #e2e8f0; border-radius: 8px; background: #fff; }
-    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+    .cards { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 14px; }
     .agent-card { display: block; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; min-height: 220px; transition: border-color .15s, transform .15s, box-shadow .15s; }
     .agent-card:hover { border-color: #94a3b8; transform: translateY(-1px); box-shadow: 0 10px 24px rgba(15, 23, 42, .08); }
     .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
@@ -525,6 +525,7 @@ const dashboardHTML = `<!doctype html>
     @media (max-width: 760px) {
       main { padding: 16px; }
       header { align-items: flex-start; flex-direction: column; }
+      .cards { grid-template-columns: 1fr; }
       .detail-grid { grid-template-columns: repeat(2, 1fr); }
       .table-scroll { -webkit-overflow-scrolling: touch; }
     }
