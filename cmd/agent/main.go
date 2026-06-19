@@ -163,13 +163,14 @@ func tcpPing(agent string, task model.Task) model.Result {
 	}
 	address := net.JoinHostPort(task.Target.Address, fmt.Sprint(task.Target.Port))
 	timeout := time.Duration(params.TimeoutMillis) * time.Millisecond
+	interval := time.Duration(params.IntervalMillis) * time.Millisecond
+	network := "tcp"
+	if !params.EnableIPv6 {
+		network = "tcp4"
+	}
 	var latencySum time.Duration
 	for i := 0; i < params.Count; i++ {
 		start := time.Now()
-		network := "tcp"
-		if !params.EnableIPv6 {
-			network = "tcp4"
-		}
 		conn, err := net.DialTimeout(network, address, timeout)
 		if err != nil {
 			result.FailureCount++
@@ -180,7 +181,7 @@ func tcpPing(agent string, task model.Task) model.Result {
 			_ = conn.Close()
 		}
 		if i < params.Count-1 {
-			time.Sleep(time.Duration(params.IntervalMillis) * time.Millisecond)
+			time.Sleep(interval)
 		}
 	}
 	if result.SuccessCount > 0 {

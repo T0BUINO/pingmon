@@ -145,15 +145,7 @@ failure_count, average_latency_ms, success_rate, error FROM results ORDER BY che
 		return nil, err
 	}
 	defer rows.Close()
-	var results []model.Result
-	for rows.Next() {
-		result, err := scanResult(rows)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, result)
-	}
-	return results, rows.Err()
+	return scanResults(rows)
 }
 
 func (s *SQLiteStore) ResultsSince(since time.Time) ([]model.Result, error) {
@@ -165,15 +157,7 @@ ORDER BY checked_at DESC`, since.UTC().Format(time.RFC3339Nano))
 		return nil, err
 	}
 	defer rows.Close()
-	var results []model.Result
-	for rows.Next() {
-		result, err := scanResult(rows)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, result)
-	}
-	return results, rows.Err()
+	return scanResults(rows)
 }
 
 func (s *SQLiteStore) ResultsSinceCompacted(since, rawCutoff time.Time) ([]model.Result, error) {
@@ -424,7 +408,7 @@ func (s *FileStore) RecentResults(limit int) ([]model.Result, error) {
 }
 
 func (s *FileStore) ResultsSince(since time.Time) ([]model.Result, error) {
-	results, err := s.RecentResults(0)
+	results, err := s.readAll()
 	if err != nil {
 		return nil, err
 	}
@@ -434,6 +418,9 @@ func (s *FileStore) ResultsSince(since time.Time) ([]model.Result, error) {
 			filtered = append(filtered, result)
 		}
 	}
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].CheckedAt.After(filtered[j].CheckedAt)
+	})
 	return filtered, nil
 }
 
@@ -488,10 +475,13 @@ func (s *FileStore) Vacuum() error {
 }
 
 func (s *FileStore) ConsecutiveFailures(targetName, address string, port int) (int, error) {
-	results, err := s.RecentResults(0)
+	results, err := s.readAll()
 	if err != nil {
 		return 0, err
 	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].CheckedAt.After(results[j].CheckedAt)
+	})
 	failures := 0
 	for _, result := range results {
 		if result.TargetName != targetName || result.Address != address || result.Port != port {
