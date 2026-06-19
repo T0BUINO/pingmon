@@ -53,6 +53,7 @@ func runCycle(supervisor string, cfg config.AgentConfig) error {
 	if err != nil {
 		return err
 	}
+	agentIP := fetchAgentIP(cfg)
 	var wg sync.WaitGroup
 	results := make(chan model.Result, len(tasks))
 	for _, task := range tasks {
@@ -67,6 +68,7 @@ func runCycle(supervisor string, cfg config.AgentConfig) error {
 	close(results)
 	batch := make([]model.Result, 0, len(tasks))
 	for result := range results {
+		result.AgentIP = agentIP
 		batch = append(batch, result)
 	}
 	if len(batch) == 0 {
@@ -89,6 +91,55 @@ func fetchTasks(supervisor string) ([]model.Task, error) {
 		return nil, err
 	}
 	return tasks, nil
+}
+
+func fetchAgentIP(cfg config.AgentConfig) string {
+	if strings.TrimSpace(cfg.PublicIPURL) != "" {
+		ip, err := fetchPublicIP(cfg.PublicIPURL)
+		if err != nil {
+			log.Printf("public ip lookup failed: %v", err)
+			return ""
+		}
+		return ip
+	}
+	ipv4, _ := fetchPublicIP(cfg.PublicIPv4URL)
+	ipv6, _ := fetchPublicIP(cfg.PublicIPv6URL)
+	switch {
+	case ipv4 != "" && ipv6 != "":
+		return ipv4 + " / " + ipv6
+	case ipv4 != "":
+		return ipv4
+	case ipv6 != "":
+		return ipv6
+	default:
+		log.Printf("public ip lookup failed for both IPv4 and IPv6 endpoints")
+		return ""
+	}
+}
+
+func fetchPublicIP(endpoint string) (string, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", nil
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("%s returned %s", endpoint, resp.Status)
+	}
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		return "", err
+	}
+	ip := strings.TrimSpace(buf.String())
+	if parsed := net.ParseIP(ip); parsed == nil {
+		return "", fmt.Errorf("%s returned invalid IP %q", endpoint, ip)
+	}
+	return ip, nil
 }
 
 func tcpPing(agent string, task model.Task) model.Result {

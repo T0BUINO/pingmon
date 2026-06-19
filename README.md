@@ -100,6 +100,8 @@ http://127.0.0.1:8080/dashboard
 
 Dashboard landing 按 agent 展示卡片，详情页按 target 展示曲线和日志。图表数据按时间范围查询，支持 `h` 小时、`d` 天、`w` 周、`mo` 月，其中 `mo` 按 30 天估算。页面会连接 `/ws`，agent 上报新结果后通过 WebSocket 自动刷新当前视图。
 
+详情页日志只显示最近的 WARN / ERROR 结果，最多 200 条，避免长期运行后成功上报把页面拉得过长。延迟图使用时间戳横轴，并对每条目标曲线做前端采样，长时间范围也会保持可读。
+
 ## Agent 参数
 
 ```text
@@ -115,7 +117,11 @@ agent 配置示例：
 supervisor_url = "http://127.0.0.1:8080"
 agent_name = "agent-1"
 poll_interval_seconds = 30
+public_ipv4_url = "https://api-ipv4.ip.sb/ip"
+public_ipv6_url = "https://api-ipv6.ip.sb/ip"
 ```
+
+`public_ipv4_url` / `public_ipv6_url` 用于 agent 主动获取双栈公网 IP 并随结果上报，适合容器内运行时避免只看到 Docker 内网 IP。默认分别使用 `https://api-ipv4.ip.sb/ip` 和 `https://api-ipv6.ip.sb/ip`；如果只获取到一个地址就上报一个，两个都失败时 supervisor 会继续用 HTTP 连接来源 IP 作为兜底。旧配置 `public_ip_url` 仍然可用，但它只会按当前网络出口返回一个地址。
 
 ## License
 

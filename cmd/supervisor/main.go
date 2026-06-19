@@ -39,6 +39,8 @@ type websocketHub struct {
 	clients map[net.Conn]struct{}
 }
 
+const maxProblemLogRows = 200
+
 func main() {
 	configPath := flag.String("config", "configs/supervisor.toml", "path to JSON or TOML config")
 	format := flag.String("format", "", "config format: json or toml")
@@ -53,7 +55,8 @@ func main() {
 		log.Fatalf("init storage: %v", err)
 	}
 	tpl := template.Must(template.New("dashboard").Funcs(template.FuncMap{
-		"mul": func(a, b float64) float64 { return a * b },
+		"mul":      func(a, b float64) float64 { return a * b },
+		"severity": resultSeverity,
 	}).Parse(dashboardHTML))
 	s := &server{cfg: cfg, store: store, tpl: tpl, hub: newWebsocketHub()}
 	go s.startRetentionCleaner()
@@ -160,9 +163,13 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if agent != "" {
 		results = filterResultsByAgent(results, agent)
 	}
+	templateResults := results
+	if agent != "" {
+		templateResults = problemResults(results, maxProblemLogRows)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.tpl.Execute(w, dashboardData{
-		Results:       results,
+		Results:       templateResults,
 		Agent:         agent,
 		Ranges:        s.cfg.DashboardRanges,
 		SelectedRange: selectedRange,
@@ -244,6 +251,38 @@ func filterResultsByAgent(results []model.Result, agent string) []model.Result {
 		}
 	}
 	return filtered
+}
+
+func problemResults(results []model.Result, limit int) []model.Result {
+	filtered := make([]model.Result, 0, minInt(len(results), limit))
+	for _, result := range results {
+		if !isProblemResult(result) {
+			continue
+		}
+		filtered = append(filtered, result)
+		if limit > 0 && len(filtered) >= limit {
+			break
+		}
+	}
+	return filtered
+}
+
+func isProblemResult(result model.Result) bool {
+	return result.FailureCount > 0 || result.SuccessRate < 1 || strings.TrimSpace(result.Error) != ""
+}
+
+func resultSeverity(result model.Result) string {
+	if result.SuccessCount == 0 || result.SuccessRate == 0 {
+		return "ERROR"
+	}
+	return "WARN"
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func remoteIP(remoteAddr string) string {
@@ -472,15 +511,22 @@ const dashboardHTML = `<!doctype html>
     .range-option:hover, .range-option.active { background: #eef2f7; }
     button, .button { display: inline-flex; align-items: center; justify-content: center; height: 34px; border: 1px solid transparent; background: #f8fafc; border-radius: 6px; padding: 0 12px; cursor: pointer; font-size: 14px; color: var(--ink); }
     button:hover, .button:hover { background: #eef2f7; border-color: transparent; }
+    .table-scroll { width: 100%; overflow-x: auto; border: 1px solid #e7ebf1; border-radius: 8px; }
+    .table-scroll table { min-width: 860px; }
     table { width: 100%; border-collapse: collapse; font-size: 14px; }
     th, td { border-bottom: 1px solid #e7ebf1; padding: 9px; text-align: left; }
+    th, td { white-space: nowrap; }
+    td:last-child { white-space: normal; min-width: 220px; overflow-wrap: anywhere; }
     th { background: #eef2f7; }
     .ok { color: #137333; font-weight: 600; }
     .bad { color: #b3261e; font-weight: 600; }
+    .warn { color: #a16207; font-weight: 600; }
+    .log-meta { margin: -4px 0 10px; }
     @media (max-width: 760px) {
       main { padding: 16px; }
       header { align-items: flex-start; flex-direction: column; }
       .detail-grid { grid-template-columns: repeat(2, 1fr); }
+      .table-scroll { -webkit-overflow-scrolling: touch; }
     }
   </style>
 </head>
@@ -515,27 +561,31 @@ const dashboardHTML = `<!doctype html>
         <div class="chart-wrap"><canvas id="latency"></canvas></div>
       </section>
       <section class="panel">
-        <h2>上报日志</h2>
-        <table>
-          <thead>
-            <tr><th>时间</th><th>节点 IP</th><th>目标</th><th>地址</th><th>成功率</th><th>平均延迟</th><th>错误</th></tr>
-          </thead>
-          <tbody>
-          {{range .Results}}
-            <tr>
-              <td class="local-time" data-time="{{.CheckedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}">{{.CheckedAt.Format "2006-01-02 15:04:05"}}</td>
-              <td>{{.AgentIP}}</td>
-              <td>{{.TargetName}}</td>
-              <td>{{.Address}}:{{.Port}}</td>
-              <td class="{{if gt .SuccessRate 0.99}}ok{{else}}bad{{end}}">{{printf "%.1f" (mul .SuccessRate 100)}}%</td>
-              <td>{{printf "%.2f" .AverageLatencyMS}} ms</td>
-              <td>{{.Error}}</td>
-            </tr>
-          {{else}}
-            <tr><td colspan="7">暂无数据</td></tr>
-          {{end}}
-          </tbody>
-        </table>
+        <h2>告警日志</h2>
+        <div class="subtle log-meta" id="logMeta">仅显示最近 {{len .Results}} 条 WARN / ERROR</div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr><th>时间</th><th>级别</th><th>节点 IP</th><th>目标</th><th>地址</th><th>成功率</th><th>平均延迟</th><th>错误</th></tr>
+            </thead>
+            <tbody id="problemLogBody">
+            {{range .Results}}
+              <tr>
+                <td class="local-time" data-time="{{.CheckedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}">{{.CheckedAt.Format "2006-01-02 15:04:05"}}</td>
+                <td class="{{if eq (severity .) "ERROR"}}bad{{else}}warn{{end}}">{{severity .}}</td>
+                <td>{{.AgentIP}}</td>
+                <td>{{.TargetName}}</td>
+                <td>{{.Address}}:{{.Port}}</td>
+                <td class="{{if gt .SuccessRate 0.99}}ok{{else}}bad{{end}}">{{printf "%.1f" (mul .SuccessRate 100)}}%</td>
+                <td>{{printf "%.2f" .AverageLatencyMS}} ms</td>
+                <td>{{.Error}}</td>
+              </tr>
+            {{else}}
+              <tr><td colspan="8">暂无 WARN / ERROR</td></tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
       </section>
     {{else}}
       <section class="cards" id="agentCards"></section>
@@ -543,6 +593,9 @@ const dashboardHTML = `<!doctype html>
   </main>
   <script>
     const colors = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#d97706', '#0891b2', '#be123c', '#4f46e5'];
+    const maxChartPointsPerSeries = 900;
+    const maxProblemLogRows = 200;
+    const minChartGapMs = 5 * 60 * 1000;
     const selectedAgent = '{{.Agent}}';
     let selectedRange = '{{.SelectedRange}}';
     let detailChart = null;
@@ -560,28 +613,80 @@ const dashboardHTML = `<!doctype html>
     function targetKey(row) {
       return row.target_name + ' (' + row.address + ':' + row.port + ')';
     }
+    function timeValue(row) {
+      const ts = new Date(row.checked_at).getTime();
+      return Number.isNaN(ts) ? null : ts;
+    }
+    function compactPoints(points, maxPoints) {
+      if (points.length <= maxPoints) return points;
+      const stride = Math.ceil(points.length / maxPoints);
+      const compacted = [];
+      for (let i = 0; i < points.length; i += stride) {
+        const bucket = points.slice(i, i + stride);
+        compacted.push({
+          x: bucket[Math.floor(bucket.length / 2)].x,
+          y: bucket.reduce((sum, point) => sum + point.y, 0) / bucket.length
+        });
+      }
+      return compacted;
+    }
+    function medianInterval(points) {
+      if (points.length < 3) return minChartGapMs;
+      const intervals = [];
+      for (let i = 1; i < points.length; i++) {
+        const gap = points[i].x - points[i - 1].x;
+        if (gap > 0) intervals.push(gap);
+      }
+      if (!intervals.length) return minChartGapMs;
+      intervals.sort((a, b) => a - b);
+      return intervals[Math.floor(intervals.length / 2)];
+    }
+    function splitLongGaps(points) {
+      if (points.length < 2) return points;
+      const threshold = Math.max(minChartGapMs, medianInterval(points) * 3);
+      const split = [points[0]];
+      for (let i = 1; i < points.length; i++) {
+        if (points[i].x - points[i - 1].x > threshold) {
+          split.push({x: points[i - 1].x + 1, y: null});
+          split.push({x: points[i].x - 1, y: null});
+        }
+        split.push(points[i]);
+      }
+      return split;
+    }
+    function formatTimeTick(value) {
+      const date = new Date(Number(value));
+      if (Number.isNaN(date.getTime())) return '';
+      const range = selectedRange.toLowerCase();
+      if (range.endsWith('h')) return date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+      if (range === '24h') return date.toLocaleString([], {month: '2-digit', day: '2-digit', hour: '2-digit'});
+      return date.toLocaleDateString([], {month: '2-digit', day: '2-digit'});
+    }
     function buildDatasets(rows) {
-      const labels = [...new Set(rows.map(row => new Date(row.checked_at).toLocaleString()))];
       const grouped = new Map();
       for (const row of rows) {
+        if (row.success_count <= 0) continue;
+        const ts = timeValue(row);
+        if (ts === null) continue;
         const key = targetKey(row);
         if (!grouped.has(key)) grouped.set(key, []);
-        grouped.get(key).push({x: new Date(row.checked_at).toLocaleString(), y: row.average_latency_ms});
+        grouped.get(key).push({x: ts, y: row.average_latency_ms});
       }
       const datasets = Array.from(grouped.entries()).map(([label, points], index) => {
-        const byTime = new Map(points.map(point => [point.x, point.y]));
+        points.sort((a, b) => a.x - b.x);
+        const compacted = splitLongGaps(compactPoints(points, maxChartPointsPerSeries));
         return {
           label,
-          data: labels.map(label => byTime.has(label) ? byTime.get(label) : null),
+          data: compacted,
           borderColor: colors[index % colors.length],
           backgroundColor: colors[index % colors.length],
-          tension: 0.25,
-          pointRadius: 2,
+          tension: 0,
+          pointRadius: compacted.length > 300 ? 0 : 2,
           borderWidth: 2,
-          spanGaps: true
+          spanGaps: false
         };
       });
-      return {labels, datasets};
+      return {datasets};
     }
     function summarizeAgent(rows) {
       const latest = rows[rows.length - 1];
@@ -644,7 +749,7 @@ const dashboardHTML = `<!doctype html>
             responsive: true,
             maintainAspectRatio: false,
             animation: false,
-            scales: {x: {display: false}, y: {display: false, beginAtZero: true}},
+            scales: {x: {type: 'linear', display: false}, y: {display: false, beginAtZero: true}},
             elements: {point: {radius: 0}},
             plugins: {legend: {display: false}, tooltip: {enabled: false}}
           }
@@ -662,6 +767,50 @@ const dashboardHTML = `<!doctype html>
       wrap.append(metric('节点 IP', summary.latest.agent_ip || '未知'));
       wrap.append(metric('监测目标', String(summary.targetCount)));
       wrap.append(metric('最后上报', new Date(summary.latest.checked_at).toLocaleString()));
+    }
+    function problemSeverity(row) {
+      return row.success_count === 0 || row.success_rate === 0 ? 'ERROR' : 'WARN';
+    }
+    function isProblemRow(row) {
+      return row.failure_count > 0 || row.success_rate < 1 || Boolean(row.error);
+    }
+    function renderProblemLog(rows) {
+      const tbody = document.getElementById('problemLogBody');
+      const meta = document.getElementById('logMeta');
+      if (!tbody) return;
+      const problems = rows.filter(isProblemRow).slice().reverse().slice(0, maxProblemLogRows);
+      tbody.innerHTML = '';
+      if (meta) meta.textContent = '仅显示最近 ' + problems.length + ' 条 WARN / ERROR，最多 ' + maxProblemLogRows + ' 条';
+      if (!problems.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 8;
+        td.textContent = '暂无 WARN / ERROR';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+      for (const row of problems) {
+        const tr = document.createElement('tr');
+        const cells = [
+          new Date(row.checked_at).toLocaleString(),
+          problemSeverity(row),
+          row.agent_ip || '未知',
+          row.target_name,
+          row.address + ':' + row.port,
+          (row.success_rate * 100).toFixed(1) + '%',
+          row.success_count > 0 ? row.average_latency_ms.toFixed(2) + ' ms' : '--',
+          row.error || ''
+        ];
+        cells.forEach((value, index) => {
+          const td = document.createElement('td');
+          td.textContent = value;
+          if (index === 1) td.className = value === 'ERROR' ? 'bad' : 'warn';
+          if (index === 5) td.className = row.success_rate > 0.99 ? 'ok' : 'bad';
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      }
     }
     function renderToggles(chart) {
       const wrap = document.getElementById('targetToggles');
@@ -686,9 +835,11 @@ const dashboardHTML = `<!doctype html>
       }
       if (!rows.length) {
         document.getElementById('agentInfo').innerHTML = '<div class="metric"><span>状态</span><strong>暂无数据</strong></div>';
+        renderProblemLog(rows);
         return;
       }
       renderAgentInfo(rows);
+      renderProblemLog(rows);
       const chartData = buildDatasets(rows);
       if (detailChart) {
         detailChart.data = chartData;
@@ -704,10 +855,22 @@ const dashboardHTML = `<!doctype html>
             animation: false,
             interaction: {mode: 'nearest', intersect: false},
             scales: {
-              x: {title: {display: true, text: '检查时间'}},
+              x: {
+                type: 'linear',
+                title: {display: true, text: '检查时间'},
+                ticks: {maxTicksLimit: 8, callback: value => formatTimeTick(value)}
+              },
               y: {beginAtZero: true, title: {display: true, text: '平均延迟 ms'}}
             },
-            plugins: {legend: {display: false}, tooltip: {enabled: true}}
+            plugins: {
+              legend: {display: false},
+              tooltip: {
+                enabled: true,
+                callbacks: {
+                  title: items => items.length ? new Date(items[0].parsed.x).toLocaleString() : ''
+                }
+              }
+            }
           }
         });
         renderToggles(detailChart);

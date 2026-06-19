@@ -33,6 +33,9 @@ type AgentConfig struct {
 	SupervisorURL       string `json:"supervisor_url"`
 	AgentName           string `json:"agent_name"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds"`
+	PublicIPURL         string `json:"public_ip_url"`
+	PublicIPv4URL       string `json:"public_ipv4_url"`
+	PublicIPv6URL       string `json:"public_ipv6_url"`
 }
 
 func DefaultConfig() Config {
@@ -63,7 +66,13 @@ func DefaultAgentConfig() AgentConfig {
 	if err != nil || host == "" {
 		host = "agent"
 	}
-	return AgentConfig{SupervisorURL: "http://127.0.0.1:8080", AgentName: host, PollIntervalSeconds: 30}
+	return AgentConfig{
+		SupervisorURL:       "http://127.0.0.1:8080",
+		AgentName:           host,
+		PollIntervalSeconds: 30,
+		PublicIPv4URL:       "https://api-ipv4.ip.sb/ip",
+		PublicIPv6URL:       "https://api-ipv6.ip.sb/ip",
+	}
 }
 
 func Load(path, format string) (Config, error) {
@@ -120,6 +129,11 @@ func LoadAgent(path, format string) (AgentConfig, error) {
 	}
 	if cfg.SupervisorURL == "" {
 		cfg.SupervisorURL = DefaultAgentConfig().SupervisorURL
+	}
+	def := DefaultAgentConfig()
+	if cfg.PublicIPURL == "" && cfg.PublicIPv4URL == "" && cfg.PublicIPv6URL == "" {
+		cfg.PublicIPv4URL = def.PublicIPv4URL
+		cfg.PublicIPv6URL = def.PublicIPv6URL
 	}
 	return cfg, nil
 }
@@ -255,6 +269,12 @@ func parseAgentTOML(input string, cfg *AgentConfig) error {
 			cfg.AgentName = parseString(value)
 		case "poll_interval_seconds":
 			cfg.PollIntervalSeconds = mustInt(key, value)
+		case "public_ip_url":
+			cfg.PublicIPURL = parseString(value)
+		case "public_ipv4_url":
+			cfg.PublicIPv4URL = parseString(value)
+		case "public_ipv6_url":
+			cfg.PublicIPv6URL = parseString(value)
 		}
 	}
 	return scanner.Err()

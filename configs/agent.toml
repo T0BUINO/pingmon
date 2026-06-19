@@ -1,3 +1,5 @@
 supervisor_url = "http://127.0.0.1:8080"
 agent_name = "agent-1"
 poll_interval_seconds = 30
+public_ipv4_url = "https://api-ipv4.ip.sb/ip"
+public_ipv6_url = "https://api-ipv6.ip.sb/ip"
