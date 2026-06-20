@@ -1030,6 +1030,23 @@ const dashboardHTML = `<!doctype html>
         if (ticks[ticks.length - 1] !== xRange.max) ticks.push(xRange.max);
         return ticks;
       }
+      visibleXTicks(ticks, xRange, area) {
+        const placed = [];
+        const measure = value => Math.max(38, formatTimeTick(value).length * 7 + 10);
+        const pixelFor = value => area.left + (value - xRange.min) / Math.max(1, xRange.max - xRange.min) * (area.right - area.left);
+        for (const value of ticks) {
+          const x = pixelFor(value);
+          const width = measure(value);
+          const start = x - width / 2;
+          const end = x + width / 2;
+          const last = placed[placed.length - 1];
+          if (!last || start > last.end + 8 || value === xRange.max) {
+            if (value === xRange.max && last && start <= last.end + 8 && last.value !== xRange.min) placed.pop();
+            placed.push({value, x, start, end});
+          }
+        }
+        return placed.map(item => item.value);
+      }
       renderAxes(area, xRange, yRange) {
         const grid = this.appendEl(this.svg, 'g', {stroke: '#e7ebf1', 'stroke-width': 1});
         const labels = this.appendEl(this.svg, 'g', {fill: '#64748b', 'font-size': 11});
@@ -1040,7 +1057,7 @@ const dashboardHTML = `<!doctype html>
           const text = this.appendEl(labels, 'text', {x: 4, y, 'dominant-baseline': value === 0 ? 'auto' : 'middle'});
           text.textContent = value === 0 ? '0' : Math.round(value) + 'ms';
         });
-        const xTicks = this.xTicks(xRange);
+        const xTicks = this.visibleXTicks(this.xTicks(xRange), xRange, area);
         xTicks.forEach((value, index) => {
           const x = area.left + (value - xRange.min) / Math.max(1, xRange.max - xRange.min) * (area.right - area.left);
           const anchor = index === 0 ? 'start' : index === xTicks.length - 1 ? 'end' : 'middle';
