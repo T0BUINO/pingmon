@@ -240,6 +240,8 @@ func rangeDuration(raw string) time.Duration {
 		multiplier = 30 * 24 * time.Hour
 	} else {
 		switch unit {
+		case "m":
+			multiplier = time.Minute
 		case "h":
 			multiplier = time.Hour
 		case "d":
@@ -694,10 +696,11 @@ const dashboardHTML = `<!doctype html>
     }
     function parseRangeMillis(raw) {
       const value = String(raw || '24h').trim().toLowerCase();
-      const match = value.match(/^(\d+)(h|d|w|mo)$/);
+      const match = value.match(/^(\d+)(m|h|d|w|mo)$/);
       if (!match) return 24 * 60 * 60 * 1000;
       const amount = Number(match[1]);
       const multipliers = {
+        m: 60 * 1000,
         h: 60 * 60 * 1000,
         d: 24 * 60 * 60 * 1000,
         w: 7 * 24 * 60 * 60 * 1000,
@@ -803,6 +806,7 @@ const dashboardHTML = `<!doctype html>
       const date = new Date(Number(value));
       if (Number.isNaN(date.getTime())) return '';
       const range = selectedRange.toLowerCase();
+      if (range.endsWith('m')) return date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
       if (range.endsWith('h')) return date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
       if (range === '24h') return date.toLocaleString([], {month: '2-digit', day: '2-digit', hour: '2-digit'});
       return date.toLocaleDateString([], {month: '2-digit', day: '2-digit'});

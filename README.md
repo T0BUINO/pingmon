@@ -90,7 +90,7 @@ http://127.0.0.1:8080/dashboard
 - `sqlite_path`：SQLite 数据库路径。
 - `data_file`：使用 `storage = "file"` 时的 JSONL 结果文件路径。
 - `dashboard_user` / `dashboard_password`：Dashboard 和 `/api/results` 的 Basic Auth 账号密码。
-- `dashboard_ranges`：Dashboard 可选时间范围，例如 `["12h", "24h", "3d", "7d", "14d", "30d", "60d", "180d", "365d"]`。
+- `dashboard_ranges`：Dashboard 可选时间范围，支持分钟/小时/天/周/月，例如 `["5m", "15m", "30m", "12h", "24h", "3d", "7d", "14d", "30d", "60d", "180d", "365d"]`。
 - `default_range`：Dashboard 默认时间范围，例如 `24h`。
 - `retention_days`：数据保留天数，默认 `365`。
 - `raw_retention_days`：原始上报数据保留天数，默认 `30`。更早的原始数据会先聚合再删除。

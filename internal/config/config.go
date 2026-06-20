@@ -48,7 +48,7 @@ func DefaultConfig() Config {
 		SQLitePath:          "data/pingmon.db",
 		DashboardUser:       "admin",
 		DashboardPassword:   "admin",
-		DashboardRanges:     []string{"12h", "24h", "3d", "7d", "14d", "30d", "60d", "180d", "365d"},
+		DashboardRanges:     []string{"5m", "15m", "30m", "12h", "24h", "3d", "7d", "14d", "30d", "60d", "180d", "365d"},
 		DefaultRange:        "24h",
 		RetentionDays:       365,
 		RawRetentionDays:    30,
