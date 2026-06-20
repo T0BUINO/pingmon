@@ -720,6 +720,7 @@ const dashboardHTML = `<!doctype html>
     .live-badge { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #bbf7d0; border-radius: 999px; padding: 2px 8px; background: #f0fdf4; color: #166534; font-size: 12px; font-weight: 600; vertical-align: middle; }
     .live-badge::before { content: ""; width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
     .live-badge.reconnecting { border-color: #fed7aa; background: #fff7ed; color: #9a3412; }
+    .agent-state-badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 700; }
     input { height: 34px; border: 1px solid transparent; border-radius: 6px; padding: 0 11px; background: #f8fafc; color: var(--ink); font-size: 14px; line-height: 34px; }
     .range-menu { position: relative; flex: 0 0 auto; }
     .range-button { min-width: 78px; justify-content: space-between; gap: 10px; }
@@ -736,6 +737,7 @@ const dashboardHTML = `<!doctype html>
     button, .button { display: inline-flex; align-items: center; justify-content: center; height: 34px; border: 1px solid #e5eaf1; background: #fbfcfe; border-radius: 6px; padding: 0 12px; cursor: pointer; font: 500 14px/1 system-ui, -apple-system, Segoe UI, sans-serif; color: var(--ink); }
     button:hover, .button:hover { background: #f1f5f9; border-color: #cbd5e1; }
     button:focus-visible, .button:focus-visible { outline: 2px solid rgba(37, 99, 235, .28); outline-offset: 2px; }
+    [hidden] { display: none !important; }
     button.danger { border-color: #fecaca; background: #fef2f2; color: #991b1b; }
     button.danger:hover { border-color: #fca5a5; background: #fee2e2; }
     .delete-agent { height: 28px; padding: 0 9px; font-size: 12px; }
@@ -1695,6 +1697,9 @@ const dashboardHTML = `<!doctype html>
       if (!summary) return {text: '暂无数据', className: 'idle'};
       return summary.successRate >= 0.99 ? {text: '正常', className: 'ok'} : {text: '异常', className: 'bad'};
     }
+    function agentStateBadgeHTML(state) {
+      return '<span class="agent-state-badge status ' + state.className + '">' + state.text + '</span>';
+    }
     function lastSeenText(status, summary) {
       const raw = status && status.last_seen_at ? status.last_seen_at : summary && summary.latest && summary.latest.checked_at;
       if (!raw) return '未知';
@@ -1860,10 +1865,9 @@ const dashboardHTML = `<!doctype html>
       const deleteButton = document.getElementById('deleteAgentButton');
       if (deleteButton) deleteButton.hidden = state.className !== 'offline';
       const subtitle = document.getElementById('pageSubtitle');
-      subtitle.innerHTML = '最后在线：' + lastSeenText(statusInfo, summary) + '<span class="live-badge" id="liveState">实时</span>';
+      subtitle.innerHTML = '最后在线：' + lastSeenText(statusInfo, summary) + '<span class="live-badge" id="liveState">实时</span>' + agentStateBadgeHTML(state);
       wrap.append(metric('节点名称', (summary && summary.latest.agent) || (statusInfo && statusInfo.agent) || selectedAgent));
       wrap.append(metric('节点 IP', agentIPText(statusInfo, summary)));
-      wrap.append(metric('状态', state.text));
       wrap.append(metric('监测目标', summary ? String(summary.targetCount) : '0'));
       wrap.append(metric('最后在线', lastSeenText(statusInfo, summary)));
     }
