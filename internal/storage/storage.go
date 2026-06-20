@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,9 @@ import (
 )
 
 type Store interface {
+	SaveAgentHeartbeat(agent, agentIP string, seenAt time.Time) error
+	ListAgentStatuses() ([]model.AgentStatus, error)
+	DeleteAgent(agent string) error
 	SaveResult(model.Result) error
 	RecentResults(limit int) ([]model.Result, error)
 	ResultsSince(since time.Time) ([]model.Result, error)
@@ -109,11 +113,72 @@ CREATE TABLE IF NOT EXISTS result_rollups (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_result_rollups_unique
 ON result_rollups(series_id, bucket_start, interval_seconds);
 CREATE INDEX IF NOT EXISTS idx_result_rollups_bucket ON result_rollups(bucket_start DESC);
+
+CREATE TABLE IF NOT EXISTS agent_statuses (
+	agent TEXT PRIMARY KEY,
+	agent_ip TEXT NOT NULL,
+	first_seen_at TEXT NOT NULL,
+	last_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_statuses_last_seen_at ON agent_statuses(last_seen_at DESC);
 `)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+func (s *SQLiteStore) SaveAgentHeartbeat(agent, agentIP string, seenAt time.Time) error {
+	agent = strings.TrimSpace(agent)
+	if agent == "" {
+		return nil
+	}
+	seen := seenAt.UTC().Format(time.RFC3339Nano)
+	_, err := s.db.Exec(`
+INSERT INTO agent_statuses (agent, agent_ip, first_seen_at, last_seen_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(agent) DO UPDATE SET
+	agent_ip = excluded.agent_ip,
+	last_seen_at = excluded.last_seen_at`,
+		agent, agentIP, seen, seen)
+	return err
+}
+
+func (s *SQLiteStore) ListAgentStatuses() ([]model.AgentStatus, error) {
+	rows, err := s.db.Query(`
+SELECT agent, agent_ip, first_seen_at, last_seen_at
+FROM agent_statuses
+ORDER BY last_seen_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAgentStatuses(rows)
+}
+
+func (s *SQLiteStore) DeleteAgent(agent string) error {
+	agent = strings.TrimSpace(agent)
+	if agent == "" {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM results WHERE series_id IN (SELECT id FROM result_series WHERE agent = ?)`, agent); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM result_rollups WHERE series_id IN (SELECT id FROM result_series WHERE agent = ?)`, agent); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM result_series WHERE agent = ?`, agent); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM agent_statuses WHERE agent = ?`, agent); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) seriesID(agent, agentIP, targetName, address string, port int, labels string) (int64, error) {
@@ -358,6 +423,30 @@ func scanResult(scanner resultScanner) (model.Result, error) {
 	return result, nil
 }
 
+func scanAgentStatuses(rows resultRows) ([]model.AgentStatus, error) {
+	var statuses []model.AgentStatus
+	for rows.Next() {
+		var status model.AgentStatus
+		var firstSeenAt string
+		var lastSeenAt string
+		if err := rows.Scan(&status.Agent, &status.AgentIP, &firstSeenAt, &lastSeenAt); err != nil {
+			return nil, err
+		}
+		first, err := time.Parse(time.RFC3339Nano, firstSeenAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse first_seen_at %q: %w", firstSeenAt, err)
+		}
+		last, err := time.Parse(time.RFC3339Nano, lastSeenAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse last_seen_at %q: %w", lastSeenAt, err)
+		}
+		status.FirstSeenAt = first
+		status.LastSeenAt = last
+		statuses = append(statuses, status)
+	}
+	return statuses, rows.Err()
+}
+
 func truncateUTC(t time.Time, d time.Duration) time.Time {
 	return t.UTC().Truncate(d)
 }
@@ -380,6 +469,73 @@ func NewFileStore(path string) (*FileStore, error) {
 	}
 	_ = file.Close()
 	return &FileStore{path: path}, nil
+}
+
+func (s *FileStore) SaveAgentHeartbeat(agent, agentIP string, seenAt time.Time) error {
+	agent = strings.TrimSpace(agent)
+	if agent == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	statuses, err := s.readAgentStatusesLocked()
+	if err != nil {
+		return err
+	}
+	status := statuses[agent]
+	if status.Agent == "" {
+		status.Agent = agent
+		status.FirstSeenAt = seenAt
+	}
+	status.AgentIP = agentIP
+	status.LastSeenAt = seenAt
+	statuses[agent] = status
+	return s.writeAgentStatusesLocked(statuses)
+}
+
+func (s *FileStore) ListAgentStatuses() ([]model.AgentStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	statuses, err := s.readAgentStatusesLocked()
+	if err != nil {
+		return nil, err
+	}
+	list := make([]model.AgentStatus, 0, len(statuses))
+	for _, status := range statuses {
+		list = append(list, status)
+	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].LastSeenAt.After(list[j].LastSeenAt)
+	})
+	return list, nil
+}
+
+func (s *FileStore) DeleteAgent(agent string) error {
+	agent = strings.TrimSpace(agent)
+	if agent == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	statuses, err := s.readAgentStatusesLocked()
+	if err != nil {
+		return err
+	}
+	delete(statuses, agent)
+	if err := s.writeAgentStatusesLocked(statuses); err != nil {
+		return err
+	}
+	results, err := s.readAllLocked()
+	if err != nil {
+		return err
+	}
+	kept := make([]model.Result, 0, len(results))
+	for _, result := range results {
+		if result.Agent != agent {
+			kept = append(kept, result)
+		}
+	}
+	return s.writeResultsLocked(kept)
 }
 
 func (s *FileStore) SaveResult(result model.Result) error {
@@ -524,4 +680,59 @@ func (s *FileStore) readAllLocked() ([]model.Result, error) {
 		results = append(results, result)
 	}
 	return results, scanner.Err()
+}
+
+func (s *FileStore) writeResultsLocked(results []model.Result) error {
+	tmp := s.path + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(file)
+	for _, result := range results {
+		if err := enc.Encode(result); err != nil {
+			_ = file.Close()
+			return err
+		}
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
+func (s *FileStore) agentStatusPath() string {
+	return s.path + ".agents.json"
+}
+
+func (s *FileStore) readAgentStatusesLocked() (map[string]model.AgentStatus, error) {
+	file, err := os.Open(s.agentStatusPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]model.AgentStatus{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	statuses := map[string]model.AgentStatus{}
+	if err := json.NewDecoder(file).Decode(&statuses); err != nil {
+		return nil, err
+	}
+	return statuses, nil
+}
+
+func (s *FileStore) writeAgentStatusesLocked(statuses map[string]model.AgentStatus) error {
+	tmp := s.agentStatusPath() + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	if err := json.NewEncoder(file).Encode(statuses); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.agentStatusPath())
 }

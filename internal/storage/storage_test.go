@@ -106,6 +106,89 @@ func TestSQLiteRollupAndCompactedResults(t *testing.T) {
 	}
 }
 
+func TestSQLiteAgentHeartbeat(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pingmon.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.db.Close()
+
+	firstSeen := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+	lastSeen := firstSeen.Add(2 * time.Minute)
+	if err := store.SaveAgentHeartbeat("agent-1", "203.0.113.1", firstSeen); err != nil {
+		t.Fatalf("SaveAgentHeartbeat first: %v", err)
+	}
+	if err := store.SaveAgentHeartbeat("agent-1", "203.0.113.2", lastSeen); err != nil {
+		t.Fatalf("SaveAgentHeartbeat second: %v", err)
+	}
+	if err := store.SaveAgentHeartbeat("agent-2", "2001:db8::2", firstSeen.Add(time.Minute)); err != nil {
+		t.Fatalf("SaveAgentHeartbeat agent-2: %v", err)
+	}
+
+	statuses, err := store.ListAgentStatuses()
+	if err != nil {
+		t.Fatalf("ListAgentStatuses: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("len(statuses) = %d, want 2", len(statuses))
+	}
+	if statuses[0].Agent != "agent-1" || statuses[0].AgentIP != "203.0.113.2" {
+		t.Fatalf("latest status = %+v, want updated agent-1", statuses[0])
+	}
+	if !statuses[0].FirstSeenAt.Equal(firstSeen) {
+		t.Fatalf("first_seen_at = %s, want %s", statuses[0].FirstSeenAt, firstSeen)
+	}
+	if !statuses[0].LastSeenAt.Equal(lastSeen) {
+		t.Fatalf("last_seen_at = %s, want %s", statuses[0].LastSeenAt, lastSeen)
+	}
+}
+
+func TestSQLiteDeleteAgentRemovesStatusesAndResults(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pingmon.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.db.Close()
+
+	seenAt := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+	for _, agent := range []string{"agent-1", "agent-2"} {
+		if err := store.SaveAgentHeartbeat(agent, "203.0.113.1", seenAt); err != nil {
+			t.Fatalf("SaveAgentHeartbeat %s: %v", agent, err)
+		}
+		if err := store.SaveResult(model.Result{
+			Agent:            agent,
+			AgentIP:          "203.0.113.1",
+			TargetName:       "web",
+			Address:          "198.51.100.10",
+			Port:             443,
+			CheckedAt:        seenAt,
+			SuccessCount:     3,
+			AverageLatencyMS: 5,
+			SuccessRate:      1,
+		}); err != nil {
+			t.Fatalf("SaveResult %s: %v", agent, err)
+		}
+	}
+
+	if err := store.DeleteAgent("agent-1"); err != nil {
+		t.Fatalf("DeleteAgent: %v", err)
+	}
+	statuses, err := store.ListAgentStatuses()
+	if err != nil {
+		t.Fatalf("ListAgentStatuses: %v", err)
+	}
+	if len(statuses) != 1 || statuses[0].Agent != "agent-2" {
+		t.Fatalf("statuses = %+v, want only agent-2", statuses)
+	}
+	results, err := store.ResultsSince(seenAt.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("ResultsSince: %v", err)
+	}
+	if len(results) != 1 || results[0].Agent != "agent-2" {
+		t.Fatalf("results = %+v, want only agent-2", results)
+	}
+}
+
 func TestSQLiteMigratesLegacySchemaToSeries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pingmon.db")
 	db, err := sql.Open("sqlite", path)

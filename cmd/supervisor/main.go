@@ -45,6 +45,15 @@ type websocketEvent struct {
 	Results []model.Result `json:"results,omitempty"`
 }
 
+type agentStatusView struct {
+	Agent               string    `json:"agent"`
+	AgentIP             string    `json:"agent_ip,omitempty"`
+	FirstSeenAt         time.Time `json:"first_seen_at"`
+	LastSeenAt          time.Time `json:"last_seen_at"`
+	OfflineAfterSeconds int       `json:"offline_after_seconds"`
+	Status              string    `json:"status"`
+}
+
 const maxProblemLogRows = 200
 
 func main() {
@@ -89,6 +98,7 @@ func main() {
 	})
 	mux.HandleFunc("/api/tasks", s.handleTasks)
 	mux.HandleFunc("/api/report", s.handleReport)
+	mux.HandleFunc("/api/agents", s.requireDashboardAuth(s.handleAgents))
 	mux.HandleFunc("/api/results", s.requireDashboardAuth(s.handleResults))
 	mux.HandleFunc("/ws", s.requireDashboardAuth(s.handleWebSocket))
 	mux.HandleFunc("/dashboard", s.handleDashboard)
@@ -101,6 +111,16 @@ func (s *server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+	agent, agentIP := agentIdentityFromRequest(r)
+	if agent != "" {
+		if agentIP == "" {
+			agentIP = remoteIP(r.RemoteAddr)
+		}
+		if err := s.store.SaveAgentHeartbeat(agent, agentIP, time.Now()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	tasks := make([]model.Task, 0, len(s.cfg.Targets))
 	for _, target := range s.cfg.Targets {
@@ -130,10 +150,15 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agentIP := remoteIP(r.RemoteAddr)
+	seenAt := time.Now()
 	saved := make([]model.Result, 0, len(results))
 	for _, result := range results {
 		normalizeReport(&result, agentIP)
 		if err := s.store.SaveResult(result); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := s.store.SaveAgentHeartbeat(result.Agent, result.AgentIP, seenAt); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -146,6 +171,32 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 	}
 	s.hub.broadcastJSON(websocketEvent{Type: "results", Results: saved})
 	writeJSON(w, map[string]any{"status": "ok", "saved": len(results)})
+}
+
+func agentIdentityFromRequest(r *http.Request) (string, string) {
+	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
+	agentIP := strings.TrimSpace(r.URL.Query().Get("agent_ip"))
+	if agent == "" {
+		agent = strings.TrimSpace(r.Header.Get("X-Pingmon-Agent"))
+	}
+	if agentIP == "" {
+		agentIP = strings.TrimSpace(r.Header.Get("X-Pingmon-Agent-IP"))
+	}
+	if (agent == "" || agentIP == "") && r.Body != nil {
+		var payload struct {
+			Agent   string `json:"agent"`
+			AgentIP string `json:"agent_ip"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err == nil {
+			if agent == "" {
+				agent = strings.TrimSpace(payload.Agent)
+			}
+			if agentIP == "" {
+				agentIP = strings.TrimSpace(payload.AgentIP)
+			}
+		}
+	}
+	return agent, agentIP
 }
 
 func decodeReportPayload(raw json.RawMessage) ([]model.Result, error) {
@@ -218,6 +269,67 @@ func (s *server) handleResults(w http.ResponseWriter, r *http.Request) {
 		results = filterResultsByAgent(results, agent)
 	}
 	writeJSON(w, results)
+}
+
+func (s *server) handleAgents(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodDelete {
+		s.handleDeleteAgent(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	statuses, err := s.store.ListAgentStatuses()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	offlineAfter := s.agentOfflineAfterSeconds()
+	now := time.Now()
+	out := make([]agentStatusView, 0, len(statuses))
+	for _, status := range statuses {
+		state := "online"
+		if now.Sub(status.LastSeenAt) > time.Duration(offlineAfter)*time.Second {
+			state = "offline"
+		}
+		out = append(out, agentStatusView{
+			Agent:               status.Agent,
+			AgentIP:             status.AgentIP,
+			FirstSeenAt:         status.FirstSeenAt,
+			LastSeenAt:          status.LastSeenAt,
+			OfflineAfterSeconds: offlineAfter,
+			Status:              state,
+		})
+	}
+	writeJSON(w, out)
+}
+
+func (s *server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
+	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
+	if agent == "" {
+		http.Error(w, "agent is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.store.DeleteAgent(agent); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if s.hub != nil {
+		s.hub.broadcast("refresh")
+	}
+	writeJSON(w, map[string]any{"status": "ok", "agent": agent})
+}
+
+func (s *server) agentOfflineAfterSeconds() int {
+	seconds := s.cfg.Params.ScheduleSeconds
+	if seconds <= 0 {
+		seconds = s.cfg.TaskIntervalSeconds
+	}
+	if seconds <= 0 {
+		seconds = 30
+	}
+	return seconds * 3
 }
 
 func (s *server) selectedRange(r *http.Request) string {
@@ -568,13 +680,16 @@ const dashboardHTML = `<!doctype html>
     .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 18px; }
     .page-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-left: auto; }
     .cards { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 14px; }
-    .agent-card { display: block; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; min-height: 220px; content-visibility: auto; contain-intrinsic-size: 360px 220px; contain: layout paint; transition: border-color .15s, transform .15s, box-shadow .15s; }
+    .agent-card { display: block; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; min-height: 220px; content-visibility: auto; contain-intrinsic-size: 360px 220px; contain: layout paint; cursor: pointer; transition: border-color .15s, transform .15s, box-shadow .15s; }
     .agent-card:hover { border-color: #94a3b8; transform: translateY(-1px); box-shadow: 0 10px 24px rgba(15, 23, 42, .08); }
     .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
+    .card-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
     .agent-name { font-weight: 700; font-size: 17px; overflow-wrap: anywhere; }
     .status { border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; white-space: nowrap; }
     .status.ok { background: #dcfce7; color: #166534; }
     .status.bad { background: #fee2e2; color: #991b1b; }
+    .status.offline { background: #e5e7eb; color: #374151; }
+    .status.idle { background: #e0f2fe; color: #075985; }
     .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0; }
     .metric { border: 1px solid #e5eaf1; border-radius: 6px; padding: 8px; background: #fbfcfe; min-width: 0; }
     .metric span { display: block; color: var(--muted); font-size: 12px; }
@@ -621,6 +736,9 @@ const dashboardHTML = `<!doctype html>
     button, .button { display: inline-flex; align-items: center; justify-content: center; height: 34px; border: 1px solid #e5eaf1; background: #fbfcfe; border-radius: 6px; padding: 0 12px; cursor: pointer; font: 500 14px/1 system-ui, -apple-system, Segoe UI, sans-serif; color: var(--ink); }
     button:hover, .button:hover { background: #f1f5f9; border-color: #cbd5e1; }
     button:focus-visible, .button:focus-visible { outline: 2px solid rgba(37, 99, 235, .28); outline-offset: 2px; }
+    button.danger { border-color: #fecaca; background: #fef2f2; color: #991b1b; }
+    button.danger:hover { border-color: #fca5a5; background: #fee2e2; }
+    .delete-agent { height: 28px; padding: 0 9px; font-size: 12px; }
     .table-scroll { width: 100%; overflow-x: auto; border: 1px solid #e7ebf1; border-radius: 8px; }
     .table-scroll table { min-width: 860px; }
     table { width: 100%; border-collapse: collapse; font-size: 14px; }
@@ -673,6 +791,7 @@ const dashboardHTML = `<!doctype html>
           </div>
         </div>
         <button type="button" id="refreshButton">刷新</button>
+        {{if .Agent}}<button class="danger" type="button" id="deleteAgentButton" hidden>删除结果</button>{{end}}
         {{if .Agent}}<a class="button" id="backButton" href="/dashboard?range={{.SelectedRange}}">返回</a>{{end}}
       </form>
     </header>
@@ -735,6 +854,7 @@ const dashboardHTML = `<!doctype html>
     let miniChartObserver = null;
     let selectedLabels = null;
     let currentRows = [];
+    let currentAgents = [];
     let currentAgentRows = [];
     let chartFullRange = null;
     let chartViewRange = null;
@@ -752,6 +872,24 @@ const dashboardHTML = `<!doctype html>
       const res = await fetch('/api/results?range=' + encodeURIComponent(selectedRange) + agentParam);
       if (!res.ok) throw new Error('结果数据加载失败，状态码：' + res.status);
       return (await res.json()).reverse();
+    }
+    async function loadAgents() {
+      const res = await fetch('/api/agents');
+      if (!res.ok) throw new Error('节点状态加载失败，状态码：' + res.status);
+      return await res.json();
+    }
+    async function deleteAgent(agent) {
+      if (!agent) return;
+      if (!confirm('将删除 ' + agent + ' 的所有历史结果和离线记录，不能撤销。')) return;
+      const res = await fetch('/api/agents?agent=' + encodeURIComponent(agent), {method: 'DELETE'});
+      if (!res.ok) throw new Error('删除结果失败，状态码：' + res.status);
+      currentAgents = currentAgents.filter(item => item.agent !== agent);
+      currentRows = currentRows.filter(row => row.agent !== agent);
+      if (selectedAgent === agent) {
+        location.href = '/dashboard?range=' + encodeURIComponent(selectedRange);
+        return;
+      }
+      renderDashboardRows(currentRows);
     }
     function parseRangeMillis(raw) {
       const value = String(raw || '24h').trim().toLowerCase();
@@ -1549,6 +1687,23 @@ const dashboardHTML = `<!doctype html>
       const targets = new Set(rows.map(targetKey));
       return {latest, successRate, averageLatency, targetCount: targets.size};
     }
+    function findAgentStatus(agent) {
+      return currentAgents.find(item => item.agent === agent) || null;
+    }
+    function agentStatusLabel(status, summary) {
+      if (status && status.status === 'offline') return {text: '离线', className: 'offline'};
+      if (!summary) return {text: '暂无数据', className: 'idle'};
+      return summary.successRate >= 0.99 ? {text: '正常', className: 'ok'} : {text: '异常', className: 'bad'};
+    }
+    function lastSeenText(status, summary) {
+      const raw = status && status.last_seen_at ? status.last_seen_at : summary && summary.latest && summary.latest.checked_at;
+      if (!raw) return '未知';
+      const date = new Date(raw);
+      return Number.isNaN(date.getTime()) ? '未知' : date.toLocaleString();
+    }
+    function agentIPText(status, summary) {
+      return (status && status.agent_ip) || (summary && summary.latest && summary.latest.agent_ip) || '未知';
+    }
     function metric(label, value) {
       const div = document.createElement('div');
       div.className = 'metric';
@@ -1627,38 +1782,68 @@ const dashboardHTML = `<!doctype html>
         if (!groups.has(row.agent)) groups.set(row.agent, []);
         groups.get(row.agent).push(row);
       }
-      if (!groups.size) {
+      const agentNames = new Set(currentAgents.map(agent => agent.agent).filter(Boolean));
+      groups.forEach((_, agent) => agentNames.add(agent));
+      if (!agentNames.size) {
         destroyMiniCharts();
         wrap.innerHTML = '<div class="panel">暂无节点上报数据</div>';
         return;
       }
       wrap.querySelectorAll('.panel').forEach(panel => panel.remove());
       const activeAgents = new Set();
-      Array.from(groups.entries()).forEach(([agent, agentRows], index) => {
-        const summary = summarizeAgent(agentRows);
+      Array.from(agentNames).sort((a, b) => a.localeCompare(b)).forEach(agent => {
+        const agentRows = groups.get(agent) || [];
+        const summary = agentRows.length ? summarizeAgent(agentRows) : null;
+        const statusInfo = findAgentStatus(agent);
+        const state = agentStatusLabel(statusInfo, summary);
+        const detailURL = '/dashboard?agent=' + encodeURIComponent(agent) + '&range=' + encodeURIComponent(selectedRange);
         activeAgents.add(agent);
         let card = existingCards.get(agent);
         if (!card) {
-          card = document.createElement('a');
+          card = document.createElement('div');
           card.className = 'agent-card';
+          card.tabIndex = 0;
+          card.setAttribute('role', 'link');
           card.innerHTML =
-            '<div class="card-head"><div><div class="agent-name"></div><div class="subtle"></div></div><span class="status"></span></div>' +
+            '<div class="card-head"><div><div class="agent-name"></div><div class="subtle"></div></div><div class="card-actions"><span class="status"></span><button class="danger delete-agent" type="button" hidden>删除结果</button></div></div>' +
             '<div class="metrics"></div><div class="mini-chart chart-surface"></div>';
+          card.addEventListener('click', event => {
+            if (event.target.closest('button')) return;
+            location.href = card.dataset.href;
+          });
+          card.addEventListener('keydown', event => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            location.href = card.dataset.href;
+          });
         }
         card.dataset.agent = agent;
-        card.href = '/dashboard?agent=' + encodeURIComponent(agent) + '&range=' + encodeURIComponent(selectedRange);
+        card.dataset.href = detailURL;
         card.querySelector('.agent-name').textContent = agent;
-        card.querySelector('.subtle').textContent = '节点 IP：' + (summary.latest.agent_ip || '未知') + ' · 最后上报：' + new Date(summary.latest.checked_at).toLocaleString();
+        card.querySelector('.subtle').textContent = '节点 IP：' + agentIPText(statusInfo, summary) + ' · 最后在线：' + lastSeenText(statusInfo, summary);
         const status = card.querySelector('.status');
-        status.textContent = summary.successRate >= 0.99 ? '正常' : '异常';
-        status.className = 'status ' + (summary.successRate >= 0.99 ? 'ok' : 'bad');
+        status.textContent = state.text;
+        status.className = 'status ' + state.className;
+        const deleteButton = card.querySelector('.delete-agent');
+        deleteButton.hidden = state.className !== 'offline';
+        deleteButton.onclick = event => {
+          event.preventDefault();
+          event.stopPropagation();
+          deleteAgent(agent).catch(handleRefreshError);
+        };
         const metrics = card.querySelector('.metrics');
         metrics.replaceChildren();
-        metrics.append(metric('目标数', String(summary.targetCount)));
-        metrics.append(metric('成功率', (summary.successRate * 100).toFixed(1) + '%'));
-        metrics.append(metric('平均延迟', summary.averageLatency.toFixed(1) + ' ms'));
+        metrics.append(metric('目标数', summary ? String(summary.targetCount) : '0'));
+        metrics.append(metric('成功率', summary ? (summary.successRate * 100).toFixed(1) + '%' : '--'));
+        metrics.append(metric('平均延迟', summary ? summary.averageLatency.toFixed(1) + ' ms' : '--'));
         wrap.appendChild(card);
-        queueMiniChart(card.querySelector('.mini-chart'), agentRows);
+        const chartSurface = card.querySelector('.mini-chart');
+        if (agentRows.length) {
+          queueMiniChart(chartSurface, agentRows);
+        } else {
+          destroyMiniChartSurface(chartSurface);
+          chartSurface.innerHTML = '';
+        }
       });
       existingCards.forEach((card, agent) => {
         if (activeAgents.has(agent)) return;
@@ -1669,13 +1854,18 @@ const dashboardHTML = `<!doctype html>
     function renderAgentInfo(rows) {
       const wrap = document.getElementById('agentInfo');
       wrap.innerHTML = '';
-      const summary = summarizeAgent(rows);
+      const statusInfo = findAgentStatus(selectedAgent);
+      const summary = rows.length ? summarizeAgent(rows) : null;
+      const state = agentStatusLabel(statusInfo, summary);
+      const deleteButton = document.getElementById('deleteAgentButton');
+      if (deleteButton) deleteButton.hidden = state.className !== 'offline';
       const subtitle = document.getElementById('pageSubtitle');
-      subtitle.innerHTML = '最后上报：' + new Date(summary.latest.checked_at).toLocaleString() + '<span class="live-badge" id="liveState">实时</span>';
-      wrap.append(metric('节点名称', summary.latest.agent || selectedAgent));
-      wrap.append(metric('节点 IP', summary.latest.agent_ip || '未知'));
-      wrap.append(metric('监测目标', String(summary.targetCount)));
-      wrap.append(metric('最后上报', new Date(summary.latest.checked_at).toLocaleString()));
+      subtitle.innerHTML = '最后在线：' + lastSeenText(statusInfo, summary) + '<span class="live-badge" id="liveState">实时</span>';
+      wrap.append(metric('节点名称', (summary && summary.latest.agent) || (statusInfo && statusInfo.agent) || selectedAgent));
+      wrap.append(metric('节点 IP', agentIPText(statusInfo, summary)));
+      wrap.append(metric('状态', state.text));
+      wrap.append(metric('监测目标', summary ? String(summary.targetCount) : '0'));
+      wrap.append(metric('最后在线', lastSeenText(statusInfo, summary)));
     }
     function problemSeverity(row) {
       return row.success_count === 0 || row.success_rate === 0 ? 'ERROR' : 'WARN';
@@ -1799,8 +1989,11 @@ const dashboardHTML = `<!doctype html>
         return;
       }
       if (!currentRows.length) {
-        document.getElementById('agentInfo').innerHTML = '<div class="metric"><span>状态</span><strong>暂无数据</strong></div>';
+        currentAgentRows = [];
+        renderAgentInfo(currentRows);
         renderProblemLog(currentRows);
+        renderLabelFilters(currentRows);
+        updateDetailChart(currentRows);
         return;
       }
       currentAgentRows = currentRows;
@@ -1825,12 +2018,19 @@ const dashboardHTML = `<!doctype html>
     async function refreshDashboard() {
       const scrollX = window.scrollX;
       const scrollY = window.scrollY;
-      renderDashboardRows(await loadResults());
+      const [rows, agents] = await Promise.all([loadResults(), loadAgents()]);
+      currentAgents = agents;
+      renderDashboardRows(rows);
       requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
     }
-    function applyLiveResults(rows) {
+    async function applyLiveResults(rows) {
       if (!Array.isArray(rows) || !rows.length) return;
       currentRows = mergeRows(currentRows, rows);
+      try {
+        currentAgents = await loadAgents();
+      } catch (err) {
+        console.warn(err);
+      }
       scheduleDashboardRender(currentRows);
     }
     function handleRefreshError(err) {
@@ -1848,6 +2048,10 @@ const dashboardHTML = `<!doctype html>
     document.getElementById('refreshButton').addEventListener('click', () => {
       refreshDashboard().catch(handleRefreshError);
     });
+    const deleteAgentButton = document.getElementById('deleteAgentButton');
+    if (deleteAgentButton) {
+      deleteAgentButton.addEventListener('click', () => deleteAgent(selectedAgent).catch(handleRefreshError));
+    }
     const zoomInButton = document.getElementById('zoomInButton');
     const zoomOutButton = document.getElementById('zoomOutButton');
     const zoomResetButton = document.getElementById('zoomResetButton');
@@ -1941,6 +2145,14 @@ const dashboardHTML = `<!doctype html>
       hideChartTooltip(detailChart);
     });
     refreshDashboard().catch(handleRefreshError);
+    window.setInterval(async () => {
+      try {
+        currentAgents = await loadAgents();
+        renderDashboardRows(currentRows);
+      } catch (err) {
+        console.warn(err);
+      }
+    }, 15000);
     function connectLiveRefresh() {
       const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
       const ws = new WebSocket(proto + location.host + '/ws');

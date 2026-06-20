@@ -51,12 +51,12 @@ func main() {
 }
 
 func runCycle(supervisor string, cfg config.AgentConfig) (int, error) {
-	tasks, err := fetchTasks(supervisor)
+	agentIP := fetchAgentIP(cfg)
+	tasks, err := fetchTasks(supervisor, cfg.AgentName, agentIP)
 	if err != nil {
 		return cfg.PollIntervalSeconds, err
 	}
 	sleepSeconds := nextPollInterval(tasks, cfg.PollIntervalSeconds)
-	agentIP := fetchAgentIP(cfg)
 	var wg sync.WaitGroup
 	results := make(chan model.Result, len(tasks))
 	for _, task := range tasks {
@@ -92,8 +92,20 @@ func nextPollInterval(tasks []model.Task, fallback int) int {
 	return fallback
 }
 
-func fetchTasks(supervisor string) ([]model.Task, error) {
-	resp, err := http.Get(supervisor + "/api/tasks")
+func fetchTasks(supervisor, agent, agentIP string) ([]model.Task, error) {
+	taskURL, err := url.Parse(supervisor + "/api/tasks")
+	if err != nil {
+		return nil, err
+	}
+	query := taskURL.Query()
+	if agent != "" {
+		query.Set("agent", agent)
+	}
+	if agentIP != "" {
+		query.Set("agent_ip", agentIP)
+	}
+	taskURL.RawQuery = query.Encode()
+	resp, err := http.Get(taskURL.String())
 	if err != nil {
 		return nil, err
 	}

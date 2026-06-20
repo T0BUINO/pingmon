@@ -36,3 +36,10 @@ type Result struct {
 	SuccessRate      float64   `json:"success_rate"`
 	Error            string    `json:"error,omitempty"`
 }
+
+type AgentStatus struct {
+	Agent       string    `json:"agent"`
+	AgentIP     string    `json:"agent_ip,omitempty"`
+	FirstSeenAt time.Time `json:"first_seen_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+}

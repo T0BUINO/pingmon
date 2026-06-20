@@ -23,6 +23,10 @@ func MigrateSQLite(path string) (bool, error) {
 }
 
 func MigrateSQLiteDB(db *sql.DB) (bool, error) {
+	agentsReady, err := hasTable(db, "agent_statuses")
+	if err != nil {
+		return false, err
+	}
 	resultsLegacy, err := hasColumn(db, "results", "agent")
 	if err != nil {
 		return false, err
@@ -31,7 +35,7 @@ func MigrateSQLiteDB(db *sql.DB) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !resultsLegacy && !rollupsLegacy {
+	if !resultsLegacy && !rollupsLegacy && agentsReady {
 		return false, nil
 	}
 
@@ -157,10 +161,37 @@ JOIN result_series rs ON rs.agent = rr.agent
 		}
 	}
 
-	if _, err := tx.Exec(`DELETE FROM sqlite_sequence WHERE name IN ('results', 'result_rollups')`); err != nil {
-		return false, err
+	if !agentsReady {
+		if _, err := tx.Exec(`
+CREATE TABLE IF NOT EXISTS agent_statuses (
+	agent TEXT PRIMARY KEY,
+	agent_ip TEXT NOT NULL,
+	first_seen_at TEXT NOT NULL,
+	last_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_statuses_last_seen_at ON agent_statuses(last_seen_at DESC)`); err != nil {
+			return false, err
+		}
+	}
+
+	if resultsLegacy || rollupsLegacy {
+		if _, err := tx.Exec(`DELETE FROM sqlite_sequence WHERE name IN ('results', 'result_rollups')`); err != nil {
+			return false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func hasTable(db *sql.DB, table string) (bool, error) {
+	var name string
+	err := db.QueryRow("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&name)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
 		return false, err
 	}
 	return true, nil
