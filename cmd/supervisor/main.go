@@ -686,11 +686,11 @@ const dashboardHTML = `<!doctype html>
     .agent-card:hover { border-color: #94a3b8; transform: translateY(-1px); box-shadow: 0 10px 24px rgba(15, 23, 42, .08); }
     .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
     .agent-name { font-weight: 700; font-size: 17px; overflow-wrap: anywhere; }
-    .status { border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; white-space: nowrap; }
-    .status.ok { background: #dcfce7; color: #166534; }
-    .status.bad { background: #fee2e2; color: #991b1b; }
-    .status.offline { background: #e5e7eb; color: #374151; }
-    .status.idle { background: #e0f2fe; color: #075985; }
+    .status { border: 1px solid transparent; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .status.ok { border-color: #86efac; background: #dcfce7; color: #166534; }
+    .status.bad { border-color: #fca5a5; background: #fee2e2; color: #991b1b; }
+    .status.offline { border-color: #cbd5e1; background: #e5e7eb; color: #374151; }
+    .status.idle { border-color: #7dd3fc; background: #e0f2fe; color: #075985; }
     .subtle .status { display: inline-flex; align-items: center; padding: 2px 8px; }
     .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0; }
     .metric { border: 1px solid #e5eaf1; border-radius: 6px; padding: 8px; background: #fbfcfe; min-width: 0; }
