@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -66,33 +65,37 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 }
 
 func (s *SQLiteStore) init() error {
+	if _, err := MigrateSQLiteDB(s.db); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS results (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	agent TEXT NOT NULL,
-	agent_ip TEXT,
-	target_name TEXT NOT NULL,
-	address TEXT NOT NULL,
-	port INTEGER NOT NULL,
-	labels TEXT,
-	checked_at TEXT NOT NULL,
-	success_count INTEGER NOT NULL,
-	failure_count INTEGER NOT NULL,
-	average_latency_ms REAL NOT NULL,
-	success_rate REAL NOT NULL,
-	error TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_results_checked_at ON results(checked_at DESC);
-CREATE INDEX IF NOT EXISTS idx_results_target ON results(target_name, address, port, checked_at DESC);
-
-CREATE TABLE IF NOT EXISTS result_rollups (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
+CREATE TABLE IF NOT EXISTS result_series (
+	id INTEGER PRIMARY KEY,
 	agent TEXT NOT NULL,
 	agent_ip TEXT NOT NULL,
 	target_name TEXT NOT NULL,
 	address TEXT NOT NULL,
 	port INTEGER NOT NULL,
 	labels TEXT NOT NULL,
+	UNIQUE(agent, agent_ip, target_name, address, port, labels)
+);
+CREATE TABLE IF NOT EXISTS results (
+	id INTEGER PRIMARY KEY,
+	series_id INTEGER NOT NULL,
+	checked_at TEXT NOT NULL,
+	success_count INTEGER NOT NULL,
+	failure_count INTEGER NOT NULL,
+	average_latency_ms REAL NOT NULL,
+	success_rate REAL NOT NULL,
+	error TEXT,
+	FOREIGN KEY(series_id) REFERENCES result_series(id)
+);
+CREATE INDEX IF NOT EXISTS idx_results_checked_at ON results(checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_results_series_checked_at ON results(series_id, checked_at DESC);
+
+CREATE TABLE IF NOT EXISTS result_rollups (
+	id INTEGER PRIMARY KEY,
+	series_id INTEGER NOT NULL,
 	bucket_start TEXT NOT NULL,
 	interval_seconds INTEGER NOT NULL,
 	sample_count INTEGER NOT NULL,
@@ -100,20 +103,31 @@ CREATE TABLE IF NOT EXISTS result_rollups (
 	failure_count INTEGER NOT NULL,
 	average_latency_ms REAL NOT NULL,
 	success_rate REAL NOT NULL,
-	error TEXT
+	error TEXT,
+	FOREIGN KEY(series_id) REFERENCES result_series(id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_result_rollups_unique
-ON result_rollups(agent, agent_ip, target_name, address, port, labels, bucket_start, interval_seconds);
+ON result_rollups(series_id, bucket_start, interval_seconds);
 CREATE INDEX IF NOT EXISTS idx_result_rollups_bucket ON result_rollups(bucket_start DESC);
 `)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`ALTER TABLE results ADD COLUMN agent_ip TEXT`)
-	if err != nil && !isDuplicateColumnError(err) {
-		return err
-	}
 	return nil
+}
+
+func (s *SQLiteStore) seriesID(agent, agentIP, targetName, address string, port int, labels string) (int64, error) {
+	if _, err := s.db.Exec(`
+INSERT OR IGNORE INTO result_series (agent, agent_ip, target_name, address, port, labels)
+VALUES (?, ?, ?, ?, ?, ?)`, agent, agentIP, targetName, address, port, labels); err != nil {
+		return 0, err
+	}
+	var id int64
+	err := s.db.QueryRow(`
+SELECT id FROM result_series
+WHERE agent = ? AND agent_ip = ? AND target_name = ? AND address = ? AND port = ? AND labels = ?`,
+		agent, agentIP, targetName, address, port, labels).Scan(&id)
+	return id, err
 }
 
 func (s *SQLiteStore) SaveResult(result model.Result) error {
@@ -121,20 +135,24 @@ func (s *SQLiteStore) SaveResult(result model.Result) error {
 	if err != nil {
 		return err
 	}
+	seriesID, err := s.seriesID(result.Agent, result.AgentIP, result.TargetName, result.Address, result.Port, string(labels))
+	if err != nil {
+		return err
+	}
 	_, err = s.db.Exec(`
 INSERT INTO results (
-	agent, agent_ip, target_name, address, port, labels, checked_at, success_count,
-	failure_count, average_latency_ms, success_rate, error
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		result.Agent, result.AgentIP, result.TargetName, result.Address, result.Port, string(labels),
-		result.CheckedAt.UTC().Format(time.RFC3339Nano), result.SuccessCount,
+	series_id, checked_at, success_count, failure_count, average_latency_ms, success_rate, error
+) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		seriesID, result.CheckedAt.UTC().Format(time.RFC3339Nano), result.SuccessCount,
 		result.FailureCount, result.AverageLatencyMS, result.SuccessRate, result.Error)
 	return err
 }
 
 func (s *SQLiteStore) RecentResults(limit int) ([]model.Result, error) {
-	query := `SELECT agent, COALESCE(agent_ip, ''), target_name, address, port, labels, checked_at, success_count,
-failure_count, average_latency_ms, success_rate, error FROM results ORDER BY checked_at DESC`
+	query := `SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
+r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
+FROM results r JOIN result_series rs ON rs.id = r.series_id
+ORDER BY r.checked_at DESC`
 	args := []any{}
 	if limit > 0 {
 		query += " LIMIT ?"
@@ -149,10 +167,11 @@ failure_count, average_latency_ms, success_rate, error FROM results ORDER BY che
 }
 
 func (s *SQLiteStore) ResultsSince(since time.Time) ([]model.Result, error) {
-	rows, err := s.db.Query(`SELECT agent, COALESCE(agent_ip, ''), target_name, address, port, labels, checked_at, success_count,
-failure_count, average_latency_ms, success_rate, error FROM results
-WHERE checked_at >= ?
-ORDER BY checked_at DESC`, since.UTC().Format(time.RFC3339Nano))
+	rows, err := s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
+r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
+FROM results r JOIN result_series rs ON rs.id = r.series_id
+WHERE r.checked_at >= ?
+ORDER BY r.checked_at DESC`, since.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return nil, err
 	}
@@ -182,10 +201,11 @@ func (s *SQLiteStore) ResultsSinceCompacted(since, rawCutoff time.Time) ([]model
 }
 
 func (s *SQLiteStore) rollupsSince(since, before time.Time) ([]model.Result, error) {
-	rows, err := s.db.Query(`SELECT agent, agent_ip, target_name, address, port, labels, bucket_start,
-success_count, failure_count, average_latency_ms, success_rate, COALESCE(error, '') FROM result_rollups
-WHERE bucket_start >= ? AND bucket_start < ?
-ORDER BY bucket_start DESC`, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+	rows, err := s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
+rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
+FROM result_rollups rr JOIN result_series rs ON rs.id = rr.series_id
+WHERE rr.bucket_start >= ? AND rr.bucket_start < ?
+ORDER BY rr.bucket_start DESC`, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return nil, err
 	}
@@ -204,16 +224,11 @@ func (s *SQLiteStore) RollupBefore(cutoff time.Time, interval time.Duration) (in
 	seconds := int(interval.Seconds())
 	res, err := s.db.Exec(`
 INSERT OR IGNORE INTO result_rollups (
-	agent, agent_ip, target_name, address, port, labels, bucket_start, interval_seconds,
-	sample_count, success_count, failure_count, average_latency_ms, success_rate, error
+	series_id, bucket_start, interval_seconds, sample_count, success_count, failure_count,
+	average_latency_ms, success_rate, error
 )
 SELECT
-	agent,
-	agent_ip,
-	target_name,
-	address,
-	port,
-	labels,
+	series_id,
 	bucket_start,
 	?,
 	COUNT(*),
@@ -233,12 +248,7 @@ SELECT
 	END
 FROM (
 	SELECT
-		agent,
-		COALESCE(agent_ip, '') AS agent_ip,
-		target_name,
-		address,
-		port,
-		COALESCE(labels, '') AS labels,
+		series_id,
 		strftime('%Y-%m-%dT%H:%M:%SZ', (unixepoch(checked_at) / ?) * ?, 'unixepoch') AS bucket_start,
 		success_count,
 		failure_count,
@@ -248,7 +258,7 @@ FROM (
 	FROM results
 	WHERE checked_at < ?
 )
-GROUP BY agent, agent_ip, target_name, address, port, labels, bucket_start`,
+GROUP BY series_id, bucket_start`,
 		seconds, seconds, seconds, cutoff.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return 0, err
@@ -282,9 +292,10 @@ func (s *SQLiteStore) Vacuum() error {
 
 func (s *SQLiteStore) ConsecutiveFailures(targetName, address string, port int) (int, error) {
 	rows, err := s.db.Query(`
-SELECT success_count FROM results
-WHERE target_name = ? AND address = ? AND port = ?
-ORDER BY checked_at DESC`, targetName, address, port)
+SELECT r.success_count FROM results r
+JOIN result_series rs ON rs.id = r.series_id
+WHERE rs.target_name = ? AND rs.address = ? AND rs.port = ?
+ORDER BY r.checked_at DESC`, targetName, address, port)
 	if err != nil {
 		return 0, err
 	}
@@ -345,10 +356,6 @@ func scanResult(scanner resultScanner) (model.Result, error) {
 	}
 	result.CheckedAt = t
 	return result, nil
-}
-
-func isDuplicateColumnError(err error) bool {
-	return strings.Contains(strings.ToLower(err.Error()), "duplicate column")
 }
 
 func truncateUTC(t time.Time, d time.Duration) time.Time {

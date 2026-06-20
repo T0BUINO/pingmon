@@ -32,6 +32,12 @@ go run ./cmd/supervisor -config configs/supervisor.toml
 go run ./cmd/agent -config configs/agent.toml
 ```
 
+只执行 SQLite 结构迁移并退出：
+
+```bash
+go run ./cmd/supervisor -config configs/supervisor.toml -migrate-only
+```
+
 ## Docker
 
 Dockerfile 会根据目标架构自动下载对应 release 预编译包，默认启动 `supervisor`：
@@ -101,6 +107,8 @@ http://127.0.0.1:8080/dashboard
 - `[[targets]]`：探测目标列表。
 
 Dashboard landing 按 agent 展示卡片，详情页按 target 展示曲线和日志。图表数据按时间范围查询，支持 `h` 小时、`d` 天、`w` 周、`mo` 月，其中 `mo` 按 30 天估算。超过 `raw_retention_days` 的旧数据会从 SQLite `result_rollups` 聚合表读取，近期数据仍保留原始粒度。页面会连接 `/ws`，agent 上报新结果后通过 WebSocket 自动刷新当前视图。
+
+SQLite 存储会在启动时自动检测旧表结构并迁移到去重后的 `result_series` 结构；如果想在正式启动服务前单独执行迁移，可以使用 `supervisor -migrate-only`。
 
 详情页日志只显示最近的 WARN / ERROR 结果，最多 200 条，避免长期运行后成功上报把页面拉得过长。延迟图使用时间戳横轴，并按图表总点数预算做前端采样，长时间范围和多目标曲线也会保持可读。
 

@@ -50,11 +50,27 @@ const maxProblemLogRows = 200
 func main() {
 	configPath := flag.String("config", "configs/supervisor.toml", "path to JSON or TOML config")
 	format := flag.String("format", "", "config format: json or toml")
+	migrateOnly := flag.Bool("migrate-only", false, "migrate SQLite storage and exit")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath, *format)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+	if *migrateOnly {
+		if cfg.Storage != "" && cfg.Storage != "sqlite" {
+			log.Fatalf("migrate-only only supports sqlite storage, got %q", cfg.Storage)
+		}
+		migrated, err := storage.MigrateSQLite(cfg.SQLitePath)
+		if err != nil {
+			log.Fatalf("migrate sqlite: %v", err)
+		}
+		if migrated {
+			log.Printf("sqlite migration completed: %s", cfg.SQLitePath)
+		} else {
+			log.Printf("sqlite schema is already current: %s", cfg.SQLitePath)
+		}
+		return
 	}
 	store, err := storage.New(cfg.Storage, cfg.DataFile, cfg.SQLitePath)
 	if err != nil {
