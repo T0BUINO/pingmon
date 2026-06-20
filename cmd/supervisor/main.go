@@ -552,7 +552,7 @@ const dashboardHTML = `<!doctype html>
     .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 18px; }
     .page-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-left: auto; }
     .cards { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 14px; }
-    .agent-card { display: block; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; min-height: 220px; transition: border-color .15s, transform .15s, box-shadow .15s; }
+    .agent-card { display: block; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; min-height: 220px; content-visibility: auto; contain-intrinsic-size: 360px 220px; contain: layout paint; transition: border-color .15s, transform .15s, box-shadow .15s; }
     .agent-card:hover { border-color: #94a3b8; transform: translateY(-1px); box-shadow: 0 10px 24px rgba(15, 23, 42, .08); }
     .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
     .agent-name { font-weight: 700; font-size: 17px; overflow-wrap: anywhere; }
@@ -573,7 +573,9 @@ const dashboardHTML = `<!doctype html>
     .chart-wrap .chart-surface { position: absolute; inset: 0; height: 100%; }
     .mini-chart.chart-surface { height: 86px; }
     .chart-surface svg { display: block; width: 100%; height: 100%; cursor: grab; overflow: hidden; }
+    .chart-surface svg * { pointer-events: none; }
     .chart-surface.dragging svg { cursor: grabbing; }
+    .chart-hover-line { position: absolute; top: 0; bottom: 0; left: 0; width: 1px; background: repeating-linear-gradient(to bottom, #94a3b8 0 4px, transparent 4px 8px); pointer-events: none; opacity: 0; transform: translate3d(0, 0, 0); }
     .chart-tooltip { position: fixed; z-index: 1000; max-width: min(560px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 24px)); overflow: hidden; pointer-events: none; border-radius: 6px; padding: 9px 10px; background: rgba(24, 24, 27, .92); color: #fff; font-size: 13px; line-height: 1.35; box-shadow: 0 16px 40px rgba(15, 23, 42, .24); opacity: 0; transform: translate3d(0, 0, 0); transition: opacity .12s ease; }
     .chart-tooltip-title { margin-bottom: 6px; font-weight: 700; white-space: nowrap; }
     .chart-tooltip-row { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 6px; white-space: nowrap; }
@@ -708,20 +710,21 @@ const dashboardHTML = `<!doctype html>
   </main>
   <script>
     const colors = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#d97706', '#0891b2', '#be123c', '#4f46e5'];
-    const maxDetailChartPoints = 1200;
-    const maxMiniChartPoints = 220;
     const maxProblemLogRows = 200;
     const minChartGapMs = 5 * 60 * 1000;
     const selectedAgent = '{{.Agent}}';
     let selectedRange = '{{.SelectedRange}}';
     let detailChart = null;
     let miniCharts = [];
+    let miniChartObserver = null;
     let selectedLabels = null;
     let currentRows = [];
     let currentAgentRows = [];
     let chartFullRange = null;
     let chartViewRange = null;
     let targetVisibility = new Map();
+    let renderDashboardTimer = null;
+    let pendingDashboardRows = null;
     let pinchStart = null;
     let panStart = null;
     document.querySelectorAll('.local-time').forEach(cell => {
@@ -816,9 +819,9 @@ const dashboardHTML = `<!doctype html>
       intervals.sort((a, b) => a - b);
       return intervals[Math.floor(intervals.length / 2)];
     }
-    function splitLongGaps(points) {
+    function splitLongGaps(points, typicalGap) {
       if (points.length < 2) return points;
-      const threshold = Math.max(minChartGapMs, medianInterval(points) * 3);
+      const threshold = Math.max(minChartGapMs, (typicalGap || medianInterval(points)) * 3);
       const split = [points[0]];
       for (let i = 1; i < points.length; i++) {
         if (points[i].x - points[i - 1].x > threshold) {
@@ -852,18 +855,28 @@ const dashboardHTML = `<!doctype html>
         this.canvas = this.container;
         this.hoverX = null;
         this.hoverLine = null;
-        this.tooltipAnchorTimes = null;
+        if (!this.options.mini) {
+          this.hoverLine = document.createElement('div');
+          this.hoverLine.className = 'chart-hover-line';
+          this.container.appendChild(this.hoverLine);
+        }
         this.tooltipCache = new Map();
         this.lastTooltipX = null;
+        this.lastTooltipPixel = null;
+        this.lastPointerClientY = null;
+        this.lastArea = null;
+        this.lastXRange = null;
+        this.tooltipActive = false;
         this.scales = {x: {getValueForPixel: pixel => this.valueForPixel(pixel)}};
         this.resizeObserver = new ResizeObserver(() => this.update());
         this.resizeObserver.observe(this.container);
         this.container.addEventListener('pointermove', event => this.scheduleTooltip(event));
         this.container.addEventListener('pointerleave', () => hideChartTooltip(this));
-        this.update();
+        if (!this.options.deferUpdate) this.update();
       }
       destroy() {
         cancelAnimationFrame(this.raf);
+        cancelAnimationFrame(this.tooltipRaf);
         if (this.resizeObserver) this.resizeObserver.disconnect();
         this.container.replaceChildren();
       }
@@ -886,9 +899,9 @@ const dashboardHTML = `<!doctype html>
         return this.data.datasets.filter((_, index) => this.isDatasetVisible(index));
       }
       invalidateTooltipCache() {
-        this.tooltipAnchorTimes = null;
         this.tooltipCache.clear();
         this.lastTooltipX = null;
+        this.lastTooltipPixel = null;
       }
       xRange() {
         const xOptions = this.options.scales?.x || {};
@@ -897,10 +910,11 @@ const dashboardHTML = `<!doctype html>
         }
         return dataRange(this.data) || {min: Date.now() - 1, max: Date.now()};
       }
-      yRange() {
+      yRange(xRange) {
         let max = 0;
         this.visibleDatasets().forEach(dataset => {
-          dataset.data.forEach(point => {
+          this.pointWindow(dataset.data, xRange).forEach(point => {
+            if (point.x < xRange.min || point.x > xRange.max) return;
             if (point.y !== null && Number.isFinite(point.y)) max = Math.max(max, point.y);
           });
         });
@@ -908,9 +922,9 @@ const dashboardHTML = `<!doctype html>
         const step = this.niceStep(padded / 5);
         return {min: 0, max: Math.ceil(padded / step) * step};
       }
-      valueForPixel(pixel) {
-        const area = this.chartArea();
-        const range = this.xRange();
+      valueForPixel(pixel, area, range) {
+        area = area || this.lastArea || this.chartArea();
+        range = range || this.lastXRange || this.xRange();
         const usable = Math.max(1, area.right - area.left);
         const ratio = Math.min(1, Math.max(0, (pixel - area.left) / usable));
         return range.min + (range.max - range.min) * ratio;
@@ -1076,7 +1090,9 @@ const dashboardHTML = `<!doctype html>
         this.raf = requestAnimationFrame(() => {
           const area = this.chartArea();
           const xRange = this.xRange();
-          const yRange = this.yRange();
+          const yRange = this.yRange(xRange);
+          this.lastArea = area;
+          this.lastXRange = xRange;
           this.svg.setAttribute('viewBox', '0 0 ' + area.width + ' ' + area.height);
           this.svg.replaceChildren();
           if (!this.options.mini) this.renderAxes(area, xRange, yRange);
@@ -1087,56 +1103,31 @@ const dashboardHTML = `<!doctype html>
             if (!d) return;
             this.appendEl(lines, 'path', {d, stroke: dataset.borderColor, 'stroke-width': this.options.mini ? 1.6 : 2});
           });
-          this.hoverLine = this.options.mini ? null : this.appendEl(this.svg, 'line', {stroke: '#94a3b8', 'stroke-width': 1, 'stroke-dasharray': '4 4', display: 'none'});
           this.updateHoverLine();
         });
       }
-      anchorTimes() {
-        if (this.tooltipAnchorTimes) return this.tooltipAnchorTimes;
-        const xRange = this.xRange();
-        const times = [];
-        this.visibleDatasets().forEach(dataset => {
-          for (const point of this.pointWindow(dataset.data, xRange)) {
-            if (point.y !== null && Number.isFinite(point.y)) times.push(point.x);
-          }
-        });
-        times.sort((a, b) => a - b);
-        const unique = [];
-        for (const value of times) {
-          if (unique[unique.length - 1] !== value) unique.push(value);
-        }
-        this.tooltipAnchorTimes = unique;
-        return unique;
-      }
       nearestAnchorTime(xValue) {
-        const times = this.anchorTimes();
-        if (!times.length) return null;
-        let lo = 0;
-        let hi = times.length - 1;
-        while (lo < hi) {
-          const mid = Math.floor((lo + hi) / 2);
-          if (times[mid] < xValue) lo = mid + 1; else hi = mid;
-        }
-        const before = times[Math.max(0, lo - 1)];
-        const after = times[lo];
-        if (before === undefined) return after;
-        if (after === undefined) return before;
-        return Math.abs(before - xValue) <= Math.abs(after - xValue) ? before : after;
+        let best = null;
+        this.visibleDatasets().forEach(dataset => {
+          const nearest = this.nearestInDataset(dataset, xValue);
+          if (!nearest) return;
+          if (!best || nearest.distance < best.distance) best = nearest;
+        });
+        return best ? best.point.x : null;
       }
       updateHoverLine() {
         if (!this.hoverLine) return;
-        const area = this.chartArea();
-        const xRange = this.xRange();
+        const area = this.lastArea || this.chartArea();
+        const xRange = this.lastXRange || this.xRange();
         if (this.hoverX === null || this.hoverX < xRange.min || this.hoverX > xRange.max) {
-          this.hoverLine.setAttribute('display', 'none');
+          this.hoverLine.style.opacity = '0';
           return;
         }
         const x = area.left + (this.hoverX - xRange.min) / Math.max(1, xRange.max - xRange.min) * (area.right - area.left);
-        this.hoverLine.setAttribute('x1', x.toFixed(1));
-        this.hoverLine.setAttribute('x2', x.toFixed(1));
-        this.hoverLine.setAttribute('y1', area.top.toFixed(1));
-        this.hoverLine.setAttribute('y2', area.bottom.toFixed(1));
-        this.hoverLine.setAttribute('display', 'block');
+        this.hoverLine.style.top = area.top.toFixed(1) + 'px';
+        this.hoverLine.style.bottom = (area.height - area.bottom).toFixed(1) + 'px';
+        this.hoverLine.style.opacity = '1';
+        this.hoverLine.style.transform = 'translate3d(' + x.toFixed(1) + 'px, 0, 0)';
       }
       nearestInDataset(dataset, xValue) {
         const points = dataset.data;
@@ -1157,7 +1148,7 @@ const dashboardHTML = `<!doctype html>
       }
       tooltipPoints(clientX) {
         const rect = this.container.getBoundingClientRect();
-        const pointerX = this.valueForPixel(clientX - rect.left);
+        const pointerX = this.valueForPixel(clientX - rect.left, this.lastArea, this.lastXRange);
         const xValue = this.nearestAnchorTime(pointerX);
         if (xValue === null) return {xValue: pointerX, items: []};
         if (this.tooltipCache.has(xValue)) return this.tooltipCache.get(xValue);
@@ -1177,11 +1168,18 @@ const dashboardHTML = `<!doctype html>
       scheduleTooltip(event) {
         const clientX = event.clientX;
         const clientY = event.clientY;
+        this.tooltipActive = true;
+        const pixel = Math.round(clientX);
+        if (pixel === this.lastTooltipPixel && Math.abs(clientY - (this.lastPointerClientY || clientY)) < 2) return;
+        this.lastTooltipPixel = pixel;
+        this.lastPointerClientY = clientY;
         cancelAnimationFrame(this.tooltipRaf);
-        this.tooltipRaf = requestAnimationFrame(() => showSvgTooltip(this, clientX, clientY));
+        this.tooltipRaf = requestAnimationFrame(() => {
+          if (this.tooltipActive) showSvgTooltip(this, clientX, clientY);
+        });
       }
     }
-    function buildDatasets(rows, pointBudget) {
+    function buildDatasets(rows) {
       const grouped = new Map();
       for (const row of rows) {
         if (row.success_count <= 0) continue;
@@ -1193,13 +1191,14 @@ const dashboardHTML = `<!doctype html>
       }
       const datasets = Array.from(grouped.entries()).map(([label, points], index) => {
         points.sort((a, b) => a.x - b.x);
-        const displayPoints = splitLongGaps(points);
+        const typicalGap = medianInterval(points);
+        const displayPoints = splitLongGaps(points, typicalGap);
         return {
           label,
           data: displayPoints,
           borderColor: colors[index % colors.length],
           backgroundColor: colors[index % colors.length],
-          typicalGap: medianInterval(points),
+          typicalGap,
           tension: 0.18,
           cubicInterpolationMode: 'monotone',
           pointRadius: 0,
@@ -1330,7 +1329,11 @@ const dashboardHTML = `<!doctype html>
       const tooltip = document.getElementById('chartTooltip');
       if (tooltip) tooltip.style.opacity = '0';
       if (chart) {
+        chart.tooltipActive = false;
+        cancelAnimationFrame(chart.tooltipRaf);
         chart.hoverX = null;
+        chart.lastTooltipPixel = null;
+        chart.lastPointerClientY = null;
         chart.updateHoverLine();
       }
     }
@@ -1507,10 +1510,51 @@ const dashboardHTML = `<!doctype html>
       div.append(span, strong);
       return div;
     }
-    function renderLanding(rows) {
-      const wrap = document.getElementById('agentCards');
+    function scheduleLowPriority(fn) {
+      if ('requestIdleCallback' in window) {
+        window.requestIdleCallback(fn, {timeout: 800});
+        return;
+      }
+      requestAnimationFrame(() => setTimeout(fn, 0));
+    }
+    function destroyMiniCharts() {
+      if (miniChartObserver) {
+        miniChartObserver.disconnect();
+        miniChartObserver = null;
+      }
       miniCharts.forEach(chart => chart.destroy());
       miniCharts = [];
+    }
+    function renderMiniChart(surface, rows) {
+      if (!surface.isConnected || surface.dataset.rendered === 'true') return;
+      surface.dataset.rendered = 'true';
+      const chartData = buildDatasets(rows);
+      const miniChart = new SvgLineChart(surface, chartData, {mini: true, smooth: true, scales: {x: {}}});
+      miniCharts.push(miniChart);
+    }
+    function queueMiniChart(surface, rows) {
+      if (!surface) return;
+      if (!('IntersectionObserver' in window)) {
+        scheduleLowPriority(() => renderMiniChart(surface, rows));
+        return;
+      }
+      if (!miniChartObserver) {
+        miniChartObserver = new IntersectionObserver(entries => {
+          entries.forEach(entry => {
+            if (!entry.isIntersecting) return;
+            if (miniChartObserver) miniChartObserver.unobserve(entry.target);
+            const rows = entry.target.__chartRows || [];
+            delete entry.target.__chartRows;
+            scheduleLowPriority(() => renderMiniChart(entry.target, rows));
+          });
+        }, {rootMargin: '320px 0px'});
+      }
+      surface.__chartRows = rows;
+      miniChartObserver.observe(surface);
+    }
+    function renderLanding(rows) {
+      const wrap = document.getElementById('agentCards');
+      destroyMiniCharts();
       wrap.innerHTML = '';
       const groups = new Map();
       for (const row of rows) {
@@ -1539,9 +1583,7 @@ const dashboardHTML = `<!doctype html>
         metrics.append(metric('成功率', (summary.successRate * 100).toFixed(1) + '%'));
         metrics.append(metric('平均延迟', summary.averageLatency.toFixed(1) + ' ms'));
         wrap.appendChild(card);
-        const chartData = buildDatasets(agentRows, maxMiniChartPoints);
-        const miniChart = new SvgLineChart(card.querySelector('.mini-chart'), chartData, {mini: true, smooth: true, scales: {x: {}}});
-        miniCharts.push(miniChart);
+        queueMiniChart(card.querySelector('.mini-chart'), agentRows);
       });
     }
     function renderAgentInfo(rows) {
@@ -1624,20 +1666,18 @@ const dashboardHTML = `<!doctype html>
       });
     }
     function updateDetailChart(rows) {
-      const chartData = buildDatasets(filterRowsByLabels(rows, selectedLabels), maxDetailChartPoints);
+      const chartData = buildDatasets(filterRowsByLabels(rows, selectedLabels));
       syncChartRange(chartData);
       if (detailChart) {
         detailChart.data = chartData;
-        applyDetailChartRange('none');
         renderToggles(detailChart);
-        detailChart.update();
+        applyDetailChartRange('none');
         return;
       }
-      detailChart = new SvgLineChart(document.getElementById('latency'), chartData, {mini: false, smooth: true, scales: {x: {}}});
+      detailChart = new SvgLineChart(document.getElementById('latency'), chartData, {mini: false, smooth: true, deferUpdate: true, scales: {x: {}}});
       attachChartZoomHandlers(detailChart);
-      applyDetailChartRange('none');
       renderToggles(detailChart);
-      detailChart.update();
+      applyDetailChartRange('none');
     }
     function renderLabelFilters(rows) {
       const wrap = document.getElementById('labelFilters');
@@ -1689,6 +1729,19 @@ const dashboardHTML = `<!doctype html>
       renderLabelFilters(currentRows);
       updateDetailChart(currentRows);
     }
+    function scheduleDashboardRender(rows) {
+      pendingDashboardRows = rows;
+      if (renderDashboardTimer !== null) return;
+      renderDashboardTimer = window.setTimeout(() => {
+        renderDashboardTimer = null;
+        const rows = pendingDashboardRows;
+        pendingDashboardRows = null;
+        const scrollX = window.scrollX;
+        const scrollY = window.scrollY;
+        renderDashboardRows(rows);
+        requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
+      }, 120);
+    }
     async function refreshDashboard() {
       const scrollX = window.scrollX;
       const scrollY = window.scrollY;
@@ -1697,11 +1750,8 @@ const dashboardHTML = `<!doctype html>
     }
     function applyLiveResults(rows) {
       if (!Array.isArray(rows) || !rows.length) return;
-      const scrollX = window.scrollX;
-      const scrollY = window.scrollY;
       currentRows = mergeRows(currentRows, rows);
-      renderDashboardRows(currentRows);
-      requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
+      scheduleDashboardRender(currentRows);
     }
     function handleRefreshError(err) {
       const targetToggles = document.getElementById('targetToggles');
