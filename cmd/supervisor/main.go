@@ -32,6 +32,7 @@ type dashboardData struct {
 	Agent         string
 	Ranges        []string
 	SelectedRange string
+	CustomRange   bool
 }
 
 type websocketHub struct {
@@ -180,6 +181,7 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		Agent:         agent,
 		Ranges:        s.cfg.DashboardRanges,
 		SelectedRange: selectedRange,
+		CustomRange:   !rangeInList(selectedRange, s.cfg.DashboardRanges),
 	}); err != nil {
 		log.Printf("render dashboard: %v", err)
 	}
@@ -212,6 +214,9 @@ func (s *server) selectedRange(r *http.Request) string {
 			return raw
 		}
 	}
+	if _, ok := parseRangeDuration(raw); ok {
+		return strings.TrimSpace(strings.ToLower(raw))
+	}
 	if len(s.cfg.DashboardRanges) > 0 {
 		return s.cfg.DashboardRanges[0]
 	}
@@ -227,9 +232,16 @@ func (s *server) resultsSince(since time.Time) ([]model.Result, error) {
 }
 
 func rangeDuration(raw string) time.Duration {
+	if duration, ok := parseRangeDuration(raw); ok {
+		return duration
+	}
+	return 24 * time.Hour
+}
+
+func parseRangeDuration(raw string) (time.Duration, bool) {
 	raw = strings.TrimSpace(strings.ToLower(raw))
 	if raw == "" {
-		return 24 * time.Hour
+		return 0, false
 	}
 	unit := raw[len(raw)-1:]
 	valueText := raw[:len(raw)-1]
@@ -249,15 +261,24 @@ func rangeDuration(raw string) time.Duration {
 		case "w":
 			multiplier = 7 * 24 * time.Hour
 		default:
-			return 24 * time.Hour
+			return 0, false
 		}
 	}
 	n, err := strconv.Atoi(valueText)
 	if err != nil || n <= 0 {
-		return 24 * time.Hour
+		return 0, false
 	}
 	_ = unit
-	return time.Duration(n) * multiplier
+	return time.Duration(n) * multiplier, true
+}
+
+func rangeInList(raw string, ranges []string) bool {
+	for _, allowed := range ranges {
+		if raw == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func filterResultsByAgent(results []model.Result, agent string) []model.Result {
@@ -567,6 +588,11 @@ const dashboardHTML = `<!doctype html>
     .range-menu.open .range-options { display: block; }
     .range-option { display: block; width: 100%; height: 30px; padding: 0 10px; border: 0; background: transparent; text-align: left; border-radius: 6px; }
     .range-option:hover, .range-option.active { background: #eef2f7; }
+    .range-custom { display: flex; gap: 6px; margin-top: 4px; padding-top: 6px; border-top: 1px solid var(--border); }
+    .range-custom input { width: 86px; height: 30px; border: 1px solid var(--border); border-radius: 6px; padding: 0 8px; font: inherit; }
+    .range-custom button { height: 30px; min-width: 42px; padding: 0 8px; }
+    .range-error { display: none; margin-top: 4px; padding: 0 2px; color: var(--bad); font-size: 12px; white-space: nowrap; }
+    .range-menu.invalid .range-error { display: block; }
     button, .button { display: inline-flex; align-items: center; justify-content: center; height: 34px; border: 1px solid transparent; background: #f8fafc; border-radius: 6px; padding: 0 12px; cursor: pointer; font-size: 14px; color: var(--ink); }
     button:hover, .button:hover { background: #eef2f7; border-color: transparent; }
     .table-scroll { width: 100%; overflow-x: auto; border: 1px solid #e7ebf1; border-radius: 8px; }
@@ -613,6 +639,11 @@ const dashboardHTML = `<!doctype html>
           <button class="range-button" type="button" id="rangeButton">{{.SelectedRange}}</button>
           <div class="range-options" id="rangeOptions">
             {{range .Ranges}}<button class="range-option {{if eq . $.SelectedRange}}active{{end}}" type="button" data-range="{{.}}">{{.}}</button>{{end}}
+            <form class="range-custom" id="rangeCustomForm">
+              <input id="rangeCustomInput" type="text" value="{{if .CustomRange}}{{.SelectedRange}}{{end}}" placeholder="45m" aria-label="自定义范围">
+              <button type="submit">应用</button>
+            </form>
+            <div class="range-error" id="rangeError">格式：数字 + m/h/d/w/mo</div>
           </div>
         </div>
         <button type="button" id="refreshButton">刷新</button>
@@ -669,6 +700,8 @@ const dashboardHTML = `<!doctype html>
   </main>
   <script>
     const colors = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#d97706', '#0891b2', '#be123c', '#4f46e5'];
+    const maxDetailChartPoints = 1200;
+    const maxMiniChartPoints = 220;
     const maxChartPointsPerSeries = 900;
     const maxProblemLogRows = 200;
     const minChartGapMs = 5 * 60 * 1000;
@@ -770,10 +803,13 @@ const dashboardHTML = `<!doctype html>
       const stride = Math.ceil(points.length / maxPoints);
       const compacted = [];
       for (let i = 0; i < points.length; i += stride) {
-        const bucket = points.slice(i, i + stride);
+        const end = Math.min(i + stride, points.length);
+        const middle = i + Math.floor((end - i) / 2);
+        let sum = 0;
+        for (let j = i; j < end; j++) sum += points[j].y;
         compacted.push({
-          x: bucket[Math.floor(bucket.length / 2)].x,
-          y: bucket.reduce((sum, point) => sum + point.y, 0) / bucket.length
+          x: points[middle].x,
+          y: sum / (end - i)
         });
       }
       return compacted;
@@ -811,7 +847,7 @@ const dashboardHTML = `<!doctype html>
       if (range === '24h') return date.toLocaleString([], {month: '2-digit', day: '2-digit', hour: '2-digit'});
       return date.toLocaleDateString([], {month: '2-digit', day: '2-digit'});
     }
-    function buildDatasets(rows) {
+    function buildDatasets(rows, pointBudget) {
       const grouped = new Map();
       for (const row of rows) {
         if (row.success_count <= 0) continue;
@@ -821,9 +857,11 @@ const dashboardHTML = `<!doctype html>
         if (!grouped.has(key)) grouped.set(key, []);
         grouped.get(key).push({x: ts, y: row.average_latency_ms});
       }
+      const seriesCount = Math.max(1, grouped.size);
+      const perSeriesBudget = Math.max(40, Math.min(maxChartPointsPerSeries, Math.floor((pointBudget || maxDetailChartPoints) / seriesCount)));
       const datasets = Array.from(grouped.entries()).map(([label, points], index) => {
         points.sort((a, b) => a.x - b.x);
-        const compacted = splitLongGaps(compactPoints(points, maxChartPointsPerSeries));
+        const compacted = splitLongGaps(compactPoints(points, perSeriesBudget));
         return {
           label,
           data: compacted,
@@ -835,7 +873,9 @@ const dashboardHTML = `<!doctype html>
           pointHoverRadius: 4,
           pointHitRadius: 10,
           borderWidth: 2,
-          spanGaps: false
+          spanGaps: false,
+          parsing: false,
+          normalized: true
         };
       });
       return {datasets};
@@ -1153,7 +1193,7 @@ const dashboardHTML = `<!doctype html>
         metrics.append(metric('成功率', (summary.successRate * 100).toFixed(1) + '%'));
         metrics.append(metric('平均延迟', summary.averageLatency.toFixed(1) + ' ms'));
         wrap.appendChild(card);
-        const chartData = buildDatasets(agentRows);
+        const chartData = buildDatasets(agentRows, maxMiniChartPoints);
         const miniChart = new Chart(card.querySelector('canvas'), {
           type: 'line',
           data: chartData,
@@ -1259,7 +1299,7 @@ const dashboardHTML = `<!doctype html>
       });
     }
     function updateDetailChart(rows) {
-      const chartData = buildDatasets(filterRowsByLabels(rows, selectedLabels));
+      const chartData = buildDatasets(filterRowsByLabels(rows, selectedLabels), maxDetailChartPoints);
       syncChartRange(chartData);
       if (detailChart) {
         detailChart.data = chartData;
@@ -1391,21 +1431,63 @@ const dashboardHTML = `<!doctype html>
     updateZoomButtons();
     const rangeMenu = document.getElementById('rangeMenu');
     const rangeButton = document.getElementById('rangeButton');
+    const rangeCustomForm = document.getElementById('rangeCustomForm');
+    const rangeCustomInput = document.getElementById('rangeCustomInput');
+    const rangePresets = new Set(Array.from(document.querySelectorAll('.range-option')).map(option => option.dataset.range));
+    const customRangeCookieName = 'pingmon_custom_range';
     rangeButton.addEventListener('click', () => rangeMenu.classList.toggle('open'));
+    function setCookie(name, value, maxAgeSeconds) {
+      document.cookie = name + '=' + encodeURIComponent(value) + '; Max-Age=' + maxAgeSeconds + '; Path=/; SameSite=Lax';
+    }
+    function getCookie(name) {
+      const prefix = name + '=';
+      return document.cookie.split(';').map(part => part.trim()).find(part => part.startsWith(prefix))?.slice(prefix.length) || '';
+    }
+    function normalizeRange(raw) {
+      const value = String(raw || '').trim().toLowerCase();
+      return /^\d+(m|h|d|w|mo)$/.test(value) && parseRangeMillis(value) > 0 ? value : '';
+    }
+    function applyRange(nextRange) {
+      selectedRange = nextRange;
+      rangeButton.textContent = selectedRange;
+      if (rangeCustomInput) rangeCustomInput.value = rangePresets.has(selectedRange) ? '' : selectedRange;
+      if (rangePresets.has(selectedRange)) {
+        setCookie(customRangeCookieName, '', 0);
+      } else {
+        setCookie(customRangeCookieName, selectedRange, 365 * 24 * 60 * 60);
+      }
+      document.querySelectorAll('.range-option').forEach(item => item.classList.toggle('active', item.dataset.range === selectedRange));
+      rangeMenu.classList.remove('open');
+      rangeMenu.classList.remove('invalid');
+      hideChartTooltip(detailChart);
+      chartViewRange = null;
+      const url = new URL(location.href);
+      url.searchParams.set('range', selectedRange);
+      history.replaceState(null, '', url);
+      refreshDashboard().catch(handleRefreshError);
+    }
     document.querySelectorAll('.range-option').forEach(option => {
       option.addEventListener('click', () => {
-        selectedRange = option.dataset.range;
-        rangeButton.textContent = selectedRange;
-        document.querySelectorAll('.range-option').forEach(item => item.classList.toggle('active', item === option));
-        rangeMenu.classList.remove('open');
-        hideChartTooltip(detailChart);
-        chartViewRange = null;
-        const url = new URL(location.href);
-        url.searchParams.set('range', selectedRange);
-        history.replaceState(null, '', url);
-        refreshDashboard().catch(handleRefreshError);
+        applyRange(option.dataset.range);
       });
     });
+    if (rangeCustomForm && rangeCustomInput) {
+      rangeCustomForm.addEventListener('submit', event => {
+        event.preventDefault();
+        const nextRange = normalizeRange(rangeCustomInput.value);
+        if (!nextRange) {
+          rangeMenu.classList.add('invalid');
+          rangeCustomInput.focus();
+          return;
+        }
+        applyRange(nextRange);
+      });
+      rangeCustomInput.addEventListener('input', () => rangeMenu.classList.remove('invalid'));
+      const savedCustomRange = normalizeRange(decodeURIComponent(getCookie(customRangeCookieName)));
+      if (savedCustomRange && rangePresets.has(selectedRange)) {
+        rangeCustomInput.value = savedCustomRange;
+      }
+    }
     document.addEventListener('click', event => {
       if (!rangeMenu.contains(event.target)) rangeMenu.classList.remove('open');
       const chartTooltip = document.getElementById('chartTooltip');
