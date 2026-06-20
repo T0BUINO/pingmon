@@ -96,8 +96,8 @@ http://127.0.0.1:8080/dashboard
 - `raw_retention_days`：原始上报数据保留天数，默认 `30`。更早的原始数据会先聚合再删除。
 - `rollup_interval_minutes`：聚合粒度，默认 `60`，表示旧数据按 1 小时聚合。
 - `failure_threshold`：连续失败次数超过该值时在日志打印告警。
-- `task_interval_seconds`：任务建议执行频率。
-- `[params]`：探测次数、间隔、超时和 IPv6 开关。
+- `task_interval_seconds`：默认任务执行频率。`[params].schedule_seconds` 未配置或小于等于 0 时，会使用该值。
+- `[params]`：探测次数、单次探测间隔、超时、IPv6 开关和 `schedule_seconds`。agent 会优先按 `/api/tasks` 下发的 `schedule_seconds` 等待下一轮任务。
 - `[[targets]]`：探测目标列表。
 
 Dashboard landing 按 agent 展示卡片，详情页按 target 展示曲线和日志。图表数据按时间范围查询，支持 `h` 小时、`d` 天、`w` 周、`mo` 月，其中 `mo` 按 30 天估算。超过 `raw_retention_days` 的旧数据会从 SQLite `result_rollups` 聚合表读取，近期数据仍保留原始粒度。页面会连接 `/ws`，agent 上报新结果后通过 WebSocket 自动刷新当前视图。
@@ -122,6 +122,8 @@ poll_interval_seconds = 30
 public_ipv4_url = "https://api-ipv4.ip.sb/ip"
 public_ipv6_url = "https://api-ipv6.ip.sb/ip"
 ```
+
+agent 每轮会先拉取 `/api/tasks`，执行探测并上报结果。下一轮等待时间优先使用任务里的 `params.schedule_seconds`；如果拉取任务失败、任务为空或服务端没有下发有效 `schedule_seconds`，才回退到本地 `poll_interval_seconds`。
 
 `public_ipv4_url` / `public_ipv6_url` 用于 agent 主动获取双栈公网 IP 并随结果上报，适合容器内运行时避免只看到 Docker 内网 IP。默认分别使用 `https://api-ipv4.ip.sb/ip` 和 `https://api-ipv6.ip.sb/ip`；如果只获取到一个地址就上报一个，两个都失败时 supervisor 会继续用 HTTP 连接来源 IP 作为兜底。旧配置 `public_ip_url` 仍然可用，但它只会按当前网络出口返回一个地址。
 

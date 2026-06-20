@@ -38,21 +38,24 @@ func main() {
 		log.Fatal(err)
 	}
 	for {
-		if err := runCycle(base, cfg); err != nil {
+		sleepSeconds, err := runCycle(base, cfg)
+		if err != nil {
 			log.Printf("cycle failed: %v", err)
+			sleepSeconds = cfg.PollIntervalSeconds
 		}
 		if *once {
 			return
 		}
-		time.Sleep(time.Duration(cfg.PollIntervalSeconds) * time.Second)
+		time.Sleep(time.Duration(sleepSeconds) * time.Second)
 	}
 }
 
-func runCycle(supervisor string, cfg config.AgentConfig) error {
+func runCycle(supervisor string, cfg config.AgentConfig) (int, error) {
 	tasks, err := fetchTasks(supervisor)
 	if err != nil {
-		return err
+		return cfg.PollIntervalSeconds, err
 	}
+	sleepSeconds := nextPollInterval(tasks, cfg.PollIntervalSeconds)
 	agentIP := fetchAgentIP(cfg)
 	var wg sync.WaitGroup
 	results := make(chan model.Result, len(tasks))
@@ -72,9 +75,21 @@ func runCycle(supervisor string, cfg config.AgentConfig) error {
 		batch = append(batch, result)
 	}
 	if len(batch) == 0 {
-		return nil
+		return sleepSeconds, nil
 	}
-	return uploadResults(supervisor, batch)
+	return sleepSeconds, uploadResults(supervisor, batch)
+}
+
+func nextPollInterval(tasks []model.Task, fallback int) int {
+	if fallback <= 0 {
+		fallback = 30
+	}
+	for _, task := range tasks {
+		if task.Params.ScheduleSeconds > 0 {
+			return task.Params.ScheduleSeconds
+		}
+	}
+	return fallback
 }
 
 func fetchTasks(supervisor string) ([]model.Task, error) {
