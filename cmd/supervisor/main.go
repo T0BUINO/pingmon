@@ -679,6 +679,7 @@ const dashboardHTML = `<!doctype html>
     let currentAgentRows = [];
     let chartFullRange = null;
     let chartViewRange = null;
+    let targetVisibility = new Map();
     let pinchStart = null;
     let panStart = null;
     document.querySelectorAll('.local-time').forEach(cell => {
@@ -1236,11 +1237,16 @@ const dashboardHTML = `<!doctype html>
         wrap.textContent = '当前 label 下暂无可绘制目标';
         return;
       }
+      const visibleLabels = new Set(chart.data.datasets.map(dataset => dataset.label));
+      targetVisibility = new Map(Array.from(targetVisibility.entries()).filter(([label]) => visibleLabels.has(label)));
       chart.data.datasets.forEach((dataset, index) => {
         const label = document.createElement('label');
         const input = document.createElement('input');
-        input.type = 'checkbox'; input.checked = true;
+        input.type = 'checkbox';
+        input.checked = targetVisibility.has(dataset.label) ? targetVisibility.get(dataset.label) : true;
+        chart.setDatasetVisibility(index, input.checked);
         input.addEventListener('change', () => {
+          targetVisibility.set(dataset.label, input.checked);
           chart.setDatasetVisibility(index, input.checked);
           chart.update();
         });
@@ -1255,6 +1261,7 @@ const dashboardHTML = `<!doctype html>
         detailChart.data = chartData;
         applyDetailChartRange('none');
         renderToggles(detailChart);
+        detailChart.update('none');
         return;
       }
       detailChart = new Chart(document.getElementById('latency'), {
@@ -1340,12 +1347,18 @@ const dashboardHTML = `<!doctype html>
       updateDetailChart(currentRows);
     }
     async function refreshDashboard() {
+      const scrollX = window.scrollX;
+      const scrollY = window.scrollY;
       renderDashboardRows(await loadResults());
+      requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
     }
     function applyLiveResults(rows) {
       if (!Array.isArray(rows) || !rows.length) return;
+      const scrollX = window.scrollX;
+      const scrollY = window.scrollY;
       currentRows = mergeRows(currentRows, rows);
       renderDashboardRows(currentRows);
+      requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
     }
     function handleRefreshError(err) {
       const targetToggles = document.getElementById('targetToggles');
