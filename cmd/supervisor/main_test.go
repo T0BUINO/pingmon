@@ -58,10 +58,6 @@ func TestHandleDeleteAgentDeletesAgentData(t *testing.T) {
 	}
 }
 
-func (s *fakeStore) RecentResults(limit int) ([]model.Result, error) {
-	return nil, nil
-}
-
 func (s *fakeStore) ResultsSince(since time.Time) ([]model.Result, error) {
 	return nil, nil
 }

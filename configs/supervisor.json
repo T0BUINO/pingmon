@@ -1,7 +1,5 @@
 {
   "listen": ":8080",
-  "storage": "sqlite",
-  "data_file": "data/results.jsonl",
   "sqlite_path": "data/pingmon.db",
   "dashboard_user": "admin",
   "dashboard_password": "change-me",

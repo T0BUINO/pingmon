@@ -189,11 +189,11 @@ func TestSQLiteDeleteAgentRemovesStatusesAndResults(t *testing.T) {
 	}
 }
 
-func TestSQLiteMigratesLegacySchemaToSeries(t *testing.T) {
+func TestSQLiteMigratesOldSchemaToSeries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pingmon.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		t.Fatalf("open legacy db: %v", err)
+		t.Fatalf("open old-schema db: %v", err)
 	}
 	_, err = db.Exec(`
 CREATE TABLE results (
@@ -241,10 +241,10 @@ INSERT INTO result_rollups (
 	('agent-1', '203.0.113.1', 'web', '198.51.100.10', 443, '["prod"]', '2026-06-18T10:00:00Z', 3600, 2, 4, 2, 15, 0.6666666667, 'rollup contains problem samples');
 `)
 	if closeErr := db.Close(); closeErr != nil {
-		t.Fatalf("close legacy db: %v", closeErr)
+		t.Fatalf("close old-schema db: %v", closeErr)
 	}
 	if err != nil {
-		t.Fatalf("seed legacy db: %v", err)
+		t.Fatalf("seed old-schema db: %v", err)
 	}
 
 	migrated, err := MigrateSQLite(path)

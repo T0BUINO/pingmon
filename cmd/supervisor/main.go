@@ -68,9 +68,6 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 	if *migrateOnly {
-		if cfg.Storage != "" && cfg.Storage != "sqlite" {
-			log.Fatalf("migrate-only only supports sqlite storage, got %q", cfg.Storage)
-		}
 		migrated, err := storage.MigrateSQLite(cfg.SQLitePath)
 		if err != nil {
 			log.Fatalf("migrate sqlite: %v", err)
@@ -82,7 +79,7 @@ func main() {
 		}
 		return
 	}
-	store, err := storage.New(cfg.Storage, cfg.DataFile, cfg.SQLitePath)
+	store, err := storage.New(cfg.SQLitePath)
 	if err != nil {
 		log.Fatalf("init storage: %v", err)
 	}
@@ -777,7 +774,7 @@ const dashboardHTML = `<!doctype html>
     <header>
       <div>
         <h1>{{if .Agent}}{{.Agent}}{{else}}监测节点{{end}}</h1>
-        <div class="subtle" id="pageSubtitle">{{if .Agent}}最后上报：--{{else}}分布式 TCP 探测概览{{end}}<span class="live-badge" id="liveState">实时</span></div>
+        <div class="subtle" id="pageSubtitle">{{if .Agent}}最后在线：--{{else}}分布式 TCP 探测概览{{end}}<span class="live-badge" id="liveState">实时</span></div>
       </div>
       <form class="page-actions" method="get" action="/dashboard">
         {{if .Agent}}<input type="hidden" name="agent" value="{{.Agent}}">{{end}}
@@ -1798,7 +1795,7 @@ const dashboardHTML = `<!doctype html>
       groups.forEach((_, agent) => agentNames.add(agent));
       if (!agentNames.size) {
         destroyMiniCharts();
-        wrap.innerHTML = '<div class="panel">暂无节点上报数据</div>';
+        wrap.innerHTML = '<div class="panel">暂无节点在线数据</div>';
         return;
       }
       wrap.querySelectorAll('.panel').forEach(panel => panel.remove());

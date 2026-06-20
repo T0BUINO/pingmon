@@ -121,14 +121,6 @@ func fetchTasks(supervisor, agent, agentIP string) ([]model.Task, error) {
 }
 
 func fetchAgentIP(cfg config.AgentConfig) string {
-	if strings.TrimSpace(cfg.PublicIPURL) != "" {
-		ip, err := fetchPublicIP(cfg.PublicIPURL)
-		if err != nil {
-			log.Printf("public ip lookup failed: %v", err)
-			return ""
-		}
-		return ip
-	}
 	ipv4, _ := fetchPublicIP(cfg.PublicIPv4URL)
 	ipv6, _ := fetchPublicIP(cfg.PublicIPv6URL)
 	switch {

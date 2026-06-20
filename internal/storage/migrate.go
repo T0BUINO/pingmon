@@ -27,15 +27,15 @@ func MigrateSQLiteDB(db *sql.DB) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	resultsLegacy, err := hasColumn(db, "results", "agent")
+	resultsNeedSeriesMigration, err := hasColumn(db, "results", "agent")
 	if err != nil {
 		return false, err
 	}
-	rollupsLegacy, err := hasColumn(db, "result_rollups", "agent")
+	rollupsNeedSeriesMigration, err := hasColumn(db, "result_rollups", "agent")
 	if err != nil {
 		return false, err
 	}
-	if !resultsLegacy && !rollupsLegacy && agentsReady {
+	if !resultsNeedSeriesMigration && !rollupsNeedSeriesMigration && agentsReady {
 		return false, nil
 	}
 
@@ -45,7 +45,7 @@ func MigrateSQLiteDB(db *sql.DB) (bool, error) {
 	}
 	defer tx.Rollback()
 
-	if resultsLegacy {
+	if resultsNeedSeriesMigration {
 		hasAgentIP, err := hasColumnTx(tx, "results", "agent_ip")
 		if err != nil {
 			return false, err
@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS result_series (
 		return false, err
 	}
 
-	if resultsLegacy {
+	if resultsNeedSeriesMigration {
 		if _, err := tx.Exec(`
 INSERT OR IGNORE INTO result_series (agent, agent_ip, target_name, address, port, labels)
 SELECT DISTINCT agent, COALESCE(agent_ip, ''), target_name, address, port, COALESCE(labels, '')
@@ -114,7 +114,7 @@ JOIN result_series rs ON rs.agent = r.agent
 		}
 	}
 
-	if rollupsLegacy {
+	if rollupsNeedSeriesMigration {
 		if _, err := tx.Exec(`
 INSERT OR IGNORE INTO result_series (agent, agent_ip, target_name, address, port, labels)
 SELECT DISTINCT agent, COALESCE(agent_ip, ''), target_name, address, port, COALESCE(labels, '')
@@ -174,7 +174,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_statuses_last_seen_at ON agent_statuses(las
 		}
 	}
 
-	if resultsLegacy || rollupsLegacy {
+	if resultsNeedSeriesMigration || rollupsNeedSeriesMigration {
 		if _, err := tx.Exec(`DELETE FROM sqlite_sequence WHERE name IN ('results', 'result_rollups')`); err != nil {
 			return false, err
 		}

@@ -12,7 +12,7 @@ cmd/supervisor     supervisor 入口
 cmd/agent          agent 入口
 internal/config    JSON/TOML 配置加载
 internal/model     公共数据结构
-internal/storage   存储接口、SQLite 存储和 JSONL 文件存储实现
+internal/storage   存储接口和 SQLite 存储实现
 configs            示例配置
 ```
 
@@ -108,9 +108,7 @@ http://127.0.0.1:8080/dashboard
 `supervisor` 支持 JSON 和本项目所需字段的简单 TOML：
 
 - `listen`：HTTP 监听地址。
-- `storage`：存储后端，默认 `sqlite`，也支持 `file`。
 - `sqlite_path`：SQLite 数据库路径。
-- `data_file`：使用 `storage = "file"` 时的 JSONL 结果文件路径。
 - `dashboard_user` / `dashboard_password`：Dashboard、`/api/results` 和 `/api/agents` 的 Basic Auth 账号密码。
 - `dashboard_ranges`：Dashboard 预设时间范围，支持分钟/小时/天/周/月，例如 `["5m", "15m", "30m", "12h", "24h", "3d", "7d", "14d", "30d", "60d", "180d", "365d"]`。页面右上角也可以临时输入自定义范围，例如 `45m`、`6h`、`10d`、`2w`、`3mo`。
 - `default_range`：Dashboard 默认时间范围，例如 `24h`。
@@ -151,7 +149,7 @@ public_ipv6_url = "https://api-ipv6.ip.sb/ip"
 
 agent 每轮会先获取公网 IP，然后带上 `agent_name` 和 `agent_ip` 拉取 `/api/tasks`，supervisor 会据此刷新节点心跳；随后 agent 执行探测并上报结果，上报成功时 supervisor 也会刷新同一 agent 的心跳。下一轮等待时间优先使用任务里的 `params.schedule_seconds`；如果拉取任务失败、任务为空或服务端没有下发有效 `schedule_seconds`，才回退到本地 `poll_interval_seconds`。
 
-`public_ipv4_url` / `public_ipv6_url` 用于 agent 主动获取双栈公网 IP 并随结果上报，适合容器内运行时避免只看到 Docker 内网 IP。默认分别使用 `https://api-ipv4.ip.sb/ip` 和 `https://api-ipv6.ip.sb/ip`；如果只获取到一个地址就上报一个，两个都失败时 supervisor 会继续用 HTTP 连接来源 IP 作为兜底。旧配置 `public_ip_url` 仍然可用，但它只会按当前网络出口返回一个地址。
+`public_ipv4_url` / `public_ipv6_url` 用于 agent 主动获取双栈公网 IP 并随结果上报，适合容器内运行时避免只看到 Docker 内网 IP。默认分别使用 `https://api-ipv4.ip.sb/ip` 和 `https://api-ipv6.ip.sb/ip`；如果只获取到一个地址就上报一个，两个都失败时 supervisor 会继续用 HTTP 连接来源 IP 作为兜底。
 
 ## License
 

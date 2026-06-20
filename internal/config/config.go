@@ -15,8 +15,6 @@ import (
 
 type Config struct {
 	Listen              string             `json:"listen"`
-	Storage             string             `json:"storage"`
-	DataFile            string             `json:"data_file"`
 	SQLitePath          string             `json:"sqlite_path"`
 	DashboardUser       string             `json:"dashboard_user"`
 	DashboardPassword   string             `json:"dashboard_password"`
@@ -35,7 +33,6 @@ type AgentConfig struct {
 	SupervisorURL       string `json:"supervisor_url"`
 	AgentName           string `json:"agent_name"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds"`
-	PublicIPURL         string `json:"public_ip_url"`
 	PublicIPv4URL       string `json:"public_ipv4_url"`
 	PublicIPv6URL       string `json:"public_ipv6_url"`
 }
@@ -43,8 +40,6 @@ type AgentConfig struct {
 func DefaultConfig() Config {
 	return Config{
 		Listen:              ":8080",
-		Storage:             "sqlite",
-		DataFile:            "data/results.jsonl",
 		SQLitePath:          "data/pingmon.db",
 		DashboardUser:       "admin",
 		DashboardPassword:   "admin",
@@ -135,7 +130,7 @@ func LoadAgent(path, format string) (AgentConfig, error) {
 		cfg.SupervisorURL = DefaultAgentConfig().SupervisorURL
 	}
 	def := DefaultAgentConfig()
-	if cfg.PublicIPURL == "" && cfg.PublicIPv4URL == "" && cfg.PublicIPv6URL == "" {
+	if cfg.PublicIPv4URL == "" && cfg.PublicIPv6URL == "" {
 		cfg.PublicIPv4URL = def.PublicIPv4URL
 		cfg.PublicIPv6URL = def.PublicIPv6URL
 	}
@@ -161,12 +156,6 @@ func applyDefaults(cfg *Config) {
 	def := DefaultConfig()
 	if cfg.Listen == "" {
 		cfg.Listen = def.Listen
-	}
-	if cfg.Storage == "" {
-		cfg.Storage = def.Storage
-	}
-	if cfg.DataFile == "" {
-		cfg.DataFile = def.DataFile
 	}
 	if cfg.SQLitePath == "" {
 		cfg.SQLitePath = def.SQLitePath
@@ -282,8 +271,6 @@ func parseAgentTOML(input string, cfg *AgentConfig) error {
 			cfg.AgentName = parseString(value)
 		case "poll_interval_seconds":
 			cfg.PollIntervalSeconds = mustInt(key, value)
-		case "public_ip_url":
-			cfg.PublicIPURL = parseString(value)
 		case "public_ipv4_url":
 			cfg.PublicIPv4URL = parseString(value)
 		case "public_ipv6_url":
@@ -297,10 +284,6 @@ func setConfigValue(cfg *Config, key, value string) error {
 	switch key {
 	case "listen":
 		cfg.Listen = parseString(value)
-	case "storage":
-		cfg.Storage = parseString(value)
-	case "data_file":
-		cfg.DataFile = parseString(value)
 	case "sqlite_path":
 		cfg.SQLitePath = parseString(value)
 	case "dashboard_user":
