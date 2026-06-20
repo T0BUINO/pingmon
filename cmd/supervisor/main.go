@@ -207,6 +207,11 @@ func (s *server) handleResults(w http.ResponseWriter, r *http.Request) {
 func (s *server) selectedRange(r *http.Request) string {
 	raw := r.URL.Query().Get("range")
 	if raw == "" {
+		if cookie, err := r.Cookie("pingmon_range"); err == nil {
+			raw = cookie.Value
+		}
+	}
+	if raw == "" {
 		raw = s.cfg.DefaultRange
 	}
 	for _, allowed := range s.cfg.DashboardRanges {
@@ -1730,6 +1735,7 @@ const dashboardHTML = `<!doctype html>
     const rangeCustomApply = document.getElementById('rangeCustomApply');
     const backButton = document.getElementById('backButton');
     const rangePresets = new Set(Array.from(document.querySelectorAll('.range-option')).map(option => option.dataset.range));
+    const rangeCookieName = 'pingmon_range';
     const customRangeCookieName = 'pingmon_custom_range';
     rangeButton.addEventListener('click', () => rangeMenu.classList.toggle('open'));
     function setCookie(name, value, maxAgeSeconds) {
@@ -1746,6 +1752,7 @@ const dashboardHTML = `<!doctype html>
     function applyRange(nextRange) {
       selectedRange = nextRange;
       rangeButton.textContent = selectedRange;
+      setCookie(rangeCookieName, selectedRange, 365 * 24 * 60 * 60);
       if (rangeCustomInput) rangeCustomInput.value = rangePresets.has(selectedRange) ? '' : selectedRange;
       if (rangePresets.has(selectedRange)) {
         setCookie(customRangeCookieName, '', 0);
