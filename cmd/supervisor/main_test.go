@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -125,5 +126,200 @@ func TestHandleReportSavesAgentHeartbeat(t *testing.T) {
 	}
 	if store.heartbeats[0].agent != "agent-1" || store.heartbeats[0].agentIP != "203.0.113.10" {
 		t.Fatalf("heartbeat = %+v", store.heartbeats[0])
+	}
+}
+
+func TestHandleReportRejectsEmptyObject(t *testing.T) {
+	store := &fakeStore{}
+	status, body := postReport(t, store, `{}`)
+
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", status, body)
+	}
+	assertNoReportWrites(t, store)
+}
+
+func TestHandleReportRejectsNull(t *testing.T) {
+	store := &fakeStore{}
+	status, body := postReport(t, store, `null`)
+
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", status, body)
+	}
+	assertNoReportWrites(t, store)
+}
+
+func TestHandleReportRejectsMissingRequiredFieldsInArray(t *testing.T) {
+	store := &fakeStore{}
+	status, body := postReport(t, store, `[{}]`)
+
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", status, body)
+	}
+	assertNoReportWrites(t, store)
+}
+
+func TestHandleReportRejectsInvalidPort(t *testing.T) {
+	for _, port := range []int{0, 70000} {
+		t.Run("port", func(t *testing.T) {
+			store := &fakeStore{}
+			result := validReportResult()
+			result.Port = port
+
+			status, body := postReport(t, store, reportJSON(t, result))
+
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", status, body)
+			}
+			assertNoReportWrites(t, store)
+		})
+	}
+}
+
+func TestHandleReportRejectsNegativeCounts(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*model.Result)
+	}{
+		{name: "success_count", edit: func(result *model.Result) { result.SuccessCount = -1 }},
+		{name: "failure_count", edit: func(result *model.Result) { result.FailureCount = -1 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeStore{}
+			result := validReportResult()
+			tt.edit(&result)
+
+			status, body := postReport(t, store, reportJSON(t, result))
+
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", status, body)
+			}
+			assertNoReportWrites(t, store)
+		})
+	}
+}
+
+func TestHandleReportRejectsZeroSamples(t *testing.T) {
+	store := &fakeStore{}
+	result := validReportResult()
+	result.SuccessCount = 0
+	result.FailureCount = 0
+
+	status, body := postReport(t, store, reportJSON(t, result))
+
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", status, body)
+	}
+	assertNoReportWrites(t, store)
+}
+
+func TestHandleReportRejectsInvalidSuccessRate(t *testing.T) {
+	for _, successRate := range []float64{-0.1, 1.1} {
+		t.Run("success_rate", func(t *testing.T) {
+			store := &fakeStore{}
+			result := validReportResult()
+			result.SuccessRate = successRate
+
+			status, body := postReport(t, store, reportJSON(t, result))
+
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", status, body)
+			}
+			assertNoReportWrites(t, store)
+		})
+	}
+}
+
+func TestHandleReportRejectsBatchWithOneInvalidResultWithoutPartialWrite(t *testing.T) {
+	store := &fakeStore{}
+	valid := validReportResult()
+	body := `[` + reportJSON(t, valid) + `,{}]`
+
+	status, response := postReport(t, store, body)
+
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", status, response)
+	}
+	assertNoReportWrites(t, store)
+}
+
+func TestValidateReportResult(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*model.Result)
+	}{
+		{name: "valid", edit: func(*model.Result) {}},
+		{name: "agent required", edit: func(result *model.Result) { result.Agent = " \t" }},
+		{name: "target_name required", edit: func(result *model.Result) { result.TargetName = "" }},
+		{name: "address required", edit: func(result *model.Result) { result.Address = "" }},
+		{name: "invalid port low", edit: func(result *model.Result) { result.Port = 0 }},
+		{name: "invalid port high", edit: func(result *model.Result) { result.Port = 65536 }},
+		{name: "negative success count", edit: func(result *model.Result) { result.SuccessCount = -1 }},
+		{name: "negative failure count", edit: func(result *model.Result) { result.FailureCount = -1 }},
+		{name: "zero samples", edit: func(result *model.Result) { result.SuccessCount = 0 }},
+		{name: "negative latency", edit: func(result *model.Result) { result.AverageLatencyMS = -0.01 }},
+		{name: "success rate low", edit: func(result *model.Result) { result.SuccessRate = -0.01 }},
+		{name: "success rate high", edit: func(result *model.Result) { result.SuccessRate = 1.01 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := validReportResult()
+			tt.edit(&result)
+
+			err := validateReportResult(result)
+
+			if tt.name == "valid" && err != nil {
+				t.Fatalf("validateReportResult() error = %v, want nil", err)
+			}
+			if tt.name != "valid" && err == nil {
+				t.Fatalf("validateReportResult() error = nil, want error")
+			}
+		})
+	}
+}
+
+func validReportResult() model.Result {
+	return model.Result{
+		Agent:            "agent-1",
+		AgentIP:          "203.0.113.10",
+		TargetName:       "web",
+		Address:          "198.51.100.10",
+		Port:             443,
+		CheckedAt:        time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC),
+		SuccessCount:     3,
+		FailureCount:     0,
+		AverageLatencyMS: 4.2,
+		SuccessRate:      1,
+	}
+}
+
+func reportJSON(t *testing.T, result model.Result) string {
+	t.Helper()
+	body, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	return string(body)
+}
+
+func postReport(t *testing.T, store *fakeStore, body string) (int, string) {
+	t.Helper()
+	s := &server{cfg: config.DefaultConfig(), store: store, hub: newWebsocketHub()}
+	req := httptest.NewRequest(http.MethodPost, "/api/report", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.handleReport(rr, req)
+
+	return rr.Code, rr.Body.String()
+}
+
+func assertNoReportWrites(t *testing.T, store *fakeStore) {
+	t.Helper()
+	if len(store.results) != 0 {
+		t.Fatalf("results = %d, want 0", len(store.results))
+	}
+	if len(store.heartbeats) != 0 {
+		t.Fatalf("heartbeats = %d, want 0", len(store.heartbeats))
 	}
 }

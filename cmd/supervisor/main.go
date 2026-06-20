@@ -6,7 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -134,7 +136,16 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	var raw json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&raw); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			http.Error(w, "invalid JSON payload", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -149,9 +160,17 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 	}
 	agentIP := remoteIP(r.RemoteAddr)
 	seenAt := time.Now()
-	saved := make([]model.Result, 0, len(results))
+	validatedResults := make([]model.Result, 0, len(results))
 	for _, result := range results {
+		if err := validateReportResult(result); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		normalizeReport(&result, agentIP)
+		validatedResults = append(validatedResults, result)
+	}
+	saved := make([]model.Result, 0, len(validatedResults))
+	for _, result := range validatedResults {
 		if err := s.store.SaveResult(result); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -198,6 +217,9 @@ func agentIdentityFromRequest(r *http.Request) (string, string) {
 }
 
 func decodeReportPayload(raw json.RawMessage) ([]model.Result, error) {
+	if strings.TrimSpace(string(raw)) == "null" {
+		return nil, fmt.Errorf("report payload is required")
+	}
 	var results []model.Result
 	if err := json.Unmarshal(raw, &results); err == nil {
 		return results, nil
@@ -207,6 +229,37 @@ func decodeReportPayload(raw json.RawMessage) ([]model.Result, error) {
 		return nil, err
 	}
 	return []model.Result{result}, nil
+}
+
+func validateReportResult(result model.Result) error {
+	if strings.TrimSpace(result.Agent) == "" {
+		return fmt.Errorf("agent is required")
+	}
+	if strings.TrimSpace(result.TargetName) == "" {
+		return fmt.Errorf("target_name is required")
+	}
+	if strings.TrimSpace(result.Address) == "" {
+		return fmt.Errorf("address is required")
+	}
+	if result.Port < 1 || result.Port > 65535 {
+		return fmt.Errorf("invalid port")
+	}
+	if result.SuccessCount < 0 {
+		return fmt.Errorf("success_count must be non-negative")
+	}
+	if result.FailureCount < 0 {
+		return fmt.Errorf("failure_count must be non-negative")
+	}
+	if result.SuccessCount+result.FailureCount <= 0 {
+		return fmt.Errorf("success_count and failure_count must include at least one sample")
+	}
+	if result.AverageLatencyMS < 0 {
+		return fmt.Errorf("average_latency_ms must be non-negative")
+	}
+	if result.SuccessRate < 0 || result.SuccessRate > 1 {
+		return fmt.Errorf("success_rate must be between 0 and 1")
+	}
+	return nil
 }
 
 func normalizeReport(result *model.Result, agentIP string) {
