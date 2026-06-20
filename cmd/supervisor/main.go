@@ -731,7 +731,7 @@ const dashboardHTML = `<!doctype html>
     const selectedAgent = '{{.Agent}}';
     let selectedRange = '{{.SelectedRange}}';
     let detailChart = null;
-    let miniCharts = [];
+    let miniCharts = new Set();
     let miniChartObserver = null;
     let selectedLabels = null;
     let currentRows = [];
@@ -895,6 +895,11 @@ const dashboardHTML = `<!doctype html>
         cancelAnimationFrame(this.tooltipRaf);
         if (this.resizeObserver) this.resizeObserver.disconnect();
         this.container.replaceChildren();
+      }
+      setData(data) {
+        this.data = data || {datasets: []};
+        this.invalidateTooltipCache();
+        this.update();
       }
       setDatasetVisibility(index, visible) {
         this.visibility.set(index, visible);
@@ -1567,17 +1572,35 @@ const dashboardHTML = `<!doctype html>
         miniChartObserver = null;
       }
       miniCharts.forEach(chart => chart.destroy());
-      miniCharts = [];
+      miniCharts.clear();
+    }
+    function destroyMiniChartSurface(surface) {
+      if (!surface) return;
+      if (miniChartObserver) miniChartObserver.unobserve(surface);
+      if (surface.__miniChart) {
+        miniCharts.delete(surface.__miniChart);
+        surface.__miniChart.destroy();
+        delete surface.__miniChart;
+      }
+      delete surface.__chartRows;
     }
     function renderMiniChart(surface, rows) {
-      if (!surface.isConnected || surface.dataset.rendered === 'true') return;
-      surface.dataset.rendered = 'true';
+      if (!surface.isConnected) return;
       const chartData = buildDatasets(rows);
+      if (surface.__miniChart) {
+        surface.__miniChart.setData(chartData);
+        return;
+      }
       const miniChart = new SvgLineChart(surface, chartData, {mini: true, smooth: true, scales: {x: {}}});
-      miniCharts.push(miniChart);
+      surface.__miniChart = miniChart;
+      miniCharts.add(miniChart);
     }
     function queueMiniChart(surface, rows) {
       if (!surface) return;
+      if (surface.__miniChart) {
+        surface.__miniChart.setData(buildDatasets(rows));
+        return;
+      }
       if (!('IntersectionObserver' in window)) {
         scheduleLowPriority(() => renderMiniChart(surface, rows));
         return;
@@ -1598,36 +1621,49 @@ const dashboardHTML = `<!doctype html>
     }
     function renderLanding(rows) {
       const wrap = document.getElementById('agentCards');
-      destroyMiniCharts();
-      wrap.innerHTML = '';
+      const existingCards = new Map(Array.from(wrap.querySelectorAll('.agent-card')).map(card => [card.dataset.agent, card]));
       const groups = new Map();
       for (const row of rows) {
         if (!groups.has(row.agent)) groups.set(row.agent, []);
         groups.get(row.agent).push(row);
       }
       if (!groups.size) {
+        destroyMiniCharts();
         wrap.innerHTML = '<div class="panel">暂无节点上报数据</div>';
         return;
       }
+      wrap.querySelectorAll('.panel').forEach(panel => panel.remove());
+      const activeAgents = new Set();
       Array.from(groups.entries()).forEach(([agent, agentRows], index) => {
         const summary = summarizeAgent(agentRows);
-        const card = document.createElement('a');
-        card.className = 'agent-card';
+        activeAgents.add(agent);
+        let card = existingCards.get(agent);
+        if (!card) {
+          card = document.createElement('a');
+          card.className = 'agent-card';
+          card.innerHTML =
+            '<div class="card-head"><div><div class="agent-name"></div><div class="subtle"></div></div><span class="status"></span></div>' +
+            '<div class="metrics"></div><div class="mini-chart chart-surface"></div>';
+        }
+        card.dataset.agent = agent;
         card.href = '/dashboard?agent=' + encodeURIComponent(agent) + '&range=' + encodeURIComponent(selectedRange);
-        card.innerHTML =
-          '<div class="card-head"><div><div class="agent-name"></div><div class="subtle"></div></div><span class="status"></span></div>' +
-          '<div class="metrics"></div><div class="mini-chart chart-surface"></div>';
         card.querySelector('.agent-name').textContent = agent;
         card.querySelector('.subtle').textContent = '节点 IP：' + (summary.latest.agent_ip || '未知') + ' · 最后上报：' + new Date(summary.latest.checked_at).toLocaleString();
         const status = card.querySelector('.status');
         status.textContent = summary.successRate >= 0.99 ? '正常' : '异常';
         status.className = 'status ' + (summary.successRate >= 0.99 ? 'ok' : 'bad');
         const metrics = card.querySelector('.metrics');
+        metrics.replaceChildren();
         metrics.append(metric('目标数', String(summary.targetCount)));
         metrics.append(metric('成功率', (summary.successRate * 100).toFixed(1) + '%'));
         metrics.append(metric('平均延迟', summary.averageLatency.toFixed(1) + ' ms'));
         wrap.appendChild(card);
         queueMiniChart(card.querySelector('.mini-chart'), agentRows);
+      });
+      existingCards.forEach((card, agent) => {
+        if (activeAgents.has(agent)) return;
+        destroyMiniChartSurface(card.querySelector('.mini-chart'));
+        card.remove();
       });
     }
     function renderAgentInfo(rows) {
