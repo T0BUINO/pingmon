@@ -28,11 +28,12 @@ type server struct {
 }
 
 type dashboardData struct {
-	Results       []model.Result
-	Agent         string
-	Ranges        []string
-	SelectedRange string
-	CustomRange   bool
+	Results             []model.Result
+	Agent               string
+	Ranges              []string
+	SelectedRange       string
+	CustomRange         bool
+	OfflineAfterSeconds int
 }
 
 type websocketHub struct {
@@ -244,11 +245,12 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.tpl.Execute(w, dashboardData{
-		Results:       templateResults,
-		Agent:         agent,
-		Ranges:        s.cfg.DashboardRanges,
-		SelectedRange: selectedRange,
-		CustomRange:   !rangeInList(selectedRange, s.cfg.DashboardRanges),
+		Results:             templateResults,
+		Agent:               agent,
+		Ranges:              s.cfg.DashboardRanges,
+		SelectedRange:       selectedRange,
+		CustomRange:         !rangeInList(selectedRange, s.cfg.DashboardRanges),
+		OfflineAfterSeconds: s.agentOfflineAfterSeconds(),
 	}); err != nil {
 		log.Printf("render dashboard: %v", err)
 	}
@@ -683,13 +685,13 @@ const dashboardHTML = `<!doctype html>
     .agent-card { display: block; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; min-height: 220px; content-visibility: auto; contain-intrinsic-size: 360px 220px; contain: layout paint; cursor: pointer; transition: border-color .15s, transform .15s, box-shadow .15s; }
     .agent-card:hover { border-color: #94a3b8; transform: translateY(-1px); box-shadow: 0 10px 24px rgba(15, 23, 42, .08); }
     .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
-    .card-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
     .agent-name { font-weight: 700; font-size: 17px; overflow-wrap: anywhere; }
     .status { border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; white-space: nowrap; }
     .status.ok { background: #dcfce7; color: #166534; }
     .status.bad { background: #fee2e2; color: #991b1b; }
     .status.offline { background: #e5e7eb; color: #374151; }
     .status.idle { background: #e0f2fe; color: #075985; }
+    .subtle .status { display: inline-flex; align-items: center; padding: 2px 8px; }
     .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0; }
     .metric { border: 1px solid #e5eaf1; border-radius: 6px; padding: 8px; background: #fbfcfe; min-width: 0; }
     .metric span { display: block; color: var(--muted); font-size: 12px; }
@@ -720,7 +722,6 @@ const dashboardHTML = `<!doctype html>
     .live-badge { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #bbf7d0; border-radius: 999px; padding: 2px 8px; background: #f0fdf4; color: #166534; font-size: 12px; font-weight: 600; vertical-align: middle; }
     .live-badge::before { content: ""; width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
     .live-badge.reconnecting { border-color: #fed7aa; background: #fff7ed; color: #9a3412; }
-    .agent-state-badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 700; }
     input { height: 34px; border: 1px solid transparent; border-radius: 6px; padding: 0 11px; background: #f8fafc; color: var(--ink); font-size: 14px; line-height: 34px; }
     .range-menu { position: relative; flex: 0 0 auto; }
     .range-button { min-width: 78px; justify-content: space-between; gap: 10px; }
@@ -740,7 +741,6 @@ const dashboardHTML = `<!doctype html>
     [hidden] { display: none !important; }
     button.danger { border-color: #fecaca; background: #fef2f2; color: #991b1b; }
     button.danger:hover { border-color: #fca5a5; background: #fee2e2; }
-    .delete-agent { height: 28px; padding: 0 9px; font-size: 12px; }
     .table-scroll { width: 100%; overflow-x: auto; border: 1px solid #e7ebf1; border-radius: 8px; }
     .table-scroll table { min-width: 860px; }
     table { width: 100%; border-collapse: collapse; font-size: 14px; }
@@ -850,6 +850,7 @@ const dashboardHTML = `<!doctype html>
     const maxProblemLogRows = 200;
     const minChartGapMs = 5 * 60 * 1000;
     const selectedAgent = '{{.Agent}}';
+    const defaultOfflineAfterSeconds = {{.OfflineAfterSeconds}};
     let selectedRange = '{{.SelectedRange}}';
     let detailChart = null;
     let miniCharts = new Set();
@@ -1693,18 +1694,24 @@ const dashboardHTML = `<!doctype html>
       return currentAgents.find(item => item.agent === agent) || null;
     }
     function agentStatusLabel(status, summary) {
-      if (status && status.status === 'offline') return {text: '离线', className: 'offline'};
+      const lastSeen = agentLastSeenTime(status, summary);
+      const offlineAfter = Number((status && status.offline_after_seconds) || defaultOfflineAfterSeconds || 90) * 1000;
+      if (lastSeen !== null && Date.now() - lastSeen > offlineAfter) return {text: '离线', className: 'offline'};
       if (!summary) return {text: '暂无数据', className: 'idle'};
       return summary.successRate >= 0.99 ? {text: '正常', className: 'ok'} : {text: '异常', className: 'bad'};
     }
     function agentStateBadgeHTML(state) {
-      return '<span class="agent-state-badge status ' + state.className + '">' + state.text + '</span>';
+      return '<span class="status ' + state.className + '">' + state.text + '</span>';
+    }
+    function agentLastSeenTime(status, summary) {
+      const raw = status && status.last_seen_at ? status.last_seen_at : summary && summary.latest && summary.latest.checked_at;
+      if (!raw) return null;
+      const ts = new Date(raw).getTime();
+      return Number.isNaN(ts) ? null : ts;
     }
     function lastSeenText(status, summary) {
-      const raw = status && status.last_seen_at ? status.last_seen_at : summary && summary.latest && summary.latest.checked_at;
-      if (!raw) return '未知';
-      const date = new Date(raw);
-      return Number.isNaN(date.getTime()) ? '未知' : date.toLocaleString();
+      const ts = agentLastSeenTime(status, summary);
+      return ts === null ? '未知' : new Date(ts).toLocaleString();
     }
     function agentIPText(status, summary) {
       return (status && status.agent_ip) || (summary && summary.latest && summary.latest.agent_ip) || '未知';
@@ -1810,10 +1817,9 @@ const dashboardHTML = `<!doctype html>
           card.tabIndex = 0;
           card.setAttribute('role', 'link');
           card.innerHTML =
-            '<div class="card-head"><div><div class="agent-name"></div><div class="subtle"></div></div><div class="card-actions"><span class="status"></span><button class="danger delete-agent" type="button" hidden>删除结果</button></div></div>' +
+            '<div class="card-head"><div><div class="agent-name"></div><div class="subtle"></div></div><span class="status"></span></div>' +
             '<div class="metrics"></div><div class="mini-chart chart-surface"></div>';
           card.addEventListener('click', event => {
-            if (event.target.closest('button')) return;
             location.href = card.dataset.href;
           });
           card.addEventListener('keydown', event => {
@@ -1829,13 +1835,6 @@ const dashboardHTML = `<!doctype html>
         const status = card.querySelector('.status');
         status.textContent = state.text;
         status.className = 'status ' + state.className;
-        const deleteButton = card.querySelector('.delete-agent');
-        deleteButton.hidden = state.className !== 'offline';
-        deleteButton.onclick = event => {
-          event.preventDefault();
-          event.stopPropagation();
-          deleteAgent(agent).catch(handleRefreshError);
-        };
         const metrics = card.querySelector('.metrics');
         metrics.replaceChildren();
         metrics.append(metric('目标数', summary ? String(summary.targetCount) : '0'));

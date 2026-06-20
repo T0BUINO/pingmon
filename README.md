@@ -122,7 +122,7 @@ http://127.0.0.1:8080/dashboard
 - `[params]`：探测次数、单次探测间隔、超时、IPv6 开关和 `schedule_seconds`。agent 会优先按 `/api/tasks` 下发的 `schedule_seconds` 等待下一轮任务。
 - `[[targets]]`：探测目标列表。
 
-Dashboard landing 按 agent 展示卡片，详情页按 target 展示曲线和日志。supervisor 会持久化 agent 心跳，离线阈值默认为 `[params].schedule_seconds * 3`；如果 `schedule_seconds` 未配置或无效，则使用 `task_interval_seconds * 3`。离线表示 agent 没有按预期联系 supervisor，异常表示 agent 在线但探测结果不健康。离线 agent 的卡片和详情页会显示“删除结果”按钮，可删除该 agent 的心跳记录、原始结果、聚合结果和 series 元数据。
+Dashboard landing 按 agent 展示卡片，详情页按 target 展示曲线和日志。supervisor 会持久化 agent 心跳，离线阈值默认为 `[params].schedule_seconds * 3`；如果 `schedule_seconds` 未配置或无效，则使用 `task_interval_seconds * 3`。离线表示 agent 没有按预期联系 supervisor，异常表示 agent 在线但探测结果不健康。离线 agent 的详情页会显示“删除结果”按钮，可删除该 agent 的心跳记录、原始结果、聚合结果和 series 元数据。
 
 图表数据按时间范围查询，支持 `h` 小时、`d` 天、`w` 周、`mo` 月，其中 `mo` 按 30 天估算。超过 `raw_retention_days` 的旧数据会从 SQLite `result_rollups` 聚合表读取，近期数据仍保留原始粒度。页面会连接 `/ws`，agent 上报新结果或删除 agent 数据后通过 WebSocket 自动刷新当前视图。
 
