@@ -940,16 +940,44 @@ const dashboardHTML = `<!doctype html>
         if (segment.length === 2 || this.options.smooth === false) {
           return segment.map((point, index) => (index ? 'L' : 'M') + point.x.toFixed(1) + ' ' + point.y.toFixed(1)).join('');
         }
-        let d = 'M' + segment[0].x.toFixed(1) + ' ' + segment[0].y.toFixed(1);
+        const slopes = [];
+        const tangents = new Array(segment.length).fill(0);
+        for (let i = 0; i < segment.length - 1; i++) {
+          const dx = segment[i + 1].x - segment[i].x;
+          slopes[i] = dx === 0 ? 0 : (segment[i + 1].y - segment[i].y) / dx;
+        }
+        tangents[0] = slopes[0];
+        tangents[segment.length - 1] = slopes[slopes.length - 1];
         for (let i = 1; i < segment.length - 1; i++) {
+          tangents[i] = slopes[i - 1] * slopes[i] <= 0 ? 0 : (slopes[i - 1] + slopes[i]) / 2;
+        }
+        for (let i = 0; i < slopes.length; i++) {
+          if (slopes[i] === 0) {
+            tangents[i] = 0;
+            tangents[i + 1] = 0;
+            continue;
+          }
+          const a = tangents[i] / slopes[i];
+          const b = tangents[i + 1] / slopes[i];
+          const h = Math.hypot(a, b);
+          if (h > 3) {
+            const scale = 3 / h;
+            tangents[i] = scale * a * slopes[i];
+            tangents[i + 1] = scale * b * slopes[i];
+          }
+        }
+        let d = 'M' + segment[0].x.toFixed(1) + ' ' + segment[0].y.toFixed(1);
+        for (let i = 0; i < segment.length - 1; i++) {
           const current = segment[i];
           const next = segment[i + 1];
-          const midX = (current.x + next.x) / 2;
-          const midY = (current.y + next.y) / 2;
-          d += 'Q' + current.x.toFixed(1) + ' ' + current.y.toFixed(1) + ' ' + midX.toFixed(1) + ' ' + midY.toFixed(1);
+          const dx = next.x - current.x;
+          const c1x = current.x + dx / 3;
+          const c1y = current.y + tangents[i] * dx / 3;
+          const c2x = next.x - dx / 3;
+          const c2y = next.y - tangents[i + 1] * dx / 3;
+          d += 'C' + c1x.toFixed(1) + ' ' + c1y.toFixed(1) + ' ' + c2x.toFixed(1) + ' ' + c2y.toFixed(1) + ' ' + next.x.toFixed(1) + ' ' + next.y.toFixed(1);
         }
-        const last = segment[segment.length - 1];
-        return d + 'L' + last.x.toFixed(1) + ' ' + last.y.toFixed(1);
+        return d;
       }
       pointWindow(points, xRange) {
         let start = 0;
