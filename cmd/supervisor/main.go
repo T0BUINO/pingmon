@@ -23,10 +23,11 @@ import (
 )
 
 type server struct {
-	cfg   config.Config
-	store storage.Store
-	tpl   *template.Template
-	hub   *websocketHub
+	cfg          config.Config
+	store        storage.Store
+	tpl          *template.Template
+	hub          *websocketHub
+	resultsCache *resultsCache
 }
 
 type dashboardData struct {
@@ -58,6 +59,7 @@ type agentStatusView struct {
 }
 
 const maxProblemLogRows = 200
+const resultsCacheTTL = 2 * time.Second
 
 func main() {
 	configPath := flag.String("config", "configs/supervisor.toml", "path to JSON or TOML config")
@@ -89,7 +91,7 @@ func main() {
 		"mul":      func(a, b float64) float64 { return a * b },
 		"severity": resultSeverity,
 	}).Parse(dashboardHTML))
-	s := &server{cfg: cfg, store: store, tpl: tpl, hub: newWebsocketHub()}
+	s := &server{cfg: cfg, store: store, tpl: tpl, hub: newWebsocketHub(), resultsCache: newResultsCache(resultsCacheTTL)}
 	go s.startRetentionCleaner()
 
 	mux := http.NewServeMux()
@@ -186,6 +188,7 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 				result.TargetName, result.Address, result.Port, failures, s.cfg.FailureThreshold)
 		}
 	}
+	s.resultsCache.clear()
 	s.hub.broadcastJSON(websocketEvent{Type: "results", Results: saved})
 	writeJSON(w, map[string]any{"status": "ok", "saved": len(results)})
 }
@@ -280,14 +283,11 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	selectedRange := s.selectedRange(r)
-	results, err := s.resultsSince(time.Now().Add(-rangeDuration(selectedRange)))
+	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
+	results, err := s.resultsSince(time.Now().Add(-rangeDuration(selectedRange)), agent)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	agent := r.URL.Query().Get("agent")
-	if agent != "" {
-		results = filterResultsByAgent(results, agent)
 	}
 	templateResults := results
 	if agent != "" {
@@ -312,15 +312,24 @@ func (s *server) handleResults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	selectedRange := s.selectedRange(r)
-	results, err := s.resultsSince(time.Now().Add(-rangeDuration(selectedRange)))
+	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
+	cacheKey := resultsCacheKey{selectedRange: selectedRange, agent: agent}
+	if data, ok := s.resultsCache.get(cacheKey); ok {
+		writeJSONBytes(w, data)
+		return
+	}
+	results, err := s.resultsSince(time.Now().Add(-rangeDuration(selectedRange)), agent)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if agent := r.URL.Query().Get("agent"); agent != "" {
-		results = filterResultsByAgent(results, agent)
+	data, err := json.Marshal(results)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	writeJSON(w, results)
+	s.resultsCache.set(cacheKey, data)
+	writeJSONBytes(w, data)
 }
 
 func (s *server) handleAgents(w http.ResponseWriter, r *http.Request) {
@@ -367,6 +376,7 @@ func (s *server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.resultsCache.clear()
 	if s.hub != nil {
 		s.hub.broadcast("refresh")
 	}
@@ -408,10 +418,16 @@ func (s *server) selectedRange(r *http.Request) string {
 	return "24h"
 }
 
-func (s *server) resultsSince(since time.Time) ([]model.Result, error) {
+func (s *server) resultsSince(since time.Time, agent string) ([]model.Result, error) {
 	rawCutoff := time.Now().AddDate(0, 0, -s.cfg.RawRetentionDays)
 	if since.Before(rawCutoff) {
+		if agent != "" {
+			return s.store.ResultsSinceCompactedForAgent(since, rawCutoff, agent)
+		}
 		return s.store.ResultsSinceCompacted(since, rawCutoff)
+	}
+	if agent != "" {
+		return s.store.ResultsSinceForAgent(since, agent)
 	}
 	return s.store.ResultsSince(since)
 }
@@ -464,16 +480,6 @@ func rangeInList(raw string, ranges []string) bool {
 		}
 	}
 	return false
-}
-
-func filterResultsByAgent(results []model.Result, agent string) []model.Result {
-	filtered := make([]model.Result, 0, len(results))
-	for _, result := range results {
-		if result.Agent == agent {
-			filtered = append(filtered, result)
-		}
-	}
-	return filtered
 }
 
 func problemResults(results []model.Result, limit int) []model.Result {
@@ -699,6 +705,7 @@ func (s *server) cleanOldData() {
 		return
 	}
 	if rolled > 0 || deletedRaw > 0 || deletedRollups > 0 {
+		s.resultsCache.clear()
 		log.Printf("retention cleanup rolled=%d deleted_raw=%d deleted_rollups=%d", rolled, deletedRaw, deletedRollups)
 		if err := s.store.Vacuum(); err != nil {
 			log.Printf("retention vacuum failed: %v", err)
@@ -711,6 +718,79 @@ func writeJSON(w http.ResponseWriter, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("write json: %v", err)
 	}
+}
+
+func writeJSONBytes(w http.ResponseWriter, data []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(data); err != nil {
+		log.Printf("write json: %v", err)
+	}
+}
+
+type resultsCacheKey struct {
+	selectedRange string
+	agent         string
+}
+
+type resultsCacheEntry struct {
+	data      []byte
+	expiresAt time.Time
+}
+
+type resultsCache struct {
+	mu      sync.RWMutex
+	ttl     time.Duration
+	entries map[resultsCacheKey]resultsCacheEntry
+}
+
+func newResultsCache(ttl time.Duration) *resultsCache {
+	return &resultsCache{
+		ttl:     ttl,
+		entries: make(map[resultsCacheKey]resultsCacheEntry),
+	}
+}
+
+func (c *resultsCache) get(key resultsCacheKey) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+	now := time.Now()
+	c.mu.RLock()
+	entry, ok := c.entries[key]
+	if !ok || now.After(entry.expiresAt) {
+		c.mu.RUnlock()
+		if ok {
+			c.mu.Lock()
+			if current, exists := c.entries[key]; exists && now.After(current.expiresAt) {
+				delete(c.entries, key)
+			}
+			c.mu.Unlock()
+		}
+		return nil, false
+	}
+	c.mu.RUnlock()
+	return entry.data, true
+}
+
+func (c *resultsCache) set(key resultsCacheKey, data []byte) {
+	if c == nil || c.ttl <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.entries[key] = resultsCacheEntry{
+		data:      append([]byte(nil), data...),
+		expiresAt: time.Now().Add(c.ttl),
+	}
+	c.mu.Unlock()
+}
+
+func (c *resultsCache) clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.entries = make(map[resultsCacheKey]resultsCacheEntry)
+	c.mu.Unlock()
 }
 
 const dashboardHTML = `<!doctype html>

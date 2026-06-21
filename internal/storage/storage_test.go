@@ -106,6 +106,91 @@ func TestSQLiteRollupAndCompactedResults(t *testing.T) {
 	}
 }
 
+func TestSQLiteCompactedResultsForAgent(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pingmon.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.db.Close()
+
+	oldBucket := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	newTime := time.Date(2026, 6, 19, 10, 0, 0, 0, time.UTC)
+	for _, result := range []model.Result{
+		{
+			Agent:            "agent-1",
+			AgentIP:          "203.0.113.1",
+			TargetName:       "web",
+			Address:          "198.51.100.10",
+			Port:             443,
+			CheckedAt:        oldBucket.Add(5 * time.Minute),
+			SuccessCount:     3,
+			AverageLatencyMS: 10,
+			SuccessRate:      1,
+		},
+		{
+			Agent:            "agent-1",
+			AgentIP:          "203.0.113.1",
+			TargetName:       "web",
+			Address:          "198.51.100.10",
+			Port:             443,
+			CheckedAt:        newTime,
+			SuccessCount:     3,
+			AverageLatencyMS: 7,
+			SuccessRate:      1,
+		},
+		{
+			Agent:            "agent-2",
+			AgentIP:          "203.0.113.2",
+			TargetName:       "web",
+			Address:          "198.51.100.10",
+			Port:             443,
+			CheckedAt:        oldBucket.Add(10 * time.Minute),
+			SuccessCount:     1,
+			AverageLatencyMS: 20,
+			SuccessRate:      1,
+		},
+		{
+			Agent:            "agent-2",
+			AgentIP:          "203.0.113.2",
+			TargetName:       "web",
+			Address:          "198.51.100.10",
+			Port:             443,
+			CheckedAt:        newTime.Add(time.Minute),
+			SuccessCount:     1,
+			AverageLatencyMS: 9,
+			SuccessRate:      1,
+		},
+	} {
+		if err := store.SaveResult(result); err != nil {
+			t.Fatalf("SaveResult: %v", err)
+		}
+	}
+
+	rawCutoff := time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC)
+	if _, err := store.RollupBefore(rawCutoff, time.Hour); err != nil {
+		t.Fatalf("RollupBefore: %v", err)
+	}
+	if _, err := store.DeleteBefore(rawCutoff); err != nil {
+		t.Fatalf("DeleteBefore: %v", err)
+	}
+
+	results, err := store.ResultsSinceCompactedForAgent(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), rawCutoff, "agent-1")
+	if err != nil {
+		t.Fatalf("ResultsSinceCompactedForAgent: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(results))
+	}
+	for _, result := range results {
+		if result.Agent != "agent-1" {
+			t.Fatalf("result agent = %q, want agent-1", result.Agent)
+		}
+	}
+	if !results[0].CheckedAt.Equal(newTime) || !results[1].CheckedAt.Equal(oldBucket) {
+		t.Fatalf("result times = %s, %s", results[0].CheckedAt, results[1].CheckedAt)
+	}
+}
+
 func TestSQLiteAgentHeartbeat(t *testing.T) {
 	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pingmon.db"))
 	if err != nil {

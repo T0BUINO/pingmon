@@ -21,7 +21,9 @@ type Store interface {
 	DeleteAgent(agent string) error
 	SaveResult(model.Result) error
 	ResultsSince(since time.Time) ([]model.Result, error)
+	ResultsSinceForAgent(since time.Time, agent string) ([]model.Result, error)
 	ResultsSinceCompacted(since, rawCutoff time.Time) ([]model.Result, error)
+	ResultsSinceCompactedForAgent(since, rawCutoff time.Time, agent string) ([]model.Result, error)
 	RollupBefore(cutoff time.Time, interval time.Duration) (int, error)
 	DeleteBefore(cutoff time.Time) (int, error)
 	DeleteRollupsBefore(cutoff time.Time) (int, error)
@@ -72,6 +74,7 @@ CREATE TABLE IF NOT EXISTS result_series (
 	labels TEXT NOT NULL,
 	UNIQUE(agent, agent_ip, target_name, address, port, labels)
 );
+CREATE INDEX IF NOT EXISTS idx_result_series_agent ON result_series(agent);
 CREATE TABLE IF NOT EXISTS results (
 	id INTEGER PRIMARY KEY,
 	series_id INTEGER NOT NULL,
@@ -215,6 +218,19 @@ ORDER BY r.checked_at DESC`, since.UTC().Format(time.RFC3339Nano))
 	return scanResults(rows)
 }
 
+func (s *SQLiteStore) ResultsSinceForAgent(since time.Time, agent string) ([]model.Result, error) {
+	rows, err := s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
+r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
+FROM result_series rs JOIN results r ON r.series_id = rs.id
+WHERE rs.agent = ? AND r.checked_at >= ?
+ORDER BY r.checked_at DESC`, agent, since.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanResults(rows)
+}
+
 func (s *SQLiteStore) ResultsSinceCompacted(since, rawCutoff time.Time) ([]model.Result, error) {
 	if since.After(rawCutoff) || since.Equal(rawCutoff) {
 		return s.ResultsSince(since)
@@ -236,12 +252,46 @@ func (s *SQLiteStore) ResultsSinceCompacted(since, rawCutoff time.Time) ([]model
 	return results, nil
 }
 
+func (s *SQLiteStore) ResultsSinceCompactedForAgent(since, rawCutoff time.Time, agent string) ([]model.Result, error) {
+	if since.After(rawCutoff) || since.Equal(rawCutoff) {
+		return s.ResultsSinceForAgent(since, agent)
+	}
+	results := make([]model.Result, 0)
+	rollups, err := s.rollupsSinceForAgent(since, rawCutoff, agent)
+	if err != nil {
+		return nil, err
+	}
+	results = append(results, rollups...)
+	raw, err := s.ResultsSinceForAgent(rawCutoff, agent)
+	if err != nil {
+		return nil, err
+	}
+	results = append(results, raw...)
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].CheckedAt.After(results[j].CheckedAt)
+	})
+	return results, nil
+}
+
 func (s *SQLiteStore) rollupsSince(since, before time.Time) ([]model.Result, error) {
 	rows, err := s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
 rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
 FROM result_rollups rr JOIN result_series rs ON rs.id = rr.series_id
 WHERE rr.bucket_start >= ? AND rr.bucket_start < ?
 ORDER BY rr.bucket_start DESC`, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanResults(rows)
+}
+
+func (s *SQLiteStore) rollupsSinceForAgent(since, before time.Time, agent string) ([]model.Result, error) {
+	rows, err := s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
+rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
+FROM result_series rs JOIN result_rollups rr ON rr.series_id = rs.id
+WHERE rs.agent = ? AND rr.bucket_start >= ? AND rr.bucket_start < ?
+ORDER BY rr.bucket_start DESC`, agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return nil, err
 	}

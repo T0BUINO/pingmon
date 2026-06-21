@@ -63,7 +63,15 @@ func (s *fakeStore) ResultsSince(since time.Time) ([]model.Result, error) {
 	return nil, nil
 }
 
+func (s *fakeStore) ResultsSinceForAgent(since time.Time, agent string) ([]model.Result, error) {
+	return nil, nil
+}
+
 func (s *fakeStore) ResultsSinceCompacted(since, rawCutoff time.Time) ([]model.Result, error) {
+	return nil, nil
+}
+
+func (s *fakeStore) ResultsSinceCompactedForAgent(since, rawCutoff time.Time, agent string) ([]model.Result, error) {
 	return nil, nil
 }
 
