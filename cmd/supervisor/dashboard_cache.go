@@ -354,6 +354,42 @@ func (c *dashboardResultCache) streamDayBucket(key dashboardCacheKey, day time.T
 	return scanner.Err()
 }
 
+func (c *dashboardResultCache) writeFullAgent(w http.ResponseWriter, key dashboardCacheKey, since time.Time, writeLine func([]byte) error) error {
+	meta, err := c.readMeta(key)
+	if err != nil {
+		return err
+	}
+	if err := c.writeDeltas(meta, writeLine); err != nil {
+		return err
+	}
+	return c.writeBaseFiltered(key, since, writeLine)
+}
+
+func (c *dashboardResultCache) anyAgentCacheReady() bool {
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		metaPath := filepath.Join(c.dir, entry.Name(), "cache.meta.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+		var meta dashboardCacheMeta
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		if meta.Version == dashboardCacheVersion && meta.Key.Agent != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *dashboardResultCache) appendDelta(results []model.Result) {
 	if c == nil || len(results) == 0 {
 		return
@@ -414,6 +450,19 @@ func (c *dashboardResultCache) clear() {
 	defer c.mu.Unlock()
 	if err := os.RemoveAll(c.dir); err != nil {
 		log.Printf("dashboard cache clear: %v", err)
+	}
+}
+
+func (c *dashboardResultCache) clearKey(key dashboardCacheKey) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.pending, key)
+	c.generation++
+	c.mu.Unlock()
+	if err := os.RemoveAll(c.bucketDir(key)); err != nil {
+		log.Printf("dashboard cache clear key: %v", err)
 	}
 }
 

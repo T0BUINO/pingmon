@@ -393,6 +393,11 @@ func (s *server) handleCacheStatus(w http.ResponseWriter, r *http.Request) {
 	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
 	key := dashboardCacheKey{Agent: agent}
 	state := s.dashCache.cacheState(key)
+	if agent == "" && (state == "none" || state == "building") {
+		if s.dashCache.anyAgentCacheReady() {
+			state = "ready"
+		}
+	}
 	writeJSON(w, map[string]string{"agent": agent, "cache_status": state})
 }
 
@@ -407,7 +412,7 @@ func (s *server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.resultsCache.clear()
-	s.dashCache.clear()
+	s.dashCache.clearKey(dashboardCacheKey{Agent: agent})
 	if s.hub != nil {
 		s.hub.broadcast("refresh")
 	}
@@ -473,6 +478,12 @@ func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, age
 		}
 		return
 	}
+	if agent == "" {
+		statuses, err := s.store.ListAgentStatuses()
+		if err == nil && s.writeLandingAggregated(w, since, statuses) {
+			return
+		}
+	}
 	s.enqueueDashboardCacheBuild(key)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Retry-After", "2")
@@ -480,6 +491,32 @@ func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, age
 	if _, err := w.Write([]byte("[]")); err != nil {
 		log.Printf("write dashboard pending response: %v", err)
 	}
+}
+
+func (s *server) writeLandingAggregated(w http.ResponseWriter, since time.Time, statuses []model.AgentStatus) bool {
+	first := true
+	writeLine := func(line []byte) error {
+		if !first {
+			if _, err := w.Write([]byte(",")); err != nil {
+				return err
+			}
+		}
+		first = false
+		_, err := w.Write(line)
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte("["))
+	anyAgent := false
+	for _, st := range statuses {
+		key := dashboardCacheKey{Agent: st.Agent}
+		if err := s.dashCache.writeFullAgent(w, key, since, writeLine); err != nil {
+			continue
+		}
+		anyAgent = true
+	}
+	w.Write([]byte("]"))
+	return anyAgent
 }
 
 func (s *server) enqueueDashboardCacheBuild(key dashboardCacheKey) {
