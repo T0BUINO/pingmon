@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -24,7 +23,18 @@ const (
 	dashboardCacheBuildYieldEvery = 1000
 	dashboardCacheBuildRowsPerSec = 25000
 	dashboardMaxCacheRange        = 365 * 24 * time.Hour
+	dashboardCacheDayBucket       = 24 * time.Hour
 )
+
+func bucketDayPath(t time.Time) string {
+	utc := t.UTC().Truncate(dashboardCacheDayBucket)
+	y, m, d := utc.Date()
+	return fmt.Sprintf("%04d/%02d/%02d", y, m, d)
+}
+
+func bucketDay(t time.Time) string {
+	return t.UTC().Truncate(dashboardCacheDayBucket).Format("2006-01-02")
+}
 
 type dashboardCacheKey struct {
 	Agent string `json:"agent,omitempty"`
@@ -100,7 +110,8 @@ func (c *dashboardResultCache) unmarkPending(key dashboardCacheKey) {
 }
 
 func (c *dashboardResultCache) build(key dashboardCacheKey, since time.Time, generation int64, buildResults func(func(model.Result) error) error) (dashboardCacheMeta, error) {
-	if err := os.MkdirAll(c.dir, 0755); err != nil {
+	bucketDir := c.bucketDir(key)
+	if err := os.MkdirAll(bucketDir, 0755); err != nil {
 		return dashboardCacheMeta{}, err
 	}
 	builtAt := time.Now().UTC()
@@ -110,79 +121,107 @@ func (c *dashboardResultCache) build(key dashboardCacheKey, since time.Time, gen
 		BuiltAt: builtAt,
 		Version: dashboardCacheVersion,
 	}
-	dataPath := c.dataPath(key)
-	tmpDataPath := dataPath + fmt.Sprintf(".%d.tmp", time.Now().UnixNano())
-	file, err := os.Create(tmpDataPath)
-	if err != nil {
-		return dashboardCacheMeta{}, err
+
+	type dayWriter struct {
+		file  *os.File
+		buf   *bufio.Writer
+		tmp   string
+		final string
+		day   string
 	}
-	writer := bufio.NewWriter(file)
+	var current *dayWriter
 	written := 0
 	buildStarted := time.Now()
-	if _, err := writer.WriteString("[\n"); err != nil {
-		file.Close()
-		os.Remove(tmpDataPath)
-		return dashboardCacheMeta{}, err
+
+	closeWriter := func(dw *dayWriter) error {
+		if dw == nil {
+			return nil
+		}
+		if err := dw.buf.Flush(); err != nil {
+			dw.file.Close()
+			os.Remove(dw.tmp)
+			return err
+		}
+		if err := dw.file.Close(); err != nil {
+			os.Remove(dw.tmp)
+			return err
+		}
+		if err := os.Rename(dw.tmp, dw.final); err != nil {
+			os.Remove(dw.tmp)
+			return err
+		}
+		return nil
 	}
+
+	cleanup := func() {
+		if current != nil {
+			current.file.Close()
+			os.Remove(current.tmp)
+		}
+	}
+
 	if err := buildResults(func(result model.Result) error {
+		day := bucketDay(result.CheckedAt)
+		if current == nil || current.day != day {
+			if err := closeWriter(current); err != nil {
+				return err
+			}
+			current = nil
+			dw := &dayWriter{day: day, final: c.bucketPath(key, result.CheckedAt)}
+			dw.tmp = dw.final + fmt.Sprintf(".%d.tmp", time.Now().UnixNano())
+			if err := os.MkdirAll(filepath.Dir(dw.tmp), 0755); err != nil {
+				return err
+			}
+			var err error
+			dw.file, err = os.Create(dw.tmp)
+			if err != nil {
+				return err
+			}
+			dw.buf = bufio.NewWriter(dw.file)
+			current = dw
+		}
 		line, err := marshalDashboardResult(result)
 		if err != nil {
 			return err
 		}
-		if _, err := writer.Write(line); err != nil {
+		if _, err := current.buf.Write(line); err != nil {
 			return err
 		}
-		if _, err := writer.WriteString("\n"); err != nil {
+		if err := current.buf.WriteByte('\n'); err != nil {
 			return err
 		}
 		written++
 		if written%dashboardCacheBuildYieldEvery == 0 {
-			if err := writer.Flush(); err != nil {
+			if err := current.buf.Flush(); err != nil {
 				return err
 			}
 			throttleDashboardCacheBuild(buildStarted, written)
 		}
 		return nil
 	}); err != nil {
-		file.Close()
-		os.Remove(tmpDataPath)
+		cleanup()
 		return dashboardCacheMeta{}, err
 	}
-	if _, err := writer.WriteString("]\n"); err != nil {
-		file.Close()
-		os.Remove(tmpDataPath)
+	if err := closeWriter(current); err != nil {
+		cleanup()
 		return dashboardCacheMeta{}, err
 	}
-	if err := writer.Flush(); err != nil {
-		file.Close()
-		os.Remove(tmpDataPath)
-		return dashboardCacheMeta{}, err
-	}
-	if err := file.Close(); err != nil {
-		os.Remove(tmpDataPath)
-		return dashboardCacheMeta{}, err
-	}
+
 	metaData, err := json.Marshal(meta)
 	if err != nil {
-		os.Remove(tmpDataPath)
+		cleanup()
 		return dashboardCacheMeta{}, err
 	}
 	tmpMetaPath := c.metaPath(key) + fmt.Sprintf(".%d.tmp", time.Now().UnixNano())
 	if err := os.WriteFile(tmpMetaPath, metaData, 0644); err != nil {
-		os.Remove(tmpDataPath)
+		cleanup()
 		return dashboardCacheMeta{}, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if generation != c.generation {
-		os.Remove(tmpDataPath)
 		os.Remove(tmpMetaPath)
 		return meta, nil
-	}
-	if err := os.Rename(tmpDataPath, dataPath); err != nil {
-		os.Remove(tmpDataPath)
-		os.Remove(tmpMetaPath)
-		return dashboardCacheMeta{}, err
 	}
 	if err := os.Rename(tmpMetaPath, c.metaPath(key)); err != nil {
 		os.Remove(tmpMetaPath)
@@ -225,19 +264,36 @@ func (c *dashboardResultCache) writeIfReady(w http.ResponseWriter, key dashboard
 	if err := c.writeDeltas(meta, writeLine); err != nil {
 		return false, err
 	}
-	if err := c.writeBaseFiltered(key, since, first, writeLine); err != nil {
+	if err := c.writeBaseFiltered(key, since, writeLine); err != nil {
 		return false, err
 	}
 	_, err = w.Write([]byte("]"))
 	return stale, err
 }
 
-func (c *dashboardResultCache) writeBaseFiltered(key dashboardCacheKey, since time.Time, first bool, writeLine func([]byte) error) error {
-	file, err := os.Open(c.dataPath(key))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+func (c *dashboardResultCache) writeBaseFiltered(key dashboardCacheKey, since time.Time, writeLine func([]byte) error) error {
+	now := time.Now().UTC()
+	cursor := now.Truncate(dashboardCacheDayBucket)
+	stop := since.Truncate(dashboardCacheDayBucket)
+	for !cursor.Before(stop) {
+		if err := c.streamDayBucket(key, cursor, writeLine); err != nil {
+			if os.IsNotExist(err) {
+				cursor = cursor.Add(-dashboardCacheDayBucket)
+				continue
+			}
+			return err
 		}
+		// For the bucket containing 'since', rows are sorted DESC so we
+		// stop streaming as soon as we pass the cutoff. streamDayBucket
+		// already skips rows older than 'since' internally.
+		cursor = cursor.Add(-dashboardCacheDayBucket)
+	}
+	return nil
+}
+
+func (c *dashboardResultCache) streamDayBucket(key dashboardCacheKey, day time.Time, writeLine func([]byte) error) error {
+	file, err := os.Open(c.bucketPath(key, day))
+	if err != nil {
 		return err
 	}
 	defer file.Close()
@@ -247,44 +303,14 @@ func (c *dashboardResultCache) writeBaseFiltered(key dashboardCacheKey, since ti
 	scanner.Buffer(buf, 16*1024*1024)
 	for scanner.Scan() {
 		line := bytesTrimSpace(scanner.Bytes())
-		if len(line) == 0 || bytesIsArrayBracket(line) {
+		if len(line) == 0 {
 			continue
-		}
-		ts, err := compactRowTimestamp(line)
-		if err != nil {
-			continue
-		}
-		if ts.Before(since) {
-			break
 		}
 		if err := writeLine(line); err != nil {
 			return err
 		}
 	}
 	return scanner.Err()
-}
-
-func bytesIsArrayBracket(b []byte) bool {
-	return len(b) == 1 && (b[0] == '[' || b[0] == ']')
-}
-
-func compactRowTimestamp(row []byte) (time.Time, error) {
-	var fields []json.RawMessage
-	if err := json.Unmarshal(row, &fields); err != nil {
-		return time.Time{}, err
-	}
-	if len(fields) < 7 {
-		return time.Time{}, fmt.Errorf("compact row has %d fields, want at least 7", len(fields))
-	}
-	var tsStr string
-	if err := json.Unmarshal(fields[6], &tsStr); err != nil {
-		return time.Time{}, err
-	}
-	nanos, err := strconv.ParseInt(tsStr, 36, 64)
-	if err != nil {
-		return time.Time{}, err
-	}
-	return time.Unix(0, nanos).UTC(), nil
 }
 
 func (c *dashboardResultCache) appendDelta(results []model.Result) {
@@ -366,34 +392,33 @@ func (c *dashboardResultCache) clearIncompatible() {
 	}
 	compatibleMetaCount := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
+		if !entry.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(c.dir, entry.Name()))
+		metaPath := filepath.Join(c.dir, entry.Name(), "cache.meta.json")
+		data, err := os.ReadFile(metaPath)
 		if err != nil {
 			continue
 		}
 		var meta dashboardCacheMeta
 		if err := json.Unmarshal(data, &meta); err != nil || meta.Version != dashboardCacheVersion {
-			c.pending = make(map[dashboardCacheKey]struct{})
-			c.deltas = nil
-			c.deltasRead = false
-			c.generation++
-			if err := os.RemoveAll(c.dir); err != nil {
-				log.Printf("dashboard cache clear incompatible: %v", err)
-			}
+			c.clearLocked()
 			return
 		}
 		compatibleMetaCount++
 	}
 	if len(entries) > 0 && compatibleMetaCount == 0 {
-		c.pending = make(map[dashboardCacheKey]struct{})
-		c.deltas = nil
-		c.deltasRead = false
-		c.generation++
-		if err := os.RemoveAll(c.dir); err != nil {
-			log.Printf("dashboard cache clear partial: %v", err)
-		}
+		c.clearLocked()
+	}
+}
+
+func (c *dashboardResultCache) clearLocked() {
+	c.pending = make(map[dashboardCacheKey]struct{})
+	c.deltas = nil
+	c.deltasRead = false
+	c.generation++
+	if err := os.RemoveAll(c.dir); err != nil {
+		log.Printf("dashboard cache clear: %v", err)
 	}
 }
 
@@ -530,10 +555,11 @@ func (c *dashboardResultCache) oldestCacheBuildTimeLocked() (time.Time, bool) {
 	}
 	var oldest time.Time
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
+		if !entry.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(c.dir, entry.Name()))
+		metaPath := filepath.Join(c.dir, entry.Name(), "cache.meta.json")
+		data, err := os.ReadFile(metaPath)
 		if err != nil {
 			continue
 		}
@@ -569,18 +595,19 @@ func (c *dashboardResultCache) readMeta(key dashboardCacheKey) (dashboardCacheMe
 	if meta.Version != dashboardCacheVersion {
 		return dashboardCacheMeta{}, fmt.Errorf("dashboard cache version mismatch")
 	}
-	if _, err := os.Stat(c.dataPath(key)); err != nil {
-		return dashboardCacheMeta{}, err
-	}
 	return meta, nil
 }
 
-func (c *dashboardResultCache) dataPath(key dashboardCacheKey) string {
-	return filepath.Join(c.dir, c.keyHash(key)+".jsonl")
+func (c *dashboardResultCache) bucketDir(key dashboardCacheKey) string {
+	return filepath.Join(c.dir, c.keyHash(key))
+}
+
+func (c *dashboardResultCache) bucketPath(key dashboardCacheKey, day time.Time) string {
+	return filepath.Join(c.bucketDir(key), bucketDayPath(day)+".jsonl")
 }
 
 func (c *dashboardResultCache) metaPath(key dashboardCacheKey) string {
-	return filepath.Join(c.dir, c.keyHash(key)+".meta.json")
+	return filepath.Join(c.bucketDir(key), "cache.meta.json")
 }
 
 func (c *dashboardResultCache) deltaPath() string {

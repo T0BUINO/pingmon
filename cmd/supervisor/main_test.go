@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -414,7 +415,16 @@ func TestDashboardResultCacheClearsIncompatibleVersion(t *testing.T) {
 
 func TestDashboardResultCacheClearsPartialCacheWithoutMeta(t *testing.T) {
 	cache := &dashboardResultCache{dir: t.TempDir()}
-	if err := os.WriteFile(cache.dataPath(dashboardCacheKey{}), []byte("[]"), 0644); err != nil {
+	key := dashboardCacheKey{}
+	bucketDir := cache.bucketDir(key)
+	if err := os.MkdirAll(bucketDir, 0755); err != nil {
+		t.Fatalf("mkdir bucket dir: %v", err)
+	}
+	bucketPath := cache.bucketPath(key, time.Now())
+	if err := os.MkdirAll(filepath.Dir(bucketPath), 0755); err != nil {
+		t.Fatalf("mkdir bucket parent: %v", err)
+	}
+	if err := os.WriteFile(bucketPath, []byte("[]"), 0644); err != nil {
 		t.Fatalf("write partial cache: %v", err)
 	}
 
