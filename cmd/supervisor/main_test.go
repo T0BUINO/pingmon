@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -118,23 +120,29 @@ func TestDashboardResultCacheServesExactBaseAndDeltaPoints(t *testing.T) {
 	base := []model.Result{
 		{
 			Agent:            "agent-1",
+			AgentIP:          "203.0.113.1",
 			TargetName:       "web",
 			Address:          "198.51.100.10",
 			Port:             443,
-			CheckedAt:        since.Add(time.Hour),
+			Labels:           []string{"prod", "edge"},
+			CheckedAt:        since.Add(time.Hour + 123456789*time.Nanosecond),
 			SuccessCount:     1,
 			AverageLatencyMS: 10,
 			SuccessRate:      1,
 		},
 		{
 			Agent:            "agent-1",
+			AgentIP:          "203.0.113.1",
 			TargetName:       "web",
 			Address:          "198.51.100.10",
 			Port:             443,
+			Labels:           []string{"prod", "edge"},
 			CheckedAt:        since.Add(2 * time.Hour),
 			SuccessCount:     1,
+			FailureCount:     1,
 			AverageLatencyMS: 11,
-			SuccessRate:      1,
+			SuccessRate:      0.5,
+			Error:            "timeout",
 		},
 	}
 	rr := httptest.NewRecorder()
@@ -151,20 +159,22 @@ func TestDashboardResultCacheServesExactBaseAndDeltaPoints(t *testing.T) {
 	if _, err := cache.writeIfReady(rr, key); err != nil {
 		t.Fatalf("cache write: %v", err)
 	}
-	var got []model.Result
-	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode base cache response: %v", err)
-	}
+	got := decodeDashboardResultsForTest(t, rr.Body.Bytes())
 	if len(got) != len(base) {
 		t.Fatalf("base cache returned %d points, want %d", len(got), len(base))
+	}
+	for i := range base {
+		assertResultEqual(t, got[i], base[i])
 	}
 
 	time.Sleep(time.Millisecond)
 	delta := model.Result{
 		Agent:            "agent-1",
+		AgentIP:          "203.0.113.1",
 		TargetName:       "web",
 		Address:          "198.51.100.10",
 		Port:             443,
+		Labels:           []string{"prod", "edge"},
 		CheckedAt:        since.Add(3 * time.Hour),
 		SuccessCount:     1,
 		AverageLatencyMS: 12,
@@ -175,12 +185,11 @@ func TestDashboardResultCacheServesExactBaseAndDeltaPoints(t *testing.T) {
 	if _, err := cache.writeIfReady(rr, key); err != nil {
 		t.Fatalf("cache write with delta: %v", err)
 	}
-	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode delta cache response: %v", err)
-	}
+	got = decodeDashboardResultsForTest(t, rr.Body.Bytes())
 	if len(got) != len(base)+1 {
 		t.Fatalf("delta cache returned %d points, want %d", len(got), len(base)+1)
 	}
+	assertResultEqual(t, got[0], delta)
 	if got[0].AverageLatencyMS != delta.AverageLatencyMS {
 		t.Fatalf("first point latency = %v, want delta %v", got[0].AverageLatencyMS, delta.AverageLatencyMS)
 	}
@@ -201,11 +210,12 @@ func TestDashboardResultCacheServesExactBaseAndDeltaPoints(t *testing.T) {
 	if _, err := cache.writeIfReady(rr, key); err != nil {
 		t.Fatalf("cache write after compact: %v", err)
 	}
-	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode compacted cache response: %v", err)
-	}
+	got = decodeDashboardResultsForTest(t, rr.Body.Bytes())
 	if len(got) != len(rebuilt) {
 		t.Fatalf("compacted cache returned %d points, want %d", len(got), len(rebuilt))
+	}
+	for i := range rebuilt {
+		assertResultEqual(t, got[i], rebuilt[i])
 	}
 }
 
@@ -234,13 +244,59 @@ func TestDashboardResultCachePersistsAcrossInstances(t *testing.T) {
 	if _, err := second.writeIfReady(rr, key); err != nil {
 		t.Fatalf("cache write after restart: %v", err)
 	}
-	var got []model.Result
-	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode persisted cache response: %v", err)
-	}
+	got := decodeDashboardResultsForTest(t, rr.Body.Bytes())
 	if len(got) != 1 || !got[0].CheckedAt.Equal(result.CheckedAt) {
 		t.Fatalf("persisted cache = %+v, want one original result", got)
 	}
+}
+
+func TestDashboardResultCacheLoadsPersistedDeltaRows(t *testing.T) {
+	dir := t.TempDir()
+	key := dashboardCacheKey{SelectedRange: "7d", Agent: "agent-1"}
+	base := model.Result{
+		Agent:            "agent-1",
+		TargetName:       "web",
+		Address:          "198.51.100.10",
+		Port:             443,
+		CheckedAt:        time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC),
+		SuccessCount:     1,
+		AverageLatencyMS: 10,
+		SuccessRate:      1,
+	}
+	delta := model.Result{
+		Agent:            "agent-1",
+		AgentIP:          "203.0.113.1",
+		TargetName:       "web",
+		Address:          "198.51.100.10",
+		Port:             443,
+		Labels:           []string{"prod"},
+		CheckedAt:        base.CheckedAt.Add(time.Hour + 987654321*time.Nanosecond),
+		SuccessCount:     1,
+		FailureCount:     1,
+		AverageLatencyMS: 12,
+		SuccessRate:      0.5,
+		Error:            "timeout",
+	}
+	first := &dashboardResultCache{dir: dir}
+	if err := first.refresh(key, base.CheckedAt.Add(-time.Hour), func(fn func(model.Result) error) error {
+		return fn(base)
+	}); err != nil {
+		t.Fatalf("cache refresh: %v", err)
+	}
+	time.Sleep(time.Millisecond)
+	first.appendDelta([]model.Result{delta})
+
+	second := &dashboardResultCache{dir: dir}
+	rr := httptest.NewRecorder()
+	if _, err := second.writeIfReady(rr, key); err != nil {
+		t.Fatalf("cache write after restart: %v", err)
+	}
+	got := decodeDashboardResultsForTest(t, rr.Body.Bytes())
+	if len(got) != 2 {
+		t.Fatalf("persisted delta response returned %d points, want 2", len(got))
+	}
+	assertResultEqual(t, got[0], delta)
+	assertResultEqual(t, got[1], base)
 }
 
 func TestDashboardResultCacheServesStaleBaseForBackgroundRefresh(t *testing.T) {
@@ -264,7 +320,7 @@ func TestDashboardResultCacheServesStaleBaseForBackgroundRefresh(t *testing.T) {
 	meta := dashboardCacheMeta{
 		Key:     key,
 		Since:   result.CheckedAt.Add(-time.Hour),
-		BuiltAt: time.Now().UTC().Add(-dashboardCacheFreshness - time.Second),
+		BuiltAt: time.Now().UTC().Add(-dashboardCacheRefreshAfter - time.Second),
 		Version: dashboardCacheVersion,
 	}
 	metaData, err := json.Marshal(meta)
@@ -313,6 +369,58 @@ func TestHandleDashboardResultsMissQueuesBuildWithoutQueryingStore(t *testing.T)
 	}
 }
 
+func TestDashboardResultCacheClearsIncompatibleVersion(t *testing.T) {
+	cache := &dashboardResultCache{dir: t.TempDir()}
+	key := dashboardCacheKey{SelectedRange: "7d"}
+	result := model.Result{
+		Agent:            "agent-1",
+		TargetName:       "web",
+		Address:          "198.51.100.10",
+		Port:             443,
+		CheckedAt:        time.Now().UTC(),
+		SuccessCount:     1,
+		AverageLatencyMS: 10,
+		SuccessRate:      1,
+	}
+	if err := cache.refresh(key, result.CheckedAt.Add(-time.Hour), func(fn func(model.Result) error) error {
+		return fn(result)
+	}); err != nil {
+		t.Fatalf("cache refresh: %v", err)
+	}
+	meta := dashboardCacheMeta{
+		Key:     key,
+		Since:   result.CheckedAt.Add(-time.Hour),
+		BuiltAt: time.Now().UTC(),
+		Version: dashboardCacheVersion - 1,
+	}
+	metaData, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal meta: %v", err)
+	}
+	if err := os.WriteFile(cache.metaPath(key), metaData, 0644); err != nil {
+		t.Fatalf("write incompatible meta: %v", err)
+	}
+
+	cache.clearIncompatible()
+
+	if _, err := os.Stat(cache.dir); !os.IsNotExist(err) {
+		t.Fatalf("cache dir still exists after incompatible clear: %v", err)
+	}
+}
+
+func TestDashboardResultCacheClearsPartialCacheWithoutMeta(t *testing.T) {
+	cache := &dashboardResultCache{dir: t.TempDir()}
+	if err := os.WriteFile(cache.dataPath(dashboardCacheKey{SelectedRange: "7d"}), []byte("[]"), 0644); err != nil {
+		t.Fatalf("write partial cache: %v", err)
+	}
+
+	cache.clearIncompatible()
+
+	if _, err := os.Stat(cache.dir); !os.IsNotExist(err) {
+		t.Fatalf("cache dir still exists after partial clear: %v", err)
+	}
+}
+
 func TestHandleDashboardResultsServesStaleCacheAndQueuesRefresh(t *testing.T) {
 	dir := t.TempDir()
 	key := dashboardCacheKey{SelectedRange: "7d", Agent: "agent-1"}
@@ -335,7 +443,7 @@ func TestHandleDashboardResultsServesStaleCacheAndQueuesRefresh(t *testing.T) {
 	meta := dashboardCacheMeta{
 		Key:     key,
 		Since:   result.CheckedAt.Add(-time.Hour),
-		BuiltAt: time.Now().UTC().Add(-dashboardCacheFreshness - time.Second),
+		BuiltAt: time.Now().UTC().Add(-dashboardCacheRefreshAfter - time.Second),
 		Version: dashboardCacheVersion,
 	}
 	metaData, err := json.Marshal(meta)
@@ -360,10 +468,7 @@ func TestHandleDashboardResultsServesStaleCacheAndQueuesRefresh(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
 	}
-	var got []model.Result
-	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode stale cache response: %v", err)
-	}
+	got := decodeDashboardResultsForTest(t, rr.Body.Bytes())
 	if len(got) != 1 || got[0].Agent != result.Agent {
 		t.Fatalf("stale cache response = %+v", got)
 	}
@@ -378,6 +483,83 @@ func TestHandleDashboardResultsServesStaleCacheAndQueuesRefresh(t *testing.T) {
 	default:
 		t.Fatal("stale cache refresh was not queued")
 	}
+}
+
+func decodeDashboardResultsForTest(t *testing.T, data []byte) []model.Result {
+	t.Helper()
+	var rows [][]json.RawMessage
+	if err := json.Unmarshal(data, &rows); err != nil {
+		t.Fatalf("decode dashboard cache response: %v", err)
+	}
+	results := make([]model.Result, 0, len(rows))
+	for i, row := range rows {
+		if len(row) != 12 {
+			t.Fatalf("row %d has %d columns, want 12", i, len(row))
+		}
+		var result model.Result
+		var checkedAt string
+		unmarshalColumn := func(column int, dst any) {
+			t.Helper()
+			if err := json.Unmarshal(row[column], dst); err != nil {
+				t.Fatalf("decode row %d column %d: %v", i, column, err)
+			}
+		}
+		unmarshalColumn(0, &result.Agent)
+		unmarshalColumn(1, &result.AgentIP)
+		unmarshalColumn(2, &result.TargetName)
+		unmarshalColumn(3, &result.Address)
+		unmarshalColumn(4, &result.Port)
+		unmarshalColumn(5, &result.Labels)
+		unmarshalColumn(6, &checkedAt)
+		parsedAt, err := parseDashboardTimeForTest(checkedAt)
+		if err != nil {
+			t.Fatalf("parse row %d checked_at: %v", i, err)
+		}
+		result.CheckedAt = parsedAt
+		unmarshalColumn(7, &result.SuccessCount)
+		unmarshalColumn(8, &result.FailureCount)
+		unmarshalColumn(9, &result.AverageLatencyMS)
+		unmarshalColumn(10, &result.SuccessRate)
+		unmarshalColumn(11, &result.Error)
+		results = append(results, result)
+	}
+	return results
+}
+
+func parseDashboardTimeForTest(value string) (time.Time, error) {
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed, nil
+	}
+	nanos, err := strconv.ParseInt(value, 36, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(0, nanos).UTC(), nil
+}
+
+func assertResultEqual(t *testing.T, got, want model.Result) {
+	t.Helper()
+	if got.Agent != want.Agent ||
+		got.AgentIP != want.AgentIP ||
+		got.TargetName != want.TargetName ||
+		got.Address != want.Address ||
+		got.Port != want.Port ||
+		!equalLabels(got.Labels, want.Labels) ||
+		!got.CheckedAt.Equal(want.CheckedAt) ||
+		got.SuccessCount != want.SuccessCount ||
+		got.FailureCount != want.FailureCount ||
+		got.AverageLatencyMS != want.AverageLatencyMS ||
+		got.SuccessRate != want.SuccessRate ||
+		got.Error != want.Error {
+		t.Fatalf("result = %+v, want %+v", got, want)
+	}
+}
+
+func equalLabels(got, want []string) bool {
+	if len(got) == 0 && len(want) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(got, want)
 }
 
 func TestHandleTasksSavesAgentHeartbeat(t *testing.T) {

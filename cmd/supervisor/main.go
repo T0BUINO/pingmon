@@ -102,6 +102,7 @@ func main() {
 		dashCache:    newDashboardResultCache(cfg.SQLitePath),
 		dashJobs:     make(chan dashboardCacheKey, 64),
 	}
+	s.dashCache.clearIncompatible()
 	go s.startRetentionCleaner()
 	go s.runDashboardCacheBuilder()
 
@@ -1074,7 +1075,7 @@ const dashboardHTML = `<!doctype html>
         return currentRows;
       }
       if (!res.ok) throw new Error('结果数据加载失败，状态码：' + res.status);
-      return (await res.json()).reverse();
+      return normalizeResultRows(await res.json()).reverse();
     }
     async function loadAgents() {
       const res = await fetch('/api/agents');
@@ -1123,6 +1124,55 @@ const dashboardHTML = `<!doctype html>
         row.success_rate,
         row.error || ''
       ].join('|');
+    }
+    function normalizeResultRows(rows) {
+      if (!Array.isArray(rows)) return [];
+      return rows.map(normalizeResultRow).filter(Boolean);
+    }
+    function normalizeResultRow(row) {
+      if (!Array.isArray(row)) return row && typeof row === 'object' ? row : null;
+      return {
+        agent: row[0] || '',
+        agent_ip: row[1] || '',
+        target_name: row[2] || '',
+        address: row[3] || '',
+        port: row[4] || 0,
+        labels: Array.isArray(row[5]) ? row[5] : [],
+        checked_at: decodeCompactTime(row[6]),
+        success_count: row[7] || 0,
+        failure_count: row[8] || 0,
+        average_latency_ms: row[9] || 0,
+        success_rate: row[10] || 0,
+        error: row[11] || ''
+      };
+    }
+    function decodeCompactTime(value) {
+      if (typeof value !== 'string' || value.length < 10 || !/^[0-9a-z]+$/i.test(value)) return value || '';
+      const ns = parseBase36BigInt(value);
+      if (ns === null) return value;
+      const billion = 1000000000n;
+      const million = 1000000n;
+      const seconds = ns / billion;
+      const nanos = ns % billion;
+      const millis = seconds * 1000n + nanos / million;
+      const date = new Date(Number(millis));
+      if (Number.isNaN(date.getTime())) return value;
+      const whole = date.toISOString().replace(/\.\d{3}Z$/, '');
+      if (nanos === 0n) return whole + 'Z';
+      const fraction = nanos.toString().padStart(9, '0').replace(/0+$/, '');
+      return whole + '.' + fraction + 'Z';
+    }
+    function parseBase36BigInt(value) {
+      let total = 0n;
+      for (const char of value.toLowerCase()) {
+        const code = char.charCodeAt(0);
+        let digit;
+        if (code >= 48 && code <= 57) digit = code - 48;
+        else if (code >= 97 && code <= 122) digit = code - 87;
+        else return null;
+        total = total * 36n + BigInt(digit);
+      }
+      return total;
     }
     function rowsForCurrentView(rows) {
       const cutoff = Date.now() - parseRangeMillis(selectedRange);
@@ -2227,7 +2277,8 @@ const dashboardHTML = `<!doctype html>
       requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
     }
     async function applyLiveResults(rows) {
-      if (!Array.isArray(rows) || !rows.length) return;
+      rows = normalizeResultRows(rows);
+      if (!rows.length) return;
       currentRows = mergeRows(currentRows, rows);
       try {
         currentAgents = await loadAgents();

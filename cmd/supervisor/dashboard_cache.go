@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,9 +20,10 @@ import (
 )
 
 const (
-	dashboardCacheVersion         = 1
-	dashboardCacheFreshness       = 5 * time.Minute
-	dashboardCacheBuildYieldEvery = 100
+	dashboardCacheVersion         = 4
+	dashboardCacheRefreshAfter    = 6 * time.Hour
+	dashboardCacheBuildYieldEvery = 1000
+	dashboardCacheBuildRowsPerSec = 25000
 )
 
 type dashboardCacheKey struct {
@@ -36,8 +39,9 @@ type dashboardCacheMeta struct {
 }
 
 type dashboardDeltaEntry struct {
-	SavedAt time.Time    `json:"saved_at"`
-	Result  model.Result `json:"result"`
+	SavedAt time.Time       `json:"saved_at"`
+	Agent   string          `json:"agent"`
+	Row     json.RawMessage `json:"row"`
 }
 
 type dashboardResultCache struct {
@@ -45,6 +49,8 @@ type dashboardResultCache struct {
 	mu         sync.Mutex
 	generation int64
 	pending    map[dashboardCacheKey]struct{}
+	deltas     []dashboardDeltaEntry
+	deltasRead bool
 }
 
 func newDashboardResultCache(sqlitePath string) *dashboardResultCache {
@@ -114,13 +120,14 @@ func (c *dashboardResultCache) build(key dashboardCacheKey, since time.Time, gen
 	writer := bufio.NewWriter(file)
 	written := 0
 	first := true
+	buildStarted := time.Now()
 	if err := writer.WriteByte('['); err != nil {
 		file.Close()
 		os.Remove(tmpDataPath)
 		return dashboardCacheMeta{}, err
 	}
 	if err := buildResults(func(result model.Result) error {
-		line, err := json.Marshal(result)
+		line, err := marshalDashboardResult(result)
 		if err != nil {
 			return err
 		}
@@ -138,7 +145,7 @@ func (c *dashboardResultCache) build(key dashboardCacheKey, since time.Time, gen
 			if err := writer.Flush(); err != nil {
 				return err
 			}
-			time.Sleep(20 * time.Millisecond)
+			throttleDashboardCacheBuild(buildStarted, written)
 		}
 		return nil
 	}); err != nil {
@@ -202,7 +209,7 @@ func (c *dashboardResultCache) writeIfReady(w http.ResponseWriter, key dashboard
 	if err != nil {
 		return false, err
 	}
-	stale := time.Since(meta.BuiltAt) > dashboardCacheFreshness
+	stale := time.Since(meta.BuiltAt) > dashboardCacheRefreshAfter
 	w.Header().Set("Content-Type", "application/json")
 	if _, err := w.Write([]byte("[")); err != nil {
 		return false, err
@@ -246,6 +253,9 @@ func (c *dashboardResultCache) appendDelta(results []model.Result) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := c.loadDeltasLocked(); err != nil {
+		log.Printf("dashboard cache delta load: %v", err)
+	}
 	if err := os.MkdirAll(c.dir, 0755); err != nil {
 		log.Printf("dashboard cache delta mkdir: %v", err)
 		return
@@ -259,7 +269,13 @@ func (c *dashboardResultCache) appendDelta(results []model.Result) {
 	writer := bufio.NewWriter(file)
 	savedAt := time.Now().UTC()
 	for _, result := range results {
-		line, err := json.Marshal(dashboardDeltaEntry{SavedAt: savedAt, Result: result})
+		row, err := marshalDashboardResult(result)
+		if err != nil {
+			log.Printf("dashboard cache delta encode: %v", err)
+			return
+		}
+		entry := dashboardDeltaEntry{SavedAt: savedAt, Agent: result.Agent, Row: append([]byte(nil), row...)}
+		line, err := json.Marshal(entry)
 		if err != nil {
 			log.Printf("dashboard cache delta encode: %v", err)
 			return
@@ -272,6 +288,7 @@ func (c *dashboardResultCache) appendDelta(results []model.Result) {
 			log.Printf("dashboard cache delta write: %v", err)
 			return
 		}
+		c.deltas = append(c.deltas, entry)
 	}
 	if err := writer.Flush(); err != nil {
 		log.Printf("dashboard cache delta flush: %v", err)
@@ -284,10 +301,59 @@ func (c *dashboardResultCache) clear() {
 	}
 	c.mu.Lock()
 	c.pending = make(map[dashboardCacheKey]struct{})
+	c.deltas = nil
+	c.deltasRead = false
 	c.generation++
 	defer c.mu.Unlock()
 	if err := os.RemoveAll(c.dir); err != nil {
 		log.Printf("dashboard cache clear: %v", err)
+	}
+}
+
+func (c *dashboardResultCache) clearIncompatible() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entries, err := os.ReadDir(c.dir)
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil {
+		log.Printf("dashboard cache inspect: %v", err)
+		return
+	}
+	compatibleMetaCount := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(c.dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var meta dashboardCacheMeta
+		if err := json.Unmarshal(data, &meta); err != nil || meta.Version != dashboardCacheVersion {
+			c.pending = make(map[dashboardCacheKey]struct{})
+			c.deltas = nil
+			c.deltasRead = false
+			c.generation++
+			if err := os.RemoveAll(c.dir); err != nil {
+				log.Printf("dashboard cache clear incompatible: %v", err)
+			}
+			return
+		}
+		compatibleMetaCount++
+	}
+	if len(entries) > 0 && compatibleMetaCount == 0 {
+		c.pending = make(map[dashboardCacheKey]struct{})
+		c.deltas = nil
+		c.deltasRead = false
+		c.generation++
+		if err := os.RemoveAll(c.dir); err != nil {
+			log.Printf("dashboard cache clear partial: %v", err)
+		}
 	}
 }
 
@@ -319,6 +385,43 @@ func (c *dashboardResultCache) writeBaseArray(key dashboardCacheKey, w io.Writer
 }
 
 func (c *dashboardResultCache) writeDeltas(meta dashboardCacheMeta, writeLine func([]byte) error) error {
+	rows, err := c.deltaRows(meta)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if err := writeLine(row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *dashboardResultCache) deltaRows(meta dashboardCacheMeta) ([][]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.loadDeltasLocked(); err != nil {
+		return nil, err
+	}
+	rows := make([][]byte, 0)
+	for _, entry := range c.deltas {
+		if !entry.SavedAt.After(meta.BuiltAt) {
+			continue
+		}
+		if meta.Key.Agent != "" && entry.Agent != meta.Key.Agent {
+			continue
+		}
+		rows = append(rows, entry.Row)
+	}
+	return rows, nil
+}
+
+func (c *dashboardResultCache) loadDeltasLocked() error {
+	if c.deltasRead {
+		return nil
+	}
+	c.deltas = nil
+	c.deltasRead = true
 	file, err := os.Open(c.deltaPath())
 	if os.IsNotExist(err) {
 		return nil
@@ -335,19 +438,12 @@ func (c *dashboardResultCache) writeDeltas(meta dashboardCacheMeta, writeLine fu
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			continue
 		}
-		if !entry.SavedAt.After(meta.BuiltAt) {
+		if entry.SavedAt.IsZero() || entry.Agent == "" || len(entry.Row) == 0 {
 			continue
 		}
-		if meta.Key.Agent != "" && entry.Result.Agent != meta.Key.Agent {
-			continue
-		}
-		line, err := json.Marshal(entry.Result)
-		if err != nil {
-			return err
-		}
-		if err := writeLine(line); err != nil {
-			return err
-		}
+		// Row bytes are immutable after loading so request paths can share them without copying.
+		entry.Row = append([]byte(nil), entry.Row...)
+		c.deltas = append(c.deltas, entry)
 	}
 	return scanner.Err()
 }
@@ -357,15 +453,16 @@ func (c *dashboardResultCache) compactDeltasLocked() error {
 	if !ok {
 		return nil
 	}
-	deltaPath := c.deltaPath()
-	file, err := os.Open(deltaPath)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
+	if err := c.loadDeltasLocked(); err != nil {
 		return err
 	}
-	defer file.Close()
+	deltaPath := c.deltaPath()
+	if len(c.deltas) == 0 {
+		if err := os.Remove(deltaPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
 
 	tmpPath := deltaPath + fmt.Sprintf(".%d.tmp", time.Now().UnixNano())
 	tmp, err := os.Create(tmpPath)
@@ -373,17 +470,16 @@ func (c *dashboardResultCache) compactDeltasLocked() error {
 		return err
 	}
 	writer := bufio.NewWriter(tmp)
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 1024*1024)
-	scanner.Buffer(buf, 16*1024*1024)
-	for scanner.Scan() {
-		line := append([]byte(nil), scanner.Bytes()...)
-		var entry dashboardDeltaEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
-			continue
-		}
+	kept := c.deltas[:0]
+	for _, entry := range c.deltas {
 		if !entry.SavedAt.After(cutoff) {
 			continue
+		}
+		line, err := json.Marshal(entry)
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return err
 		}
 		if _, err := writer.Write(line); err != nil {
 			tmp.Close()
@@ -395,11 +491,7 @@ func (c *dashboardResultCache) compactDeltasLocked() error {
 			os.Remove(tmpPath)
 			return err
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
+		kept = append(kept, entry)
 	}
 	if err := writer.Flush(); err != nil {
 		tmp.Close()
@@ -414,6 +506,7 @@ func (c *dashboardResultCache) compactDeltasLocked() error {
 		os.Remove(tmpPath)
 		return err
 	}
+	c.deltas = kept
 	return nil
 }
 
@@ -484,6 +577,59 @@ func (c *dashboardResultCache) deltaPath() string {
 func (c *dashboardResultCache) keyHash(key dashboardCacheKey) string {
 	sum := sha1.Sum([]byte(key.SelectedRange + "\x00" + key.Agent))
 	return fmt.Sprintf("%x", sum)
+}
+
+func marshalDashboardResult(result model.Result) ([]byte, error) {
+	labels, err := json.Marshal(result.Labels)
+	if err != nil {
+		return nil, err
+	}
+	if string(labels) == "null" {
+		labels = []byte("[]")
+	}
+	data := make([]byte, 0, 256)
+	data = append(data, '[')
+	data = appendJSONString(data, result.Agent)
+	data = append(data, ',')
+	data = appendJSONString(data, result.AgentIP)
+	data = append(data, ',')
+	data = appendJSONString(data, result.TargetName)
+	data = append(data, ',')
+	data = appendJSONString(data, result.Address)
+	data = append(data, ',')
+	data = strconv.AppendInt(data, int64(result.Port), 10)
+	data = append(data, ',')
+	data = append(data, labels...)
+	data = append(data, ',')
+	data = appendJSONString(data, strconv.FormatInt(result.CheckedAt.UTC().UnixNano(), 36))
+	data = append(data, ',')
+	data = strconv.AppendInt(data, int64(result.SuccessCount), 10)
+	data = append(data, ',')
+	data = strconv.AppendInt(data, int64(result.FailureCount), 10)
+	data = append(data, ',')
+	data = strconv.AppendFloat(data, result.AverageLatencyMS, 'f', -1, 64)
+	data = append(data, ',')
+	data = strconv.AppendFloat(data, result.SuccessRate, 'f', -1, 64)
+	data = append(data, ',')
+	data = appendJSONString(data, result.Error)
+	data = append(data, ']')
+	return data, nil
+}
+
+func appendJSONString(data []byte, value string) []byte {
+	return strconv.AppendQuote(data, value)
+}
+
+func throttleDashboardCacheBuild(started time.Time, written int) {
+	targetElapsed := time.Duration(int64(written) * int64(time.Second) / dashboardCacheBuildRowsPerSec)
+	if sleep := targetElapsed - time.Since(started); sleep > 0 {
+		if sleep > 100*time.Millisecond {
+			sleep = 100 * time.Millisecond
+		}
+		time.Sleep(sleep)
+		return
+	}
+	runtime.Gosched()
 }
 
 func bytesTrimSpace(data []byte) []byte {
