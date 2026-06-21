@@ -189,6 +189,22 @@ func TestSQLiteCompactedResultsForAgent(t *testing.T) {
 	if !results[0].CheckedAt.Equal(newTime) || !results[1].CheckedAt.Equal(oldBucket) {
 		t.Fatalf("result times = %s, %s", results[0].CheckedAt, results[1].CheckedAt)
 	}
+
+	var streamed []model.Result
+	if err := store.StreamResultsSinceCompacted(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), rawCutoff, "agent-1", func(result model.Result) error {
+		streamed = append(streamed, result)
+		return nil
+	}); err != nil {
+		t.Fatalf("StreamResultsSinceCompacted: %v", err)
+	}
+	if len(streamed) != len(results) {
+		t.Fatalf("len(streamed) = %d, want %d", len(streamed), len(results))
+	}
+	for i := range streamed {
+		if !streamed[i].CheckedAt.Equal(results[i].CheckedAt) || streamed[i].Agent != results[i].Agent {
+			t.Fatalf("streamed[%d] = %+v, want %+v", i, streamed[i], results[i])
+		}
+	}
 }
 
 func TestSQLiteAgentHeartbeat(t *testing.T) {

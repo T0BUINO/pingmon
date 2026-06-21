@@ -24,6 +24,8 @@ type Store interface {
 	ResultsSinceForAgent(since time.Time, agent string) ([]model.Result, error)
 	ResultsSinceCompacted(since, rawCutoff time.Time) ([]model.Result, error)
 	ResultsSinceCompactedForAgent(since, rawCutoff time.Time, agent string) ([]model.Result, error)
+	StreamResultsSince(since time.Time, agent string, fn func(model.Result) error) error
+	StreamResultsSinceCompacted(since, rawCutoff time.Time, agent string, fn func(model.Result) error) error
 	RollupBefore(cutoff time.Time, interval time.Duration) (int, error)
 	DeleteBefore(cutoff time.Time) (int, error)
 	DeleteRollupsBefore(cutoff time.Time) (int, error)

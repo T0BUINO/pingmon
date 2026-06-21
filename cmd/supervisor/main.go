@@ -28,6 +28,8 @@ type server struct {
 	tpl          *template.Template
 	hub          *websocketHub
 	resultsCache *resultsCache
+	dashCache    *dashboardResultCache
+	dashJobs     chan dashboardCacheKey
 }
 
 type dashboardData struct {
@@ -91,8 +93,17 @@ func main() {
 		"mul":      func(a, b float64) float64 { return a * b },
 		"severity": resultSeverity,
 	}).Parse(dashboardHTML))
-	s := &server{cfg: cfg, store: store, tpl: tpl, hub: newWebsocketHub(), resultsCache: newResultsCache(resultsCacheTTL)}
+	s := &server{
+		cfg:          cfg,
+		store:        store,
+		tpl:          tpl,
+		hub:          newWebsocketHub(),
+		resultsCache: newResultsCache(resultsCacheTTL),
+		dashCache:    newDashboardResultCache(cfg.SQLitePath),
+		dashJobs:     make(chan dashboardCacheKey, 64),
+	}
 	go s.startRetentionCleaner()
+	go s.runDashboardCacheBuilder()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -187,6 +198,9 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[ALERT] target=%s address=%s:%d consecutive_failures=%d threshold=%d",
 				result.TargetName, result.Address, result.Port, failures, s.cfg.FailureThreshold)
 		}
+	}
+	if len(saved) > 0 {
+		s.dashCache.appendDelta(saved)
 	}
 	s.resultsCache.clear()
 	s.hub.broadcastJSON(websocketEvent{Type: "results", Results: saved})
@@ -284,18 +298,9 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	selectedRange := s.selectedRange(r)
 	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
-	results, err := s.resultsSince(time.Now().Add(-rangeDuration(selectedRange)), agent)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	templateResults := results
-	if agent != "" {
-		templateResults = problemResults(results, maxProblemLogRows)
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.tpl.Execute(w, dashboardData{
-		Results:             templateResults,
+		Results:             nil,
 		Agent:               agent,
 		Ranges:              s.cfg.DashboardRanges,
 		SelectedRange:       selectedRange,
@@ -313,6 +318,10 @@ func (s *server) handleResults(w http.ResponseWriter, r *http.Request) {
 	}
 	selectedRange := s.selectedRange(r)
 	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
+	if r.URL.Query().Get("dashboard") == "1" {
+		s.writeDashboardResults(w, selectedRange, agent)
+		return
+	}
 	cacheKey := resultsCacheKey{selectedRange: selectedRange, agent: agent}
 	if data, ok := s.resultsCache.get(cacheKey); ok {
 		writeJSONBytes(w, data)
@@ -377,6 +386,7 @@ func (s *server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.resultsCache.clear()
+	s.dashCache.clear()
 	if s.hub != nil {
 		s.hub.broadcast("refresh")
 	}
@@ -430,6 +440,61 @@ func (s *server) resultsSince(since time.Time, agent string) ([]model.Result, er
 		return s.store.ResultsSinceForAgent(since, agent)
 	}
 	return s.store.ResultsSince(since)
+}
+
+func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, agent string) {
+	key := dashboardCacheKey{SelectedRange: selectedRange, Agent: agent}
+	if stale, err := s.dashCache.writeIfReady(w, key); err == nil {
+		if stale {
+			s.enqueueDashboardCacheBuild(key)
+		}
+		return
+	}
+	s.enqueueDashboardCacheBuild(key)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", "2")
+	w.WriteHeader(http.StatusAccepted)
+	if _, err := w.Write([]byte("[]")); err != nil {
+		log.Printf("write dashboard pending response: %v", err)
+	}
+}
+
+func (s *server) enqueueDashboardCacheBuild(key dashboardCacheKey) {
+	if s.dashJobs == nil {
+		return
+	}
+	if !s.dashCache.markPending(key) {
+		return
+	}
+	select {
+	case s.dashJobs <- key:
+	default:
+		s.dashCache.unmarkPending(key)
+		log.Printf("dashboard cache build queue full range=%s agent=%q", key.SelectedRange, key.Agent)
+	}
+}
+
+func (s *server) runDashboardCacheBuilder() {
+	for key := range s.dashJobs {
+		func() {
+			defer s.dashCache.unmarkPending(key)
+			since := time.Now().Add(-rangeDuration(key.SelectedRange))
+			if err := s.dashCache.refresh(key, since, func(fn func(model.Result) error) error {
+				return s.streamResultsSince(since, key.Agent, fn)
+			}); err != nil {
+				log.Printf("dashboard cache build range=%s agent=%q: %v", key.SelectedRange, key.Agent, err)
+			}
+		}()
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func (s *server) streamResultsSince(since time.Time, agent string, fn func(model.Result) error) error {
+	rawCutoff := time.Now().AddDate(0, 0, -s.cfg.RawRetentionDays)
+	if since.Before(rawCutoff) {
+		return s.store.StreamResultsSinceCompacted(since, rawCutoff, agent, fn)
+	}
+	return s.store.StreamResultsSince(since, agent, fn)
 }
 
 func rangeDuration(raw string) time.Duration {
@@ -706,6 +771,7 @@ func (s *server) cleanOldData() {
 	}
 	if rolled > 0 || deletedRaw > 0 || deletedRollups > 0 {
 		s.resultsCache.clear()
+		s.dashCache.clear()
 		log.Printf("retention cleanup rolled=%d deleted_raw=%d deleted_rollups=%d", rolled, deletedRaw, deletedRollups)
 		if err := s.store.Vacuum(); err != nil {
 			log.Printf("retention vacuum failed: %v", err)
@@ -1002,7 +1068,11 @@ const dashboardHTML = `<!doctype html>
     });
     async function loadResults() {
       const agentParam = selectedAgent ? '&agent=' + encodeURIComponent(selectedAgent) : '';
-      const res = await fetch('/api/results?range=' + encodeURIComponent(selectedRange) + agentParam);
+      const res = await fetch('/api/results?dashboard=1&range=' + encodeURIComponent(selectedRange) + agentParam);
+      if (res.status === 202) {
+        window.setTimeout(() => refreshDashboard().catch(handleRefreshError), 2000);
+        return currentRows;
+      }
       if (!res.ok) throw new Error('结果数据加载失败，状态码：' + res.status);
       return (await res.json()).reverse();
     }
