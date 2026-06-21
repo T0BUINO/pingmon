@@ -2136,7 +2136,8 @@ const dashboardHTML = `<!doctype html>
         card.querySelector('.agent-name').textContent = agent;
         card.querySelector('.subtle').textContent = '节点 IP：' + agentIPText(statusInfo, summary) + ' · 最后在线：' + lastSeenText(statusInfo, summary);
         const status = card.querySelector('.status');
-        if (cacheState === 'building' || cacheState === 'none') {
+        const isCaching = (cacheState === 'building' || cacheState === 'none') && !agentRows.length;
+        if (isCaching) {
           status.textContent = '缓存中';
           status.className = 'status caching';
           card.dataset.caching = '1';
