@@ -300,6 +300,7 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	selectedRange := s.selectedRange(r)
 	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "private, max-age=10")
 	if err := s.tpl.Execute(w, dashboardData{
 		Results:             nil,
 		Agent:               agent,
@@ -444,8 +445,10 @@ func (s *server) resultsSince(since time.Time, agent string) ([]model.Result, er
 }
 
 func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, agent string) {
-	key := dashboardCacheKey{SelectedRange: selectedRange, Agent: agent}
-	if stale, err := s.dashCache.writeIfReady(w, key); err == nil {
+	key := dashboardCacheKey{Agent: agent}
+	since := time.Now().Add(-rangeDuration(selectedRange))
+	w.Header().Set("Cache-Control", "private, max-age=5")
+	if stale, err := s.dashCache.writeIfReady(w, key, since); err == nil {
 		if stale {
 			s.enqueueDashboardCacheBuild(key)
 		}
@@ -471,7 +474,7 @@ func (s *server) enqueueDashboardCacheBuild(key dashboardCacheKey) {
 	case s.dashJobs <- key:
 	default:
 		s.dashCache.unmarkPending(key)
-		log.Printf("dashboard cache build queue full range=%s agent=%q", key.SelectedRange, key.Agent)
+		log.Printf("dashboard cache build queue full agent=%q", key.Agent)
 	}
 }
 
@@ -479,11 +482,11 @@ func (s *server) runDashboardCacheBuilder() {
 	for key := range s.dashJobs {
 		func() {
 			defer s.dashCache.unmarkPending(key)
-			since := time.Now().Add(-rangeDuration(key.SelectedRange))
+			since := time.Now().Add(-dashboardMaxCacheRange)
 			if err := s.dashCache.refresh(key, since, func(fn func(model.Result) error) error {
 				return s.streamResultsSince(since, key.Agent, fn)
 			}); err != nil {
-				log.Printf("dashboard cache build range=%s agent=%q: %v", key.SelectedRange, key.Agent, err)
+				log.Printf("dashboard cache build agent=%q: %v", key.Agent, err)
 			}
 		}()
 		time.Sleep(250 * time.Millisecond)

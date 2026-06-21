@@ -116,7 +116,7 @@ func (s *fakeStore) ConsecutiveFailures(targetName, address string, port int) (i
 func TestDashboardResultCacheServesExactBaseAndDeltaPoints(t *testing.T) {
 	cache := &dashboardResultCache{dir: t.TempDir()}
 	since := time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC)
-	key := dashboardCacheKey{SelectedRange: "3d", Agent: "agent-1"}
+	key := dashboardCacheKey{Agent: "agent-1"}
 	base := []model.Result{
 		{
 			Agent:            "agent-1",
@@ -156,7 +156,7 @@ func TestDashboardResultCacheServesExactBaseAndDeltaPoints(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("cache refresh: %v", err)
 	}
-	if _, err := cache.writeIfReady(rr, key); err != nil {
+	if _, err := cache.writeIfReady(rr, key, since); err != nil {
 		t.Fatalf("cache write: %v", err)
 	}
 	got := decodeDashboardResultsForTest(t, rr.Body.Bytes())
@@ -182,7 +182,7 @@ func TestDashboardResultCacheServesExactBaseAndDeltaPoints(t *testing.T) {
 	}
 	cache.appendDelta([]model.Result{delta})
 	rr = httptest.NewRecorder()
-	if _, err := cache.writeIfReady(rr, key); err != nil {
+	if _, err := cache.writeIfReady(rr, key, since); err != nil {
 		t.Fatalf("cache write with delta: %v", err)
 	}
 	got = decodeDashboardResultsForTest(t, rr.Body.Bytes())
@@ -207,7 +207,7 @@ func TestDashboardResultCacheServesExactBaseAndDeltaPoints(t *testing.T) {
 		t.Fatalf("cache refresh with delta: %v", err)
 	}
 	rr = httptest.NewRecorder()
-	if _, err := cache.writeIfReady(rr, key); err != nil {
+	if _, err := cache.writeIfReady(rr, key, since); err != nil {
 		t.Fatalf("cache write after compact: %v", err)
 	}
 	got = decodeDashboardResultsForTest(t, rr.Body.Bytes())
@@ -221,7 +221,6 @@ func TestDashboardResultCacheServesExactBaseAndDeltaPoints(t *testing.T) {
 
 func TestDashboardResultCachePersistsAcrossInstances(t *testing.T) {
 	dir := t.TempDir()
-	key := dashboardCacheKey{SelectedRange: "7d"}
 	result := model.Result{
 		Agent:            "agent-1",
 		TargetName:       "web",
@@ -232,8 +231,10 @@ func TestDashboardResultCachePersistsAcrossInstances(t *testing.T) {
 		AverageLatencyMS: 10,
 		SuccessRate:      1,
 	}
+	key := dashboardCacheKey{Agent: result.Agent}
+	cacheSince := result.CheckedAt.Add(-time.Hour)
 	first := &dashboardResultCache{dir: dir}
-	if err := first.refresh(key, result.CheckedAt.Add(-time.Hour), func(fn func(model.Result) error) error {
+	if err := first.refresh(key, cacheSince, func(fn func(model.Result) error) error {
 		return fn(result)
 	}); err != nil {
 		t.Fatalf("cache refresh: %v", err)
@@ -241,7 +242,7 @@ func TestDashboardResultCachePersistsAcrossInstances(t *testing.T) {
 
 	second := &dashboardResultCache{dir: dir}
 	rr := httptest.NewRecorder()
-	if _, err := second.writeIfReady(rr, key); err != nil {
+	if _, err := second.writeIfReady(rr, key, cacheSince); err != nil {
 		t.Fatalf("cache write after restart: %v", err)
 	}
 	got := decodeDashboardResultsForTest(t, rr.Body.Bytes())
@@ -252,7 +253,7 @@ func TestDashboardResultCachePersistsAcrossInstances(t *testing.T) {
 
 func TestDashboardResultCacheLoadsPersistedDeltaRows(t *testing.T) {
 	dir := t.TempDir()
-	key := dashboardCacheKey{SelectedRange: "7d", Agent: "agent-1"}
+	key := dashboardCacheKey{Agent: "agent-1"}
 	base := model.Result{
 		Agent:            "agent-1",
 		TargetName:       "web",
@@ -263,6 +264,7 @@ func TestDashboardResultCacheLoadsPersistedDeltaRows(t *testing.T) {
 		AverageLatencyMS: 10,
 		SuccessRate:      1,
 	}
+	cacheSince := base.CheckedAt.Add(-time.Hour)
 	delta := model.Result{
 		Agent:            "agent-1",
 		AgentIP:          "203.0.113.1",
@@ -278,7 +280,7 @@ func TestDashboardResultCacheLoadsPersistedDeltaRows(t *testing.T) {
 		Error:            "timeout",
 	}
 	first := &dashboardResultCache{dir: dir}
-	if err := first.refresh(key, base.CheckedAt.Add(-time.Hour), func(fn func(model.Result) error) error {
+	if err := first.refresh(key, cacheSince, func(fn func(model.Result) error) error {
 		return fn(base)
 	}); err != nil {
 		t.Fatalf("cache refresh: %v", err)
@@ -288,7 +290,7 @@ func TestDashboardResultCacheLoadsPersistedDeltaRows(t *testing.T) {
 
 	second := &dashboardResultCache{dir: dir}
 	rr := httptest.NewRecorder()
-	if _, err := second.writeIfReady(rr, key); err != nil {
+	if _, err := second.writeIfReady(rr, key, cacheSince); err != nil {
 		t.Fatalf("cache write after restart: %v", err)
 	}
 	got := decodeDashboardResultsForTest(t, rr.Body.Bytes())
@@ -301,7 +303,6 @@ func TestDashboardResultCacheLoadsPersistedDeltaRows(t *testing.T) {
 
 func TestDashboardResultCacheServesStaleBaseForBackgroundRefresh(t *testing.T) {
 	cache := &dashboardResultCache{dir: t.TempDir()}
-	key := dashboardCacheKey{SelectedRange: "7d"}
 	result := model.Result{
 		Agent:            "agent-1",
 		TargetName:       "web",
@@ -312,14 +313,16 @@ func TestDashboardResultCacheServesStaleBaseForBackgroundRefresh(t *testing.T) {
 		AverageLatencyMS: 10,
 		SuccessRate:      1,
 	}
-	if err := cache.refresh(key, result.CheckedAt.Add(-time.Hour), func(fn func(model.Result) error) error {
+	key := dashboardCacheKey{Agent: result.Agent}
+	cacheSince := result.CheckedAt.Add(-time.Hour)
+	if err := cache.refresh(key, cacheSince, func(fn func(model.Result) error) error {
 		return fn(result)
 	}); err != nil {
 		t.Fatalf("cache refresh: %v", err)
 	}
 	meta := dashboardCacheMeta{
 		Key:     key,
-		Since:   result.CheckedAt.Add(-time.Hour),
+		Since:   cacheSince,
 		BuiltAt: time.Now().UTC().Add(-dashboardCacheRefreshAfter - time.Second),
 		Version: dashboardCacheVersion,
 	}
@@ -331,7 +334,7 @@ func TestDashboardResultCacheServesStaleBaseForBackgroundRefresh(t *testing.T) {
 		t.Fatalf("write stale meta: %v", err)
 	}
 
-	stale, err := cache.writeIfReady(httptest.NewRecorder(), key)
+	stale, err := cache.writeIfReady(httptest.NewRecorder(), key, cacheSince)
 	if err != nil {
 		t.Fatalf("stale cache write: %v", err)
 	}
@@ -361,7 +364,7 @@ func TestHandleDashboardResultsMissQueuesBuildWithoutQueryingStore(t *testing.T)
 	}
 	select {
 	case key := <-s.dashJobs:
-		if key.SelectedRange != "7d" || key.Agent != "agent-1" {
+		if key.Agent != "agent-1" {
 			t.Fatalf("queued key = %+v", key)
 		}
 	default:
@@ -371,7 +374,6 @@ func TestHandleDashboardResultsMissQueuesBuildWithoutQueryingStore(t *testing.T)
 
 func TestDashboardResultCacheClearsIncompatibleVersion(t *testing.T) {
 	cache := &dashboardResultCache{dir: t.TempDir()}
-	key := dashboardCacheKey{SelectedRange: "7d"}
 	result := model.Result{
 		Agent:            "agent-1",
 		TargetName:       "web",
@@ -382,14 +384,16 @@ func TestDashboardResultCacheClearsIncompatibleVersion(t *testing.T) {
 		AverageLatencyMS: 10,
 		SuccessRate:      1,
 	}
-	if err := cache.refresh(key, result.CheckedAt.Add(-time.Hour), func(fn func(model.Result) error) error {
+	key := dashboardCacheKey{Agent: result.Agent}
+	cacheSince := result.CheckedAt.Add(-time.Hour)
+	if err := cache.refresh(key, cacheSince, func(fn func(model.Result) error) error {
 		return fn(result)
 	}); err != nil {
 		t.Fatalf("cache refresh: %v", err)
 	}
 	meta := dashboardCacheMeta{
 		Key:     key,
-		Since:   result.CheckedAt.Add(-time.Hour),
+		Since:   cacheSince,
 		BuiltAt: time.Now().UTC(),
 		Version: dashboardCacheVersion - 1,
 	}
@@ -410,7 +414,7 @@ func TestDashboardResultCacheClearsIncompatibleVersion(t *testing.T) {
 
 func TestDashboardResultCacheClearsPartialCacheWithoutMeta(t *testing.T) {
 	cache := &dashboardResultCache{dir: t.TempDir()}
-	if err := os.WriteFile(cache.dataPath(dashboardCacheKey{SelectedRange: "7d"}), []byte("[]"), 0644); err != nil {
+	if err := os.WriteFile(cache.dataPath(dashboardCacheKey{}), []byte("[]"), 0644); err != nil {
 		t.Fatalf("write partial cache: %v", err)
 	}
 
@@ -423,7 +427,6 @@ func TestDashboardResultCacheClearsPartialCacheWithoutMeta(t *testing.T) {
 
 func TestHandleDashboardResultsServesStaleCacheAndQueuesRefresh(t *testing.T) {
 	dir := t.TempDir()
-	key := dashboardCacheKey{SelectedRange: "7d", Agent: "agent-1"}
 	result := model.Result{
 		Agent:            "agent-1",
 		TargetName:       "web",
@@ -434,15 +437,17 @@ func TestHandleDashboardResultsServesStaleCacheAndQueuesRefresh(t *testing.T) {
 		AverageLatencyMS: 10,
 		SuccessRate:      1,
 	}
+	key := dashboardCacheKey{Agent: result.Agent}
+	cacheSince := result.CheckedAt.Add(-time.Hour)
 	cache := &dashboardResultCache{dir: dir}
-	if err := cache.refresh(key, result.CheckedAt.Add(-time.Hour), func(fn func(model.Result) error) error {
+	if err := cache.refresh(key, cacheSince, func(fn func(model.Result) error) error {
 		return fn(result)
 	}); err != nil {
 		t.Fatalf("cache refresh: %v", err)
 	}
 	meta := dashboardCacheMeta{
 		Key:     key,
-		Since:   result.CheckedAt.Add(-time.Hour),
+		Since:   cacheSince,
 		BuiltAt: time.Now().UTC().Add(-dashboardCacheRefreshAfter - time.Second),
 		Version: dashboardCacheVersion,
 	}
