@@ -109,6 +109,47 @@ func (c *dashboardResultCache) unmarkPending(key dashboardCacheKey) {
 	c.mu.Unlock()
 }
 
+func (c *dashboardResultCache) cacheState(key dashboardCacheKey) string {
+	if c == nil {
+		return "none"
+	}
+	c.mu.Lock()
+	_, pending := c.pending[key]
+	c.mu.Unlock()
+	if pending {
+		return "building"
+	}
+	meta, err := c.readMeta(key)
+	if err != nil {
+		return "none"
+	}
+	if time.Since(meta.BuiltAt) > dashboardCacheRefreshAfter {
+		return "stale"
+	}
+	return "ready"
+}
+
+func (c *dashboardResultCache) ensureCache(key dashboardCacheKey, enqueue func()) string {
+	state := c.cacheState(key)
+	if state == "none" || state == "stale" {
+		enqueue()
+		if state == "none" && c.isPending(key) {
+			state = "building"
+		}
+		if state == "stale" {
+			return "stale"
+		}
+	}
+	return state
+}
+
+func (c *dashboardResultCache) isPending(key dashboardCacheKey) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.pending[key]
+	return ok
+}
+
 func (c *dashboardResultCache) build(key dashboardCacheKey, since time.Time, generation int64, buildResults func(func(model.Result) error) error) (dashboardCacheMeta, error) {
 	bucketDir := c.bucketDir(key)
 	if err := os.MkdirAll(bucketDir, 0755); err != nil {

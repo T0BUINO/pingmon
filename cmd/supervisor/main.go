@@ -58,6 +58,7 @@ type agentStatusView struct {
 	LastSeenAt          time.Time `json:"last_seen_at"`
 	OfflineAfterSeconds int       `json:"offline_after_seconds"`
 	Status              string    `json:"status"`
+	CacheStatus         string    `json:"cache_status"`
 }
 
 const maxProblemLogRows = 200
@@ -114,6 +115,7 @@ func main() {
 	mux.HandleFunc("/api/report", s.handleReport)
 	mux.HandleFunc("/api/agents", s.requireDashboardAuth(s.handleAgents))
 	mux.HandleFunc("/api/results", s.requireDashboardAuth(s.handleResults))
+	mux.HandleFunc("/api/cache-status", s.requireDashboardAuth(s.handleCacheStatus))
 	mux.HandleFunc("/ws", s.requireDashboardAuth(s.handleWebSocket))
 	mux.HandleFunc("/dashboard", s.handleDashboard)
 
@@ -365,6 +367,8 @@ func (s *server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		if now.Sub(status.LastSeenAt) > time.Duration(offlineAfter)*time.Second {
 			state = "offline"
 		}
+		key := dashboardCacheKey{Agent: status.Agent}
+		cacheState := s.dashCache.cacheState(key)
 		out = append(out, agentStatusView{
 			Agent:               status.Agent,
 			AgentIP:             status.AgentIP,
@@ -372,9 +376,24 @@ func (s *server) handleAgents(w http.ResponseWriter, r *http.Request) {
 			LastSeenAt:          status.LastSeenAt,
 			OfflineAfterSeconds: offlineAfter,
 			Status:              state,
+			CacheStatus:         cacheState,
 		})
+		if cacheState == "none" {
+			s.enqueueDashboardCacheBuild(key)
+		}
 	}
 	writeJSON(w, out)
+}
+
+func (s *server) handleCacheStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
+	key := dashboardCacheKey{Agent: agent}
+	state := s.dashCache.cacheState(key)
+	writeJSON(w, map[string]string{"agent": agent, "cache_status": state})
 }
 
 func (s *server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
@@ -883,7 +902,7 @@ const dashboardHTML = `<!doctype html>
     .page-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-left: auto; }
     .cards { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 14px; }
     .agent-card { display: block; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; min-height: 220px; content-visibility: auto; contain-intrinsic-size: 360px 220px; contain: layout paint; cursor: pointer; transition: border-color .15s, transform .15s, box-shadow .15s; }
-    .agent-card:hover { border-color: #94a3b8; transform: translateY(-1px); box-shadow: 0 10px 24px rgba(15, 23, 42, .08); }
+    .agent-card:hover { border-color: #94a3b8; box-shadow: 0 10px 24px rgba(15, 23, 42, .08); }
     .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
     .agent-name { font-weight: 700; font-size: 17px; overflow-wrap: anywhere; }
     .status { border: 1px solid transparent; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 700; white-space: nowrap; }
@@ -891,6 +910,8 @@ const dashboardHTML = `<!doctype html>
     .status.bad { border-color: #fca5a5; background: #fee2e2; color: #991b1b; }
     .status.offline { border-color: #cbd5e1; background: #e5e7eb; color: #374151; }
     .status.idle { border-color: #7dd3fc; background: #e0f2fe; color: #075985; }
+    .status.caching { border-color: #fcd34d; background: #fef9c3; color: #92400e; animation: pulse-cache 1.2s ease-in-out infinite; }
+    @keyframes pulse-cache { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
     .subtle .status { display: inline-flex; align-items: center; padding: 2px 8px; }
     .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0; }
     .metric { border: 1px solid #e5eaf1; border-radius: 6px; padding: 8px; background: #fbfcfe; min-width: 0; }
@@ -1074,11 +1095,37 @@ const dashboardHTML = `<!doctype html>
       const agentParam = selectedAgent ? '&agent=' + encodeURIComponent(selectedAgent) : '';
       const res = await fetch('/api/results?dashboard=1&range=' + encodeURIComponent(selectedRange) + agentParam);
       if (res.status === 202) {
-        window.setTimeout(() => refreshDashboard().catch(handleRefreshError), 2000);
-        return currentRows;
+        showCachingState();
+        await pollCacheReady(selectedAgent || '');
+        hideCachingState();
+        return loadResults();
       }
       if (!res.ok) throw new Error('结果数据加载失败，状态码：' + res.status);
       return normalizeResultRows(await res.json()).reverse();
+    }
+    async function pollCacheReady(agent) {
+      for (let i = 0; i < 150; i++) {
+        await sleep(2000);
+        try {
+          const r = await fetch('/api/cache-status?agent=' + encodeURIComponent(agent));
+          if (!r.ok) continue;
+          const s = await r.json();
+          if (s.cache_status === 'ready' || s.cache_status === 'stale') return;
+        } catch (e) { /* retry */ }
+      }
+    }
+    function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+    function showCachingState() {
+      if (selectedAgent) {
+        const subtitle = document.getElementById('pageSubtitle');
+        if (subtitle) subtitle.innerHTML = '<span class="status caching">缓存生成中&hellip;</span>';
+      }
+      const cards = document.getElementById('agentCards');
+      if (cards && !selectedAgent) cards.innerHTML = '<div class="panel"><span class="status caching">缓存生成中，请稍候&hellip;</span></div>';
+    }
+    function hideCachingState() {
+      const cards = document.getElementById('agentCards');
+      if (cards) cards.querySelectorAll('.panel').forEach(p => p.remove());
     }
     async function loadAgents() {
       const res = await fetch('/api/agents');
@@ -2061,6 +2108,7 @@ const dashboardHTML = `<!doctype html>
         const summary = agentRows.length ? summarizeAgent(agentRows) : null;
         const statusInfo = findAgentStatus(agent);
         const state = agentStatusLabel(statusInfo, summary);
+        const cacheState = (statusInfo && statusInfo.cache_status) || 'none';
         const detailURL = '/dashboard?agent=' + encodeURIComponent(agent) + '&range=' + encodeURIComponent(selectedRange);
         activeAgents.add(agent);
         let card = existingCards.get(agent);
@@ -2073,11 +2121,13 @@ const dashboardHTML = `<!doctype html>
             '<div class="card-head"><div><div class="agent-name"></div><div class="subtle"></div></div><span class="status"></span></div>' +
             '<div class="metrics"></div><div class="mini-chart chart-surface"></div>';
           card.addEventListener('click', event => {
+            if (card.dataset.caching === '1') { event.preventDefault(); return; }
             location.href = card.dataset.href;
           });
           card.addEventListener('keydown', event => {
             if (event.key !== 'Enter' && event.key !== ' ') return;
             event.preventDefault();
+            if (card.dataset.caching === '1') return;
             location.href = card.dataset.href;
           });
         }
@@ -2086,8 +2136,15 @@ const dashboardHTML = `<!doctype html>
         card.querySelector('.agent-name').textContent = agent;
         card.querySelector('.subtle').textContent = '节点 IP：' + agentIPText(statusInfo, summary) + ' · 最后在线：' + lastSeenText(statusInfo, summary);
         const status = card.querySelector('.status');
-        status.textContent = state.text;
-        status.className = 'status ' + state.className;
+        if (cacheState === 'building' || cacheState === 'none') {
+          status.textContent = '缓存中';
+          status.className = 'status caching';
+          card.dataset.caching = '1';
+        } else {
+          status.textContent = state.text;
+          status.className = 'status ' + state.className;
+          card.dataset.caching = '0';
+        }
         const metrics = card.querySelector('.metrics');
         metrics.replaceChildren();
         metrics.append(metric('目标数', summary ? String(summary.targetCount) : '0'));
@@ -2097,6 +2154,9 @@ const dashboardHTML = `<!doctype html>
         const chartSurface = card.querySelector('.mini-chart');
         if (agentRows.length) {
           queueMiniChart(chartSurface, agentRows);
+        } else if (cacheState === 'building' || cacheState === 'none') {
+          destroyMiniChartSurface(chartSurface);
+          chartSurface.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px">缓存生成中&hellip;</div>';
         } else {
           destroyMiniChartSurface(chartSurface);
           chartSurface.innerHTML = '';
