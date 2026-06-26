@@ -1269,6 +1269,19 @@ const dashboardHTML = `<!doctype html>
       const ts = new Date(row.checked_at).getTime();
       return Number.isNaN(ts) ? null : ts;
     }
+    function downsample(points, targetCount) {
+      if (!points.length) return [];
+      if (points.length <= targetCount) return points;
+      const bucket = points.length / targetCount;
+      const result = [];
+      for (let i = 0; i < targetCount; i++) {
+        const end = Math.min(Math.round((i + 1) * bucket), points.length);
+        if (end > i * bucket) {
+          result.push(points[end - 1]);
+        }
+      }
+      return result;
+    }
     function medianInterval(points) {
       if (points.length < 3) return minChartGapMs;
       const intervals = [];
@@ -1402,7 +1415,10 @@ const dashboardHTML = `<!doctype html>
       }
       segmentPath(segment) {
         if (!segment.length) return '';
-        if (segment.length === 1) return 'M' + segment[0].x.toFixed(1) + ' ' + segment[0].y.toFixed(1);
+        if (segment.length === 1) {
+          const p = segment[0];
+          return 'M' + p.x.toFixed(1) + ' ' + (p.y - 1).toFixed(1) + ' L' + (p.x + 1).toFixed(1) + ' ' + (p.y + 1).toFixed(1) + ' L' + (p.x - 1).toFixed(1) + ' ' + (p.y + 1).toFixed(1) + ' Z';
+        }
         if (segment.length === 2 || this.options.smooth === false) {
           return segment.map((point, index) => (index ? 'L' : 'M') + point.x.toFixed(1) + ' ' + point.y.toFixed(1)).join('');
         }
@@ -1685,8 +1701,9 @@ const dashboardHTML = `<!doctype html>
       }
       const datasets = Array.from(grouped.entries()).map(([label, points], index) => {
         points.sort((a, b) => a.x - b.x);
-        const typicalGap = medianInterval(points);
-        const displayPoints = splitLongGaps(points, typicalGap);
+        const downsampled = downsample(points, 1000);
+        const typicalGap = medianInterval(downsampled);
+        const displayPoints = splitLongGaps(downsampled, typicalGap);
         return {
           label,
           data: displayPoints,
