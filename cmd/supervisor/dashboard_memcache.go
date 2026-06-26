@@ -11,6 +11,7 @@ import (
 )
 
 const dashMemMaxMB = 64
+const maxChartPoints = 1000
 
 type agentRow struct {
 	checkedAt int64
@@ -100,34 +101,22 @@ func estimateMB(rows []agentRow) int {
 }
 
 func (s *server) serveStreamDirect(w http.ResponseWriter, since time.Time, agent string) {
-	bw := bufio.NewWriter(w)
-	if _, err := bw.Write([]byte("[")); err != nil {
-		return
-	}
-	first := true
-	writeResult := func(result model.Result) error {
+	var rows []agentRow
+	if err := s.streamResultsSince(since, agent, func(result model.Result) error {
 		line, err := marshalDashboardResult(result)
 		if err != nil {
 			return err
 		}
-		if !first {
-			if _, err := bw.Write([]byte(",")); err != nil {
-				return err
-			}
-		}
-		first = false
-		_, err = bw.Write(line)
-		return err
-	}
-	if err := s.streamResultsSince(since, agent, writeResult); err != nil {
+		rows = append(rows, agentRow{
+			checkedAt: result.CheckedAt.UnixNano(),
+			data:      append([]byte(nil), line...),
+		})
+		return nil
+	}); err != nil {
 		log.Printf("stream dashboard results: %v", err)
 	}
-	if _, err := bw.Write([]byte("]")); err != nil {
-		return
-	}
-	if err := bw.Flush(); err != nil {
-		log.Printf("flush dashboard results: %v", err)
-	}
+	rows = aggregateRowsByTime(rows, since, maxChartPoints)
+	writeRows(w, rows)
 }
 
 func (s *server) buildCache(agent string, since time.Time) []agentRow {
@@ -154,11 +143,17 @@ func (s *server) buildCache(agent string, since time.Time) []agentRow {
 func serveFromCache(w http.ResponseWriter, rows []agentRow, since time.Time) {
 	sinceUnix := since.UnixNano()
 	cut := findFirstLessThan(rows, sinceUnix)
+	filtered := rows[:cut]
+	filtered = aggregateRowsByTime(filtered, since, maxChartPoints)
+	writeRows(w, filtered)
+}
+
+func writeRows(w http.ResponseWriter, rows []agentRow) {
 	bw := bufio.NewWriter(w)
 	if _, err := bw.Write([]byte("[")); err != nil {
 		return
 	}
-	for i := 0; i < cut; i++ {
+	for i := range rows {
 		if i > 0 {
 			if _, err := bw.Write([]byte(",")); err != nil {
 				return
@@ -174,6 +169,36 @@ func serveFromCache(w http.ResponseWriter, rows []agentRow, since time.Time) {
 	if err := bw.Flush(); err != nil {
 		log.Printf("flush cache response: %v", err)
 	}
+}
+
+func aggregateRowsByTime(rows []agentRow, since time.Time, targetCount int) []agentRow {
+	n := len(rows)
+	if n <= targetCount {
+		return rows
+	}
+	newestTime := rows[0].checkedAt
+	span := newestTime - since.UnixNano()
+	if span < 1 {
+		return rows
+	}
+	bucketNanos := span / int64(targetCount)
+	if bucketNanos < 1 {
+		return rows
+	}
+	result := make([]agentRow, 0, targetCount)
+	bucketEnd := newestTime
+	rowIdx := 0
+	for b := 0; b < targetCount && rowIdx < n; b++ {
+		bucketStart := bucketEnd - bucketNanos
+		if rows[rowIdx].checkedAt >= bucketStart {
+			result = append(result, rows[rowIdx])
+			for rowIdx < n && rows[rowIdx].checkedAt >= bucketStart {
+				rowIdx++
+			}
+		}
+		bucketEnd = bucketStart
+	}
+	return result
 }
 
 func findFirstLessThan(rows []agentRow, targetUnix int64) int {
