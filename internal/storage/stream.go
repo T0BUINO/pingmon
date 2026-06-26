@@ -9,7 +9,6 @@ import (
 
 const (
 	streamQueryWindow = 6 * time.Hour
-	streamQueryYield  = 20 * time.Millisecond
 )
 
 func (s *SQLiteStore) StreamResultsSince(since time.Time, agent string, fn func(model.Result) error) error {
@@ -38,7 +37,6 @@ func (s *SQLiteStore) streamResultsWindowed(since, before time.Time, agent strin
 			return err
 		}
 		cursor = start
-		time.Sleep(streamQueryYield)
 	}
 	return nil
 }
@@ -78,7 +76,6 @@ func (s *SQLiteStore) streamRollupsSince(since, before time.Time, agent string, 
 			return err
 		}
 		cursor = start
-		time.Sleep(streamQueryYield)
 	}
 	return nil
 }

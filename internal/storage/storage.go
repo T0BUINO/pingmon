@@ -4,10 +4,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"pingmon/internal/model"
@@ -20,6 +22,7 @@ type Store interface {
 	ListAgentStatuses() ([]model.AgentStatus, error)
 	DeleteAgent(agent string) error
 	SaveResult(model.Result) error
+	SaveResults(results []model.Result, seenAt time.Time) ([]model.Result, error)
 	ResultsSince(since time.Time) ([]model.Result, error)
 	ResultsSinceForAgent(since time.Time, agent string) ([]model.Result, error)
 	ResultsSinceCompacted(since, rawCutoff time.Time) ([]model.Result, error)
@@ -30,7 +33,7 @@ type Store interface {
 	DeleteBefore(cutoff time.Time) (int, error)
 	DeleteRollupsBefore(cutoff time.Time) (int, error)
 	Vacuum() error
-	ConsecutiveFailures(targetName, address string, port int) (int, error)
+	ConsecutiveFailures(targetName, address string, port int, limit int) (int, error)
 }
 
 func New(sqlitePath string) (Store, error) {
@@ -38,7 +41,8 @@ func New(sqlitePath string) (Store, error) {
 }
 
 type SQLiteStore struct {
-	db *sql.DB
+	db          *sql.DB
+	seriesCache sync.Map
 }
 
 func NewSQLiteStore(path string) (*SQLiteStore, error) {
@@ -48,17 +52,27 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
 	store := &SQLiteStore{db: db}
 	if err := store.init(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return store, nil
+}
+
+func sqliteDSN(path string) string {
+	q := url.Values{}
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "synchronous(NORMAL)")
+	q.Add("_pragma", "temp_store(MEMORY)")
+	q.Add("_pragma", "cache_size(-65536)")
+	q.Add("_pragma", "wal_autocheckpoint(1000)")
+	return path + "?" + q.Encode()
 }
 
 func (s *SQLiteStore) init() error {
@@ -77,6 +91,7 @@ CREATE TABLE IF NOT EXISTS result_series (
 	UNIQUE(agent, agent_ip, target_name, address, port, labels)
 );
 CREATE INDEX IF NOT EXISTS idx_result_series_agent ON result_series(agent);
+CREATE INDEX IF NOT EXISTS idx_result_series_target ON result_series(target_name, address, port);
 CREATE TABLE IF NOT EXISTS results (
 	id INTEGER PRIMARY KEY,
 	series_id INTEGER NOT NULL,
@@ -172,21 +187,38 @@ func (s *SQLiteStore) DeleteAgent(agent string) error {
 	if _, err := tx.Exec(`DELETE FROM agent_statuses WHERE agent = ?`, agent); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.seriesCache.Range(func(k, _ any) bool { s.seriesCache.Delete(k); return true })
+	return nil
 }
 
-func (s *SQLiteStore) seriesID(agent, agentIP, targetName, address string, port int, labels string) (int64, error) {
-	if _, err := s.db.Exec(`
-INSERT OR IGNORE INTO result_series (agent, agent_ip, target_name, address, port, labels)
-VALUES (?, ?, ?, ?, ?, ?)`, agent, agentIP, targetName, address, port, labels); err != nil {
-		return 0, err
+type dbExec interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func seriesKey(agent, agentIP, targetName, address string, port int, labels string) string {
+	return agent + "\x00" + agentIP + "\x00" + targetName + "\x00" + address + "\x00" + strconv.Itoa(port) + "\x00" + labels
+}
+
+func (s *SQLiteStore) seriesID(q dbExec, agent, agentIP, targetName, address string, port int, labels string) (int64, error) {
+	key := seriesKey(agent, agentIP, targetName, address, port, labels)
+	if v, ok := s.seriesCache.Load(key); ok {
+		return v.(int64), nil
 	}
 	var id int64
-	err := s.db.QueryRow(`
-SELECT id FROM result_series
-WHERE agent = ? AND agent_ip = ? AND target_name = ? AND address = ? AND port = ? AND labels = ?`,
-		agent, agentIP, targetName, address, port, labels).Scan(&id)
-	return id, err
+	err := q.QueryRow(`
+INSERT INTO result_series (agent, agent_ip, target_name, address, port, labels)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(agent, agent_ip, target_name, address, port, labels) DO UPDATE SET agent_ip = excluded.agent_ip
+RETURNING id`, agent, agentIP, targetName, address, port, labels).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	s.seriesCache.Store(key, id)
+	return id, nil
 }
 
 func (s *SQLiteStore) SaveResult(result model.Result) error {
@@ -194,7 +226,7 @@ func (s *SQLiteStore) SaveResult(result model.Result) error {
 	if err != nil {
 		return err
 	}
-	seriesID, err := s.seriesID(result.Agent, result.AgentIP, result.TargetName, result.Address, result.Port, string(labels))
+	seriesID, err := s.seriesID(s.db, result.Agent, result.AgentIP, result.TargetName, result.Address, result.Port, string(labels))
 	if err != nil {
 		return err
 	}
@@ -205,6 +237,58 @@ INSERT INTO results (
 		seriesID, result.CheckedAt.UTC().Format(time.RFC3339Nano), result.SuccessCount,
 		result.FailureCount, result.AverageLatencyMS, result.SuccessRate, result.Error)
 	return err
+}
+
+func (s *SQLiteStore) SaveResults(results []model.Result, seenAt time.Time) ([]model.Result, error) {
+	if len(results) == 0 {
+		return nil, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	heartbeats := make(map[string]string, len(results))
+	for i := range results {
+		result := results[i]
+		labels, err := json.Marshal(result.Labels)
+		if err != nil {
+			return nil, err
+		}
+		seriesID, err := s.seriesID(tx, result.Agent, result.AgentIP, result.TargetName, result.Address, result.Port, string(labels))
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`
+INSERT INTO results (
+	series_id, checked_at, success_count, failure_count, average_latency_ms, success_rate, error
+) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			seriesID, result.CheckedAt.UTC().Format(time.RFC3339Nano), result.SuccessCount,
+			result.FailureCount, result.AverageLatencyMS, result.SuccessRate, result.Error); err != nil {
+			return nil, err
+		}
+		heartbeats[result.Agent] = result.AgentIP
+	}
+	seen := seenAt.UTC().Format(time.RFC3339Nano)
+	for agent, agentIP := range heartbeats {
+		agent = strings.TrimSpace(agent)
+		if agent == "" {
+			continue
+		}
+		if _, err := tx.Exec(`
+INSERT INTO agent_statuses (agent, agent_ip, first_seen_at, last_seen_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(agent) DO UPDATE SET
+	agent_ip = excluded.agent_ip,
+	last_seen_at = excluded.last_seen_at`,
+			agent, agentIP, seen, seen); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 func (s *SQLiteStore) ResultsSince(since time.Time) ([]model.Result, error) {
@@ -237,42 +321,47 @@ func (s *SQLiteStore) ResultsSinceCompacted(since, rawCutoff time.Time) ([]model
 	if since.After(rawCutoff) || since.Equal(rawCutoff) {
 		return s.ResultsSince(since)
 	}
-	results := make([]model.Result, 0)
 	rollups, err := s.rollupsSince(since, rawCutoff)
 	if err != nil {
 		return nil, err
 	}
-	results = append(results, rollups...)
 	raw, err := s.ResultsSince(rawCutoff)
 	if err != nil {
 		return nil, err
 	}
-	results = append(results, raw...)
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].CheckedAt.After(results[j].CheckedAt)
-	})
-	return results, nil
+	return mergeResultsDesc(raw, rollups), nil
 }
 
 func (s *SQLiteStore) ResultsSinceCompactedForAgent(since, rawCutoff time.Time, agent string) ([]model.Result, error) {
 	if since.After(rawCutoff) || since.Equal(rawCutoff) {
 		return s.ResultsSinceForAgent(since, agent)
 	}
-	results := make([]model.Result, 0)
 	rollups, err := s.rollupsSinceForAgent(since, rawCutoff, agent)
 	if err != nil {
 		return nil, err
 	}
-	results = append(results, rollups...)
 	raw, err := s.ResultsSinceForAgent(rawCutoff, agent)
 	if err != nil {
 		return nil, err
 	}
-	results = append(results, raw...)
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].CheckedAt.After(results[j].CheckedAt)
-	})
-	return results, nil
+	return mergeResultsDesc(raw, rollups), nil
+}
+
+func mergeResultsDesc(a, b []model.Result) []model.Result {
+	result := make([]model.Result, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if a[i].CheckedAt.After(b[j].CheckedAt) {
+			result = append(result, a[i])
+			i++
+		} else {
+			result = append(result, b[j])
+			j++
+		}
+	}
+	result = append(result, a[i:]...)
+	result = append(result, b[j:]...)
+	return result
 }
 
 func (s *SQLiteStore) rollupsSince(since, before time.Time) ([]model.Result, error) {
@@ -378,12 +467,18 @@ func (s *SQLiteStore) Vacuum() error {
 	return err
 }
 
-func (s *SQLiteStore) ConsecutiveFailures(targetName, address string, port int) (int, error) {
-	rows, err := s.db.Query(`
+func (s *SQLiteStore) ConsecutiveFailures(targetName, address string, port int, limit int) (int, error) {
+	query := `
 SELECT r.success_count FROM results r
 JOIN result_series rs ON rs.id = r.series_id
 WHERE rs.target_name = ? AND rs.address = ? AND rs.port = ?
-ORDER BY r.checked_at DESC`, targetName, address, port)
+ORDER BY r.checked_at DESC`
+	args := []any{targetName, address, port}
+	if limit > 0 {
+		query += "\nLIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -413,7 +508,7 @@ type resultRows interface {
 }
 
 func scanResults(rows resultRows) ([]model.Result, error) {
-	var results []model.Result
+	results := make([]model.Result, 0, 256)
 	for rows.Next() {
 		result, err := scanResult(rows)
 		if err != nil {
@@ -447,7 +542,7 @@ func scanResult(scanner resultScanner) (model.Result, error) {
 }
 
 func scanAgentStatuses(rows resultRows) ([]model.AgentStatus, error) {
-	var statuses []model.AgentStatus
+	statuses := make([]model.AgentStatus, 0, 16)
 	for rows.Next() {
 		var status model.AgentStatus
 		var firstSeenAt string

@@ -48,6 +48,18 @@ func (s *fakeStore) SaveResult(result model.Result) error {
 	return nil
 }
 
+func (s *fakeStore) SaveResults(results []model.Result, seenAt time.Time) ([]model.Result, error) {
+	seen := make(map[string]bool, len(results))
+	for _, result := range results {
+		s.results = append(s.results, result)
+		if !seen[result.Agent] {
+			seen[result.Agent] = true
+			s.heartbeats = append(s.heartbeats, heartbeatCall{agent: result.Agent, agentIP: result.AgentIP, seenAt: seenAt})
+		}
+	}
+	return results, nil
+}
+
 func TestHandleDeleteAgentDeletesAgentData(t *testing.T) {
 	store := &fakeStore{}
 	s := &server{cfg: config.DefaultConfig(), store: store, hub: newWebsocketHub()}
@@ -110,7 +122,7 @@ func (s *fakeStore) Vacuum() error {
 	return nil
 }
 
-func (s *fakeStore) ConsecutiveFailures(targetName, address string, port int) (int, error) {
+func (s *fakeStore) ConsecutiveFailures(targetName, address string, port int, limit int) (int, error) {
 	return 0, nil
 }
 

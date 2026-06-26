@@ -43,7 +43,13 @@ type dashboardData struct {
 
 type websocketHub struct {
 	mu      sync.Mutex
-	clients map[net.Conn]struct{}
+	clients map[*wsClient]struct{}
+}
+
+type wsClient struct {
+	conn net.Conn
+	send chan []byte
+	done chan struct{}
 }
 
 type websocketEvent struct {
@@ -104,6 +110,7 @@ func main() {
 		dashJobs:     make(chan dashboardCacheKey, 64),
 	}
 	s.dashCache.clearIncompatible()
+	s.dashCache.warm()
 	go s.startRetentionCleaner()
 	go s.runDashboardCacheBuilder()
 
@@ -185,28 +192,29 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 		normalizeReport(&result, agentIP)
 		validatedResults = append(validatedResults, result)
 	}
-	saved := make([]model.Result, 0, len(validatedResults))
-	for _, result := range validatedResults {
-		if err := s.store.SaveResult(result); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+	saved, err := s.store.SaveResults(validatedResults, seenAt)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(saved) > 0 {
+		s.dashCache.appendDelta(saved)
+	}
+	s.hub.broadcastJSON(websocketEvent{Type: "results", Results: saved})
+	limit := s.cfg.FailureThreshold + 1
+	seenTargets := make(map[string]bool, len(saved))
+	for _, result := range saved {
+		key := result.TargetName + "\x00" + result.Address + "\x00" + strconv.Itoa(result.Port)
+		if seenTargets[key] {
+			continue
 		}
-		if err := s.store.SaveAgentHeartbeat(result.Agent, result.AgentIP, seenAt); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		saved = append(saved, result)
-		failures, err := s.store.ConsecutiveFailures(result.TargetName, result.Address, result.Port)
+		seenTargets[key] = true
+		failures, err := s.store.ConsecutiveFailures(result.TargetName, result.Address, result.Port, limit)
 		if err == nil && failures > s.cfg.FailureThreshold {
 			log.Printf("[ALERT] target=%s address=%s:%d consecutive_failures=%d threshold=%d",
 				result.TargetName, result.Address, result.Port, failures, s.cfg.FailureThreshold)
 		}
 	}
-	if len(saved) > 0 {
-		s.dashCache.appendDelta(saved)
-	}
-	s.resultsCache.clear()
-	s.hub.broadcastJSON(websocketEvent{Type: "results", Results: saved})
 	writeJSON(w, map[string]any{"status": "ok", "saved": len(results)})
 }
 
@@ -676,10 +684,9 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close()
 		return
 	}
-	s.hub.add(conn)
-	_ = writeWebSocketText(conn, "connected")
+	c := s.hub.add(conn)
 	go func() {
-		defer s.hub.remove(conn)
+		defer s.hub.remove(c)
 		buf := make([]byte, 2)
 		for {
 			if _, err := conn.Read(buf); err != nil {
@@ -695,32 +702,62 @@ func websocketAccept(key string) string {
 }
 
 func newWebsocketHub() *websocketHub {
-	return &websocketHub{clients: make(map[net.Conn]struct{})}
+	return &websocketHub{clients: make(map[*wsClient]struct{})}
 }
 
-func (h *websocketHub) add(conn net.Conn) {
+func (h *websocketHub) add(conn net.Conn) *wsClient {
+	c := &wsClient{conn: conn, send: make(chan []byte, 16), done: make(chan struct{})}
+	c.send <- buildWebSocketFrame("connected")
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.clients[conn] = struct{}{}
+	h.clients[c] = struct{}{}
+	h.mu.Unlock()
+	go h.runWriter(c)
+	return c
 }
 
-func (h *websocketHub) remove(conn net.Conn) {
+func (h *websocketHub) remove(c *wsClient) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	delete(h.clients, conn)
-	_ = conn.Close()
+	if _, ok := h.clients[c]; !ok {
+		h.mu.Unlock()
+		return
+	}
+	delete(h.clients, c)
+	h.mu.Unlock()
+	close(c.done)
+	_ = c.conn.Close()
+}
+
+func (h *websocketHub) runWriter(c *wsClient) {
+	for {
+		select {
+		case <-c.done:
+			return
+		case frame, ok := <-c.send:
+			if !ok {
+				return
+			}
+			if _, err := c.conn.Write(frame); err != nil {
+				h.remove(c)
+				return
+			}
+		}
+	}
 }
 
 func (h *websocketHub) broadcast(message string) {
+	frame := buildWebSocketFrame(message)
 	h.mu.Lock()
-	clients := make([]net.Conn, 0, len(h.clients))
-	for conn := range h.clients {
-		clients = append(clients, conn)
+	clients := make([]*wsClient, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
 	}
 	h.mu.Unlock()
-	for _, conn := range clients {
-		if err := writeWebSocketText(conn, message); err != nil {
-			h.remove(conn)
+	for _, c := range clients {
+		select {
+		case <-c.done:
+		case c.send <- frame:
+		default:
+			h.remove(c)
 		}
 	}
 }
@@ -735,22 +772,22 @@ func (h *websocketHub) broadcastJSON(event websocketEvent) {
 	h.broadcast(string(payload))
 }
 
-func writeWebSocketText(conn net.Conn, message string) error {
+func buildWebSocketFrame(message string) []byte {
 	payload := []byte(message)
-	header := []byte{0x81}
+	var frame []byte
 	switch {
 	case len(payload) < 126:
-		header = append(header, byte(len(payload)))
+		frame = make([]byte, 0, 2+len(payload))
+		frame = append(frame, 0x81, byte(len(payload)))
 	case len(payload) <= 65535:
-		header = append(header, 126, byte(len(payload)>>8), byte(len(payload)))
+		frame = make([]byte, 0, 4+len(payload))
+		frame = append(frame, 0x81, 126, byte(len(payload)>>8), byte(len(payload)))
 	default:
-		header = append(header, 127, 0, 0, 0, 0, byte(len(payload)>>24), byte(len(payload)>>16), byte(len(payload)>>8), byte(len(payload)))
+		frame = make([]byte, 0, 10+len(payload))
+		frame = append(frame, 0x81, 127, 0, 0, 0, 0, byte(len(payload)>>24), byte(len(payload)>>16), byte(len(payload)>>8), byte(len(payload)))
 	}
-	if _, err := conn.Write(header); err != nil {
-		return err
-	}
-	_, err := conn.Write(payload)
-	return err
+	frame = append(frame, payload...)
+	return frame
 }
 
 func (s *server) requireDashboardAuth(next http.HandlerFunc) http.HandlerFunc {

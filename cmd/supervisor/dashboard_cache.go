@@ -284,7 +284,8 @@ func (c *dashboardResultCache) writeIfReady(w http.ResponseWriter, key dashboard
 	}
 	stale := time.Since(meta.BuiltAt) > dashboardCacheRefreshAfter
 	w.Header().Set("Content-Type", "application/json")
-	if _, err := w.Write([]byte("[")); err != nil {
+	bw := bufio.NewWriter(w)
+	if _, err := bw.Write([]byte("[")); err != nil {
 		return false, err
 	}
 	first := true
@@ -294,22 +295,30 @@ func (c *dashboardResultCache) writeIfReady(w http.ResponseWriter, key dashboard
 			return nil
 		}
 		if !first {
-			if _, err := w.Write([]byte(",")); err != nil {
+			if _, err := bw.Write([]byte(",")); err != nil {
 				return err
 			}
 		}
 		first = false
-		_, err := w.Write(line)
+		_, err := bw.Write(line)
 		return err
 	}
 	if err := c.writeDeltas(meta, writeLine); err != nil {
+		_ = bw.Flush()
 		return false, err
 	}
 	if err := c.writeBaseFiltered(key, since, writeLine); err != nil {
+		_ = bw.Flush()
 		return false, err
 	}
-	_, err = w.Write([]byte("]"))
-	return stale, err
+	if _, err := bw.Write([]byte("]")); err != nil {
+		_ = bw.Flush()
+		return false, err
+	}
+	if err := bw.Flush(); err != nil {
+		return false, err
+	}
+	return stale, nil
 }
 
 func (c *dashboardResultCache) writeBaseFiltered(key dashboardCacheKey, since time.Time, writeLine func([]byte) error) error {
@@ -417,7 +426,7 @@ func (c *dashboardResultCache) appendDelta(results []model.Result) {
 			log.Printf("dashboard cache delta encode: %v", err)
 			return
 		}
-		entry := dashboardDeltaEntry{SavedAt: savedAt, Agent: result.Agent, Row: append([]byte(nil), row...)}
+		entry := dashboardDeltaEntry{SavedAt: savedAt, Agent: result.Agent, Row: row}
 		line, err := json.Marshal(entry)
 		if err != nil {
 			log.Printf("dashboard cache delta encode: %v", err)
@@ -463,6 +472,17 @@ func (c *dashboardResultCache) clearKey(key dashboardCacheKey) {
 	c.mu.Unlock()
 	if err := os.RemoveAll(c.bucketDir(key)); err != nil {
 		log.Printf("dashboard cache clear key: %v", err)
+	}
+}
+
+func (c *dashboardResultCache) warm() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.loadDeltasLocked(); err != nil {
+		log.Printf("dashboard cache delta warm: %v", err)
 	}
 }
 
