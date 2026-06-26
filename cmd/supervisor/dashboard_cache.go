@@ -26,6 +26,12 @@ const (
 	dashboardCacheDayBucket       = 24 * time.Hour
 )
 
+var rowBufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 0, 256)
+	},
+}
+
 func bucketDayPath(t time.Time) string {
 	utc := t.UTC().Truncate(dashboardCacheDayBucket)
 	y, m, d := utc.Date()
@@ -38,11 +44,13 @@ func bucketDay(t time.Time) string {
 
 type dashboardCacheKey struct {
 	Agent string `json:"agent,omitempty"`
+	Range string `json:"range,omitempty"`
 }
 
 type dashboardCacheMeta struct {
 	Key     dashboardCacheKey `json:"key"`
 	Since   time.Time         `json:"since"`
+	Until   time.Time         `json:"until"`
 	BuiltAt time.Time         `json:"built_at"`
 	Version int               `json:"version"`
 }
@@ -73,8 +81,21 @@ func (c *dashboardResultCache) refresh(key dashboardCacheKey, since time.Time, b
 	if c == nil {
 		return nil
 	}
+	now := time.Now().UTC()
 	generation := c.currentGeneration()
-	_, err := c.build(key, since, generation, build)
+	
+	// Check if existing cache is valid and covers the requested range
+	meta, err := c.readMeta(key)
+	if err == nil && meta.Version == dashboardCacheVersion {
+		stale := time.Since(meta.BuiltAt) > dashboardCacheRefreshAfter
+		coversRange := !meta.Since.After(since) && meta.Until.After(now)
+		if !stale && coversRange {
+			return nil
+		}
+	}
+	
+	// Full rebuild (cache missing, stale, version mismatch, or doesn't cover range)
+	_, err = c.build(key, since, generation, build)
 	return err
 }
 
@@ -159,6 +180,7 @@ func (c *dashboardResultCache) build(key dashboardCacheKey, since time.Time, gen
 	meta := dashboardCacheMeta{
 		Key:     key,
 		Since:   since.UTC(),
+		Until:   builtAt,
 		BuiltAt: builtAt,
 		Version: dashboardCacheVersion,
 	}
@@ -725,38 +747,42 @@ func (c *dashboardResultCache) deltaPath() string {
 }
 
 func (c *dashboardResultCache) keyHash(key dashboardCacheKey) string {
-	sum := sha1.Sum([]byte(key.Agent))
+	sum := sha1.Sum([]byte(key.Agent + key.Range))
 	return fmt.Sprintf("%x", sum)
 }
 
 func marshalDashboardResult(result model.Result) ([]byte, error) {
-	data := make([]byte, 0, 256)
-	data = append(data, '[')
-	data = appendJSONString(data, result.Agent)
-	data = append(data, ',')
-	data = appendJSONString(data, result.AgentIP)
-	data = append(data, ',')
-	data = appendJSONString(data, result.TargetName)
-	data = append(data, ',')
-	data = appendJSONString(data, result.Address)
-	data = append(data, ',')
-	data = strconv.AppendInt(data, int64(result.Port), 10)
-	data = append(data, ',')
-	data = appendLabels(data, result.Labels)
-	data = append(data, ',')
-	data = appendJSONString(data, strconv.FormatInt(result.CheckedAt.UTC().UnixNano(), 36))
-	data = append(data, ',')
-	data = strconv.AppendInt(data, int64(result.SuccessCount), 10)
-	data = append(data, ',')
-	data = strconv.AppendInt(data, int64(result.FailureCount), 10)
-	data = append(data, ',')
-	data = strconv.AppendFloat(data, result.AverageLatencyMS, 'f', -1, 64)
-	data = append(data, ',')
-	data = strconv.AppendFloat(data, result.SuccessRate, 'f', -1, 64)
-	data = append(data, ',')
-	data = appendJSONString(data, result.Error)
-	data = append(data, ']')
-	return data, nil
+	buf := rowBufPool.Get().([]byte)
+	buf = buf[:0]
+	defer rowBufPool.Put(buf)
+	
+	buf = append(buf, '[')
+	buf = appendJSONString(buf, result.Agent)
+	buf = append(buf, ',')
+	buf = appendJSONString(buf, result.AgentIP)
+	buf = append(buf, ',')
+	buf = appendJSONString(buf, result.TargetName)
+	buf = append(buf, ',')
+	buf = appendJSONString(buf, result.Address)
+	buf = append(buf, ',')
+	buf = strconv.AppendInt(buf, int64(result.Port), 10)
+	buf = append(buf, ',')
+	buf = appendLabels(buf, result.Labels)
+	buf = append(buf, ',')
+	buf = appendJSONString(buf, strconv.FormatInt(result.CheckedAt.UTC().UnixNano(), 36))
+	buf = append(buf, ',')
+	buf = strconv.AppendInt(buf, int64(result.SuccessCount), 10)
+	buf = append(buf, ',')
+	buf = strconv.AppendInt(buf, int64(result.FailureCount), 10)
+	buf = append(buf, ',')
+	buf = strconv.AppendFloat(buf, result.AverageLatencyMS, 'f', -1, 64)
+	buf = append(buf, ',')
+	buf = strconv.AppendFloat(buf, result.SuccessRate, 'f', -1, 64)
+	buf = append(buf, ',')
+	buf = appendJSONString(buf, result.Error)
+	buf = append(buf, ']')
+	
+	return append([]byte(nil), buf...), nil
 }
 
 func appendJSONString(data []byte, value string) []byte {
@@ -778,15 +804,9 @@ func appendLabels(data []byte, labels []string) []byte {
 }
 
 func throttleDashboardCacheBuild(started time.Time, written int) {
-	targetElapsed := time.Duration(int64(written) * int64(time.Second) / dashboardCacheBuildRowsPerSec)
-	if sleep := targetElapsed - time.Since(started); sleep > 0 {
-		if sleep > 100*time.Millisecond {
-			sleep = 100 * time.Millisecond
-		}
-		time.Sleep(sleep)
-		return
+	if written%dashboardCacheBuildYieldEvery == 0 {
+		runtime.Gosched()
 	}
-	runtime.Gosched()
 }
 
 func bytesTrimSpace(data []byte) []byte {

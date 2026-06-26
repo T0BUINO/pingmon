@@ -9,6 +9,7 @@ import (
 
 const (
 	streamQueryWindow = 6 * time.Hour
+	maxResultsPerWindow = 50000
 )
 
 func (s *SQLiteStore) StreamResultsSince(since time.Time, agent string, fn func(model.Result) error) error {
@@ -44,18 +45,38 @@ func (s *SQLiteStore) streamResultsWindowed(since, before time.Time, agent strin
 func (s *SQLiteStore) streamResultsWindow(since, before time.Time, agent string, fn func(model.Result) error) error {
 	var rows *sql.Rows
 	var err error
+	shortRange := before.Sub(since) <= 24*time.Hour
 	if agent == "" {
-		rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
+		if shortRange {
+			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
+r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
+FROM results r JOIN result_series rs ON rs.id = r.series_id
+WHERE r.checked_at >= ? AND r.checked_at < ?
+ORDER BY r.checked_at DESC LIMIT ?`,
+				since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow)
+		} else {
+			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
 r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
 FROM results r JOIN result_series rs ON rs.id = r.series_id
 WHERE r.checked_at >= ? AND r.checked_at < ?
 ORDER BY r.checked_at DESC`, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+		}
 	} else {
-		rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
+		if shortRange {
+			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
 r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
 FROM result_series rs JOIN results r ON r.series_id = rs.id
 WHERE rs.agent = ? AND r.checked_at >= ? AND r.checked_at < ?
-ORDER BY r.checked_at DESC`, agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+ORDER BY r.checked_at DESC LIMIT ?`,
+				agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow)
+		} else {
+			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
+r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
+FROM result_series rs JOIN results r ON r.series_id = rs.id
+WHERE rs.agent = ? AND r.checked_at >= ? AND r.checked_at < ?
+ORDER BY r.checked_at DESC`,
+				agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+		}
 	}
 	if err != nil {
 		return err
@@ -83,18 +104,37 @@ func (s *SQLiteStore) streamRollupsSince(since, before time.Time, agent string, 
 func (s *SQLiteStore) streamRollupsWindow(since, before time.Time, agent string, fn func(model.Result) error) error {
 	var rows *sql.Rows
 	var err error
+	shortRange := before.Sub(since) <= 24*time.Hour
 	if agent == "" {
-		rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
+		if shortRange {
+			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
 rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
 FROM result_rollups rr JOIN result_series rs ON rs.id = rr.series_id
 WHERE rr.bucket_start >= ? AND rr.bucket_start < ?
-ORDER BY rr.bucket_start DESC`, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+ORDER BY rr.bucket_start DESC LIMIT ?`,
+				since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow)
+		} else {
+			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
+rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
+FROM result_rollups rr JOIN result_series rs ON rs.id = rr.series_id
+WHERE rs.agent = ? AND rr.bucket_start >= ? AND rr.bucket_start < ?
+ORDER BY rr.bucket_start DESC`, agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+		}
 	} else {
-		rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
+		if shortRange {
+			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
+rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
+FROM result_series rs JOIN result_rollups rr ON rr.series_id = rs.id
+WHERE rs.agent = ? AND rr.bucket_start >= ? AND rr.bucket_start < ?
+ORDER BY rr.bucket_start DESC LIMIT ?`,
+				agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow)
+		} else {
+			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
 rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
 FROM result_series rs JOIN result_rollups rr ON rr.series_id = rs.id
 WHERE rs.agent = ? AND rr.bucket_start >= ? AND rr.bucket_start < ?
 ORDER BY rr.bucket_start DESC`, agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+		}
 	}
 	if err != nil {
 		return err

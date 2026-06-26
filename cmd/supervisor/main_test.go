@@ -407,6 +407,7 @@ func TestDashboardResultCacheClearsIncompatibleVersion(t *testing.T) {
 	meta := dashboardCacheMeta{
 		Key:     key,
 		Since:   cacheSince,
+		Until:   time.Now().UTC().Add(time.Hour),
 		BuiltAt: time.Now().UTC(),
 		Version: dashboardCacheVersion - 1,
 	}
@@ -459,7 +460,7 @@ func TestHandleDashboardResultsServesStaleCacheAndQueuesRefresh(t *testing.T) {
 		AverageLatencyMS: 10,
 		SuccessRate:      1,
 	}
-	key := dashboardCacheKey{Agent: result.Agent}
+	key := dashboardCacheKey{Agent: result.Agent, Range: "7d"}
 	cacheSince := result.CheckedAt.Add(-time.Hour)
 	cache := &dashboardResultCache{dir: dir}
 	if err := cache.refresh(key, cacheSince, func(fn func(model.Result) error) error {
@@ -470,6 +471,7 @@ func TestHandleDashboardResultsServesStaleCacheAndQueuesRefresh(t *testing.T) {
 	meta := dashboardCacheMeta{
 		Key:     key,
 		Since:   cacheSince,
+		Until:   time.Now().UTC().Add(time.Hour),
 		BuiltAt: time.Now().UTC().Add(-dashboardCacheRefreshAfter - time.Second),
 		Version: dashboardCacheVersion,
 	}

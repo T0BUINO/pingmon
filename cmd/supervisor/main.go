@@ -477,7 +477,7 @@ func (s *server) resultsSince(since time.Time, agent string) ([]model.Result, er
 }
 
 func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, agent string) {
-	key := dashboardCacheKey{Agent: agent}
+	key := dashboardCacheKey{Agent: agent, Range: selectedRange}
 	since := time.Now().Add(-rangeDuration(selectedRange))
 	w.Header().Set("Cache-Control", "private, max-age=5")
 	if stale, err := s.dashCache.writeIfReady(w, key, since); err == nil {
@@ -488,7 +488,7 @@ func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, age
 	}
 	if agent == "" {
 		statuses, err := s.store.ListAgentStatuses()
-		if err == nil && s.writeLandingAggregated(w, since, statuses) {
+		if err == nil && s.writeLandingAggregated(w, since, selectedRange, statuses) {
 			return
 		}
 	}
@@ -501,7 +501,7 @@ func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, age
 	}
 }
 
-func (s *server) writeLandingAggregated(w http.ResponseWriter, since time.Time, statuses []model.AgentStatus) bool {
+func (s *server) writeLandingAggregated(w http.ResponseWriter, since time.Time, selectedRange string, statuses []model.AgentStatus) bool {
 	first := true
 	writeLine := func(line []byte) error {
 		if !first {
@@ -517,7 +517,7 @@ func (s *server) writeLandingAggregated(w http.ResponseWriter, since time.Time, 
 	w.Write([]byte("["))
 	anyAgent := false
 	for _, st := range statuses {
-		key := dashboardCacheKey{Agent: st.Agent}
+		key := dashboardCacheKey{Agent: st.Agent, Range: selectedRange}
 		if err := s.dashCache.writeFullAgent(w, key, since, writeLine); err != nil {
 			continue
 		}
@@ -546,11 +546,11 @@ func (s *server) runDashboardCacheBuilder() {
 	for key := range s.dashJobs {
 		func() {
 			defer s.dashCache.unmarkPending(key)
-			since := time.Now().Add(-dashboardMaxCacheRange)
+			since := time.Now().Add(-rangeDuration(key.Range))
 			if err := s.dashCache.refresh(key, since, func(fn func(model.Result) error) error {
 				return s.streamResultsSince(since, key.Agent, fn)
 			}); err != nil {
-				log.Printf("dashboard cache build agent=%q: %v", key.Agent, err)
+				log.Printf("dashboard cache build agent=%q range=%q: %v", key.Agent, key.Range, err)
 			}
 		}()
 		time.Sleep(250 * time.Millisecond)
