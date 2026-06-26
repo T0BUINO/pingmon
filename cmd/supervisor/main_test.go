@@ -26,6 +26,7 @@ type fakeStore struct {
 	streamedResults   []model.Result
 	deleted           []string
 	resultsSinceCalls int
+	materializedCalls int
 }
 
 func (s *fakeStore) SaveAgentHeartbeat(agent, agentIP string, seenAt time.Time) error {
@@ -77,21 +78,25 @@ func TestHandleDeleteAgentDeletesAgentData(t *testing.T) {
 
 func (s *fakeStore) ResultsSince(since time.Time) ([]model.Result, error) {
 	s.resultsSinceCalls++
+	s.materializedCalls++
 	return nil, nil
 }
 
 func (s *fakeStore) ResultsSinceForAgent(since time.Time, agent string) ([]model.Result, error) {
 	s.resultsSinceCalls++
+	s.materializedCalls++
 	return nil, nil
 }
 
 func (s *fakeStore) ResultsSinceCompacted(since, rawCutoff time.Time) ([]model.Result, error) {
 	s.resultsSinceCalls++
+	s.materializedCalls++
 	return nil, nil
 }
 
 func (s *fakeStore) ResultsSinceCompactedForAgent(since, rawCutoff time.Time, agent string) ([]model.Result, error) {
 	s.resultsSinceCalls++
+	s.materializedCalls++
 	return nil, nil
 }
 
@@ -286,6 +291,34 @@ func TestDashboardMemCacheInvalidatesOnNewData(t *testing.T) {
 	s.handleResults(rr2, req2)
 	if store.resultsSinceCalls <= callsAfterFirst {
 		t.Fatalf("cache should be invalidated after new data (calls: %d, was: %d)", store.resultsSinceCalls, callsAfterFirst)
+	}
+}
+
+func TestBuildOverviewStreamsInsteadOfMaterializingResults(t *testing.T) {
+	now := time.Now().UTC()
+	store := &fakeStore{
+		streamedResults: []model.Result{
+			{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "198.51.100.10", Port: 443, CheckedAt: now, SuccessCount: 3, AverageLatencyMS: 10, SuccessRate: 1},
+			{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "db", Address: "198.51.100.20", Port: 5432, CheckedAt: now.Add(-time.Minute), SuccessCount: 1, FailureCount: 1, AverageLatencyMS: 20, SuccessRate: 0.5},
+		},
+	}
+	s := &server{cfg: config.DefaultConfig(), store: store}
+
+	overview, err := s.buildOverview("24h", "agent-1")
+	if err != nil {
+		t.Fatalf("buildOverview() error = %v", err)
+	}
+	if store.materializedCalls != 0 {
+		t.Fatalf("overview materialized %d result slices, want 0", store.materializedCalls)
+	}
+	if store.resultsSinceCalls != 1 {
+		t.Fatalf("stream calls = %d, want 1", store.resultsSinceCalls)
+	}
+	if overview.Summary.Targets != 2 || overview.Summary.Problems != 1 {
+		t.Fatalf("summary = %+v, want 2 targets and 1 problem", overview.Summary)
+	}
+	if len(overview.Series) == 0 {
+		t.Fatalf("series should be aggregated")
 	}
 }
 
