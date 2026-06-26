@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha1"
 	"crypto/subtle"
 	"encoding/base64"
@@ -28,8 +29,6 @@ type server struct {
 	tpl          *template.Template
 	hub          *websocketHub
 	resultsCache *resultsCache
-	dashCache    *dashboardResultCache
-	dashJobs     chan dashboardCacheKey
 }
 
 type dashboardData struct {
@@ -106,13 +105,8 @@ func main() {
 		tpl:          tpl,
 		hub:          newWebsocketHub(),
 		resultsCache: newResultsCache(resultsCacheTTL),
-		dashCache:    newDashboardResultCache(cfg.SQLitePath),
-		dashJobs:     make(chan dashboardCacheKey, 64),
 	}
-	s.dashCache.clearIncompatible()
-	s.dashCache.warm()
 	go s.startRetentionCleaner()
-	go s.runDashboardCacheBuilder()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -196,9 +190,6 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	if len(saved) > 0 {
-		s.dashCache.appendDelta(saved)
 	}
 	s.hub.broadcastJSON(websocketEvent{Type: "results", Results: saved})
 	limit := s.cfg.FailureThreshold + 1
@@ -375,8 +366,6 @@ func (s *server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		if now.Sub(status.LastSeenAt) > time.Duration(offlineAfter)*time.Second {
 			state = "offline"
 		}
-		key := dashboardCacheKey{Agent: status.Agent}
-		cacheState := s.dashCache.cacheState(key)
 		out = append(out, agentStatusView{
 			Agent:               status.Agent,
 			AgentIP:             status.AgentIP,
@@ -384,11 +373,8 @@ func (s *server) handleAgents(w http.ResponseWriter, r *http.Request) {
 			LastSeenAt:          status.LastSeenAt,
 			OfflineAfterSeconds: offlineAfter,
 			Status:              state,
-			CacheStatus:         cacheState,
+			CacheStatus:         "ready",
 		})
-		if cacheState == "none" {
-			s.enqueueDashboardCacheBuild(key)
-		}
 	}
 	writeJSON(w, out)
 }
@@ -399,14 +385,7 @@ func (s *server) handleCacheStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
-	key := dashboardCacheKey{Agent: agent}
-	state := s.dashCache.cacheState(key)
-	if agent == "" && (state == "none" || state == "building") {
-		if s.dashCache.anyAgentCacheReady() {
-			state = "ready"
-		}
-	}
-	writeJSON(w, map[string]string{"agent": agent, "cache_status": state})
+	writeJSON(w, map[string]string{"agent": agent, "cache_status": "ready"})
 }
 
 func (s *server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
@@ -420,7 +399,6 @@ func (s *server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.resultsCache.clear()
-	s.dashCache.clearKey(dashboardCacheKey{Agent: agent})
 	if s.hub != nil {
 		s.hub.broadcast("refresh")
 	}
@@ -477,85 +455,40 @@ func (s *server) resultsSince(since time.Time, agent string) ([]model.Result, er
 }
 
 func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, agent string) {
-	key := dashboardCacheKey{Agent: agent, Range: selectedRange}
 	since := time.Now().Add(-rangeDuration(selectedRange))
+	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "private, max-age=5")
-	if stale, err := s.dashCache.writeIfReady(w, key, since); err == nil {
-		if stale {
-			s.enqueueDashboardCacheBuild(key)
-		}
+	bw := bufio.NewWriter(w)
+	if _, err := bw.Write([]byte("[")); err != nil {
 		return
 	}
-	if agent == "" {
-		statuses, err := s.store.ListAgentStatuses()
-		if err == nil && s.writeLandingAggregated(w, since, selectedRange, statuses) {
-			return
-		}
-	}
-	s.enqueueDashboardCacheBuild(key)
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Retry-After", "2")
-	w.WriteHeader(http.StatusAccepted)
-	if _, err := w.Write([]byte("[]")); err != nil {
-		log.Printf("write dashboard pending response: %v", err)
-	}
-}
-
-func (s *server) writeLandingAggregated(w http.ResponseWriter, since time.Time, selectedRange string, statuses []model.AgentStatus) bool {
 	first := true
-	writeLine := func(line []byte) error {
+	writeResult := func(result model.Result) error {
+		line, err := marshalDashboardResult(result)
+		if err != nil {
+			return err
+		}
 		if !first {
-			if _, err := w.Write([]byte(",")); err != nil {
+			if _, err := bw.Write([]byte(",")); err != nil {
 				return err
 			}
 		}
 		first = false
-		_, err := w.Write(line)
+		_, err = bw.Write(line)
 		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte("["))
-	anyAgent := false
-	for _, st := range statuses {
-		key := dashboardCacheKey{Agent: st.Agent, Range: selectedRange}
-		if err := s.dashCache.writeFullAgent(w, key, since, writeLine); err != nil {
-			continue
-		}
-		anyAgent = true
+	if err := s.streamResultsSince(since, agent, writeResult); err != nil {
+		log.Printf("stream dashboard results: %v", err)
 	}
-	w.Write([]byte("]"))
-	return anyAgent
-}
-
-func (s *server) enqueueDashboardCacheBuild(key dashboardCacheKey) {
-	if s.dashJobs == nil {
+	if _, err := bw.Write([]byte("]")); err != nil {
 		return
 	}
-	if !s.dashCache.markPending(key) {
-		return
-	}
-	select {
-	case s.dashJobs <- key:
-	default:
-		s.dashCache.unmarkPending(key)
-		log.Printf("dashboard cache build queue full agent=%q", key.Agent)
+	if err := bw.Flush(); err != nil {
+		log.Printf("flush dashboard results: %v", err)
 	}
 }
 
-func (s *server) runDashboardCacheBuilder() {
-	for key := range s.dashJobs {
-		func() {
-			defer s.dashCache.unmarkPending(key)
-			since := time.Now().Add(-rangeDuration(key.Range))
-			if err := s.dashCache.refresh(key, since, func(fn func(model.Result) error) error {
-				return s.streamResultsSince(since, key.Agent, fn)
-			}); err != nil {
-				log.Printf("dashboard cache build agent=%q range=%q: %v", key.Agent, key.Range, err)
-			}
-		}()
-		time.Sleep(250 * time.Millisecond)
-	}
-}
+
 
 func (s *server) streamResultsSince(since time.Time, agent string, fn func(model.Result) error) error {
 	rawCutoff := time.Now().AddDate(0, 0, -s.cfg.RawRetentionDays)
@@ -868,7 +801,6 @@ func (s *server) cleanOldData() {
 	}
 	if rolled > 0 || deletedRaw > 0 || deletedRollups > 0 {
 		s.resultsCache.clear()
-		s.dashCache.clear()
 		log.Printf("retention cleanup rolled=%d deleted_raw=%d deleted_rollups=%d", rolled, deletedRaw, deletedRollups)
 		if err := s.store.Vacuum(); err != nil {
 			log.Printf("retention vacuum failed: %v", err)
