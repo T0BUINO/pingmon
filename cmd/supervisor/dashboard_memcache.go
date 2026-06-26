@@ -11,7 +11,7 @@ import (
 )
 
 const dashMemMaxMB = 64
-const maxChartPoints = 3000
+const maxChartPoints = 6000
 
 type agentRow struct {
 	checkedAt int64

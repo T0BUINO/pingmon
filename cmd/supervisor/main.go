@@ -25,10 +25,10 @@ import (
 )
 
 const (
-	maxProblemLogRows = 200
+	maxProblemLogRows = 30
 	resultsCacheTTL   = 2 * time.Second
 	overviewCacheTTL  = 2 * time.Second
-	maxSeriesPoints   = 360
+	maxSeriesPoints   = 2000
 )
 
 type server struct {
@@ -537,8 +537,8 @@ type overviewBuilder struct {
 
 func newOverviewBuilder(overview *overviewResponse, statuses map[string]agentStatusView, selectedAgent string, selectedDuration time.Duration) *overviewBuilder {
 	bucket := selectedDuration / maxSeriesPoints
-	if bucket < time.Minute {
-		bucket = time.Minute
+	if bucket < 30*time.Second {
+		bucket = 30 * time.Second
 	}
 	return &overviewBuilder{
 		overview:       overview,
@@ -957,8 +957,8 @@ func buildSeries(rows []model.Result, selectedAgent string) []seriesPoint {
 	if span > 0 {
 		bucket = time.Duration(math.Ceil(float64(span) / float64(maxSeriesPoints)))
 	}
-	if bucket < time.Minute {
-		bucket = time.Minute
+	if bucket < 30*time.Second {
+		bucket = 30 * time.Second
 	}
 	buckets := make(map[string]*metricAgg)
 	for _, row := range rows {

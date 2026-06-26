@@ -195,15 +195,10 @@ const dashboardHTML = `<!doctype html>
       font-size: 24px;
       letter-spacing: 0;
     }
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(0, 1.35fr) minmax(360px, .65fr);
-      gap: 14px;
-      align-items: start;
-    }
     .panel {
       min-width: 0;
       overflow: hidden;
+      margin-bottom: 14px;
     }
     .panel-head {
       display: flex;
@@ -223,9 +218,33 @@ const dashboardHTML = `<!doctype html>
       color: var(--muted);
       font-size: 12px;
     }
+    .panel-collapse {
+      cursor: pointer;
+      user-select: none;
+    }
+    .panel-collapse .arrow {
+      display: inline-block;
+      transition: transform .2s;
+      margin-left: 6px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .panel-collapse.collapsed .arrow {
+      transform: rotate(-90deg);
+    }
+    .panel-body {
+      overflow: auto;
+    }
+    .panel-collapse.collapsed + .panel-body {
+      display: none;
+    }
+    .problem-scroll {
+      max-height: 320px;
+      overflow: auto;
+    }
     .chart {
       width: 100%;
-      height: 280px;
+      height: 300px;
       display: block;
       background: linear-gradient(#fff, #fbfcfd);
     }
@@ -279,7 +298,6 @@ const dashboardHTML = `<!doctype html>
       }
       main { padding: 16px; }
       .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .layout { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
       .top { display: grid; }
@@ -325,31 +343,15 @@ const dashboardHTML = `<!doctype html>
 
       <section class="summary" id="summary"></section>
 
-      <section class="layout">
-        <div class="panel">
-          <div class="panel-head">
-            <h3>出站连通性趋势</h3>
-            <span id="chartMeta"></span>
-          </div>
-          <svg id="chart" class="chart" role="img" aria-label="服务器出站连通性趋势"></svg>
+      <section class="panel">
+        <div class="panel-head">
+          <h3>出站连通性趋势</h3>
+          <span id="chartMeta"></span>
         </div>
-        <div class="panel">
-          <div class="panel-head">
-            <h3>连接失败与抖动</h3>
-            <span id="problemMeta"></span>
-          </div>
-          <div style="overflow:auto">
-            <table>
-              <thead>
-                <tr><th>时间</th><th>级别</th><th>服务器</th><th>探测点</th><th>连通率</th></tr>
-              </thead>
-              <tbody id="problemBody"></tbody>
-            </table>
-          </div>
-        </div>
+        <svg id="chart" class="chart" role="img" aria-label="服务器出站连通性趋势"></svg>
       </section>
 
-      <section class="panel" style="margin-top:14px">
+      <section class="panel">
         <div class="panel-head">
           <h3>探测点连通性</h3>
           <span id="probeMeta"></span>
@@ -363,13 +365,29 @@ const dashboardHTML = `<!doctype html>
           </table>
         </div>
       </section>
+
+      <section class="panel">
+        <div class="panel-head panel-collapse collapsed" id="problemHead" title="点击展开/折叠">
+          <h3>连接失败与抖动 <span class="arrow">&#9660;</span></h3>
+          <span id="problemMeta"></span>
+        </div>
+        <div class="panel-body">
+          <div class="problem-scroll">
+            <table>
+              <thead>
+                <tr><th>时间</th><th>级别</th><th>服务器</th><th>探测点</th><th>连通率</th></tr>
+              </thead>
+              <tbody id="problemBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
   <script>
-    const initialAgent = {{printf "%q" .SelectedAgent}};
     const state = {
       range: document.getElementById('rangeSelect').value || '24h',
-      agent: initialAgent,
+      agent: '',
       data: null
     };
     const els = {
@@ -386,6 +404,7 @@ const dashboardHTML = `<!doctype html>
       probeMeta: document.getElementById('probeMeta'),
       problemBody: document.getElementById('problemBody'),
       problemMeta: document.getElementById('problemMeta'),
+      problemHead: document.getElementById('problemHead'),
       refresh: document.getElementById('refreshButton'),
       back: document.getElementById('backButton'),
       del: document.getElementById('deleteAgentButton')
@@ -481,10 +500,13 @@ const dashboardHTML = `<!doctype html>
           '<td>' + esc(row.agent) + '</td><td class="wrap">' + esc((row.probe_name || row.target_name) + ' · ' + row.address + ':' + row.port) + '</td><td>' + fmtPct(row.success_rate) + '</td></tr>');
       });
     }
+    function toggleProblems() {
+      els.problemHead.classList.toggle('collapsed');
+    }
     function renderChart(points) {
       const svg = els.chart;
-      const width = Math.max(320, svg.clientWidth || 720);
-      const height = 280;
+      const width = Math.max(360, svg.clientWidth || 760);
+      const height = 320;
       svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
       svg.innerHTML = '';
       els.chartMeta.textContent = points.length + ' 个聚合点';
@@ -492,9 +514,10 @@ const dashboardHTML = `<!doctype html>
         svg.innerHTML = '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#667386">暂无趋势数据</text>';
         return;
       }
-      const pad = {l: 44, r: 16, t: 18, b: 32};
+      const pad = {l: 56, r: 16, t: 20, b: 46};
       const minT = Math.min(...points.map(p => new Date(p.timestamp).getTime()));
       const maxT = Math.max(...points.map(p => new Date(p.timestamp).getTime()));
+      const rangeT = Math.max(1, maxT - minT);
       const maxLatency = Math.max(1, ...points.map(p => p.average_latency_ms || 0));
       const groups = new Map();
       points.forEach(p => {
@@ -503,28 +526,52 @@ const dashboardHTML = `<!doctype html>
         groups.get(key).push(p);
       });
       const colors = ['#2457c5', '#13835d', '#a56500', '#be3a3a', '#5b5fc7', '#007d89'];
+
       function x(t) {
-        if (maxT === minT) return pad.l;
-        return pad.l + (new Date(t).getTime() - minT) / (maxT - minT) * (width - pad.l - pad.r);
+        return pad.l + (new Date(t).getTime() - minT) / rangeT * (width - pad.l - pad.r);
       }
       function y(v) {
         return height - pad.b - (v / maxLatency) * (height - pad.t - pad.b);
       }
-      const axis = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      axis.setAttribute('d', 'M' + pad.l + ' ' + pad.t + 'V' + (height - pad.b) + 'H' + (width - pad.r));
-      axis.setAttribute('fill', 'none');
-      axis.setAttribute('stroke', '#d8dee8');
-      svg.appendChild(axis);
+
+      const ns = 'http://www.w3.org/2000/svg';
+      function el(tag, attrs) {
+        const e = document.createElementNS(ns, tag);
+        for (const k in attrs) e.setAttribute(k, attrs[k]);
+        return e;
+      }
+
+      const plotW = width - pad.l - pad.r;
+      const plotH = height - pad.t - pad.b;
+
+      svg.appendChild(el('rect', {x: pad.l, y: pad.t, width: plotW, height: plotH, fill: 'none', stroke: '#d8dee8'}));
+
+      const yTicks = 4;
+      for (let i = 0; i <= yTicks; i++) {
+        const val = maxLatency * i / yTicks;
+        const yy = y(val);
+        if (yy < pad.t) continue;
+        svg.appendChild(el('line', {x1: pad.l - 5, y1: yy, x2: pad.l + plotW, y2: yy, stroke: '#e8ecf2', 'stroke-dasharray': '3,3'}));
+        const label = el('text', {x: pad.l - 8, y: yy + 4, 'text-anchor': 'end', fill: '#667386', 'font-size': '11'});
+        label.textContent = val >= 10 ? val.toFixed(0) + ' ms' : val.toFixed(1) + ' ms';
+        svg.appendChild(label);
+      }
+
+      const xTicks = Math.min(6, Math.max(2, Math.floor(plotW / 90)));
+      for (let i = 0; i <= xTicks; i++) {
+        const ts = new Date(minT + rangeT * i / xTicks);
+        const xx = x(ts);
+        const label = el('text', {x: xx, y: height - pad.b + 18, 'text-anchor': 'middle', fill: '#667386', 'font-size': '11'});
+        label.textContent = ts.toLocaleString(undefined, {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
+        svg.appendChild(label);
+      }
+
       Array.from(groups.entries()).slice(0, 8).forEach(([name, rows], index) => {
         rows.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-        const path = rows.map((p, i) => (i ? 'L' : 'M') + x(p.timestamp).toFixed(1) + ' ' + y(p.average_latency_ms || 0).toFixed(1)).join(' ');
-        const el = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        el.setAttribute('d', path);
-        el.setAttribute('fill', 'none');
-        el.setAttribute('stroke', colors[index % colors.length]);
-        el.setAttribute('stroke-width', '2');
-        el.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'title')).textContent = name;
-        svg.appendChild(el);
+        const d = rows.map((p, i) => (i ? 'L' : 'M') + x(p.timestamp).toFixed(1) + ' ' + y(p.average_latency_ms || 0).toFixed(1)).join(' ');
+        const path = el('path', {d: d, fill: 'none', stroke: colors[index % colors.length], 'stroke-width': '2'});
+        path.appendChild(el('title', {})).textContent = name;
+        svg.appendChild(path);
       });
     }
     function render() {
@@ -578,6 +625,7 @@ const dashboardHTML = `<!doctype html>
       state.agent = '';
       await loadOverview();
     };
+    els.problemHead.onclick = toggleProblems;
     function connectLive() {
       const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
       ws.onopen = () => {
