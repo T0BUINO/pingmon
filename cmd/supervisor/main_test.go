@@ -204,6 +204,91 @@ func TestHandleDashboardResultsLandingStreamsAllAgents(t *testing.T) {
 	}
 }
 
+func TestDashboardMemCacheServesFromCacheAfterFirstRequest(t *testing.T) {
+	now := time.Now().UTC()
+	results := []model.Result{
+		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "198.51.100.10", Port: 443, CheckedAt: now, SuccessCount: 1, AverageLatencyMS: 10, SuccessRate: 1},
+		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "198.51.100.10", Port: 443, CheckedAt: now.Add(-30 * time.Minute), SuccessCount: 1, FailureCount: 1, AverageLatencyMS: 11, SuccessRate: 0.5, Error: "timeout"},
+		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "db", Address: "198.51.100.20", Port: 5432, CheckedAt: now.Add(-2 * time.Hour), SuccessCount: 1, AverageLatencyMS: 5, SuccessRate: 1},
+	}
+	store := &fakeStore{streamedResults: results}
+	s := &server{cfg: config.DefaultConfig(), store: store, dashMem: newDashMemCache()}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=24h&agent=agent-1", nil)
+	rr := httptest.NewRecorder()
+	s.handleResults(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200", rr.Code)
+	}
+	firstGot := decodeDashboardResultsForTest(t, rr.Body.Bytes())
+	if len(firstGot) != 3 {
+		t.Fatalf("first request returned %d rows, want 3", len(firstGot))
+	}
+	firstCalls := store.resultsSinceCalls
+
+	req2 := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=1h&agent=agent-1", nil)
+	rr2 := httptest.NewRecorder()
+	s.handleResults(rr2, req2)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("second request status = %d, want 200", rr2.Code)
+	}
+	secondGot := decodeDashboardResultsForTest(t, rr2.Body.Bytes())
+	if len(secondGot) != 2 {
+		t.Fatalf("second request (1h) returned %d rows, want 2", len(secondGot))
+	}
+	if store.resultsSinceCalls != firstCalls {
+		t.Fatalf("second request hit DB (%d calls, want %d)", store.resultsSinceCalls, firstCalls)
+	}
+}
+
+func TestDashboardMemCacheLongRangeBypassesCache(t *testing.T) {
+	now := time.Now().UTC()
+	store := &fakeStore{
+		streamedResults: []model.Result{
+			{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "198.51.100.10", Port: 443, CheckedAt: now, SuccessCount: 1, AverageLatencyMS: 10, SuccessRate: 1},
+		},
+	}
+	s := &server{cfg: config.DefaultConfig(), store: store, dashMem: newDashMemCache()}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=365d&agent=agent-1", nil)
+	rr := httptest.NewRecorder()
+	s.handleResults(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if store.resultsSinceCalls != 1 {
+		t.Fatalf("resultsSinceCalls = %d, want 1", store.resultsSinceCalls)
+	}
+}
+
+func TestDashboardMemCacheInvalidatesOnNewData(t *testing.T) {
+	now := time.Now().UTC()
+	store := &fakeStore{
+		streamedResults: []model.Result{
+			{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "198.51.100.10", Port: 443, CheckedAt: now, SuccessCount: 1, AverageLatencyMS: 10, SuccessRate: 1},
+		},
+	}
+	s := &server{cfg: config.DefaultConfig(), store: store, dashMem: newDashMemCache(), hub: newWebsocketHub()}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=24h&agent=agent-1", nil)
+	rr := httptest.NewRecorder()
+	s.handleResults(rr, req)
+	callsAfterFirst := store.resultsSinceCalls
+
+	body := `{"agent":"agent-1","agent_ip":"203.0.113.1","target_name":"web","address":"198.51.100.10","port":443,"checked_at":"2026-06-20T10:00:00Z","success_count":1,"failure_count":0,"average_latency_ms":1,"success_rate":1}`
+	reportReq := httptest.NewRequest(http.MethodPost, "/api/report", strings.NewReader(body))
+	reportRR := httptest.NewRecorder()
+	s.handleReport(reportRR, reportReq)
+
+	req2 := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=24h&agent=agent-1", nil)
+	rr2 := httptest.NewRecorder()
+	s.handleResults(rr2, req2)
+	if store.resultsSinceCalls <= callsAfterFirst {
+		t.Fatalf("cache should be invalidated after new data (calls: %d, was: %d)", store.resultsSinceCalls, callsAfterFirst)
+	}
+}
+
 func decodeDashboardResultsForTest(t *testing.T, data []byte) []model.Result {
 	t.Helper()
 	var rows [][]json.RawMessage

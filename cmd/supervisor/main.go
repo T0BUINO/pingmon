@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"crypto/sha1"
 	"crypto/subtle"
 	"encoding/base64"
@@ -29,6 +28,7 @@ type server struct {
 	tpl          *template.Template
 	hub          *websocketHub
 	resultsCache *resultsCache
+	dashMem      *dashMemCache
 }
 
 type dashboardData struct {
@@ -105,6 +105,7 @@ func main() {
 		tpl:          tpl,
 		hub:          newWebsocketHub(),
 		resultsCache: newResultsCache(resultsCacheTTL),
+		dashMem:      newDashMemCache(),
 	}
 	go s.startRetentionCleaner()
 
@@ -192,6 +193,15 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.hub.broadcastJSON(websocketEvent{Type: "results", Results: saved})
+	if s.dashMem != nil {
+		seen := make(map[string]bool)
+		for _, r := range saved {
+			if !seen[r.Agent] {
+				seen[r.Agent] = true
+				s.dashMem.invalidate(r.Agent)
+			}
+		}
+	}
 	limit := s.cfg.FailureThreshold + 1
 	seenTargets := make(map[string]bool, len(saved))
 	for _, result := range saved {
@@ -456,36 +466,23 @@ func (s *server) resultsSince(since time.Time, agent string) ([]model.Result, er
 
 func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, agent string) {
 	since := time.Now().Add(-rangeDuration(selectedRange))
+	rawCutoff := time.Now().AddDate(0, 0, -s.cfg.RawRetentionDays)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "private, max-age=5")
-	bw := bufio.NewWriter(w)
-	if _, err := bw.Write([]byte("[")); err != nil {
-		return
-	}
-	first := true
-	writeResult := func(result model.Result) error {
-		line, err := marshalDashboardResult(result)
-		if err != nil {
-			return err
+
+	if !since.Before(rawCutoff) && agent != "" && s.dashMem != nil {
+		rows := s.dashMem.get(agent)
+		if rows == nil {
+			cacheSince := time.Now().AddDate(0, 0, -s.cfg.RawRetentionDays)
+			rows = s.buildCache(agent, cacheSince)
 		}
-		if !first {
-			if _, err := bw.Write([]byte(",")); err != nil {
-				return err
-			}
+		if len(rows) > 0 {
+			serveFromCache(w, rows, since)
+			return
 		}
-		first = false
-		_, err = bw.Write(line)
-		return err
 	}
-	if err := s.streamResultsSince(since, agent, writeResult); err != nil {
-		log.Printf("stream dashboard results: %v", err)
-	}
-	if _, err := bw.Write([]byte("]")); err != nil {
-		return
-	}
-	if err := bw.Flush(); err != nil {
-		log.Printf("flush dashboard results: %v", err)
-	}
+	s.serveStreamDirect(w, since, agent)
 }
 
 
@@ -801,6 +798,7 @@ func (s *server) cleanOldData() {
 	}
 	if rolled > 0 || deletedRaw > 0 || deletedRollups > 0 {
 		s.resultsCache.clear()
+		s.dashMem.clear()
 		log.Printf("retention cleanup rolled=%d deleted_raw=%d deleted_rollups=%d", rolled, deletedRaw, deletedRollups)
 		if err := s.store.Vacuum(); err != nil {
 			log.Printf("retention vacuum failed: %v", err)
