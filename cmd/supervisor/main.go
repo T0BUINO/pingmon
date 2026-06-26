@@ -38,6 +38,7 @@ type dashboardData struct {
 	SelectedRange       string
 	CustomRange         bool
 	OfflineAfterSeconds int
+	RollupIntervalMins  int
 }
 
 type websocketHub struct {
@@ -319,6 +320,7 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		SelectedRange:       selectedRange,
 		CustomRange:         !rangeInList(selectedRange, s.cfg.DashboardRanges),
 		OfflineAfterSeconds: s.agentOfflineAfterSeconds(),
+		RollupIntervalMins:  s.cfg.RollupIntervalMins,
 	}); err != nil {
 		log.Printf("render dashboard: %v", err)
 	}
@@ -1074,6 +1076,7 @@ const dashboardHTML = `<!doctype html>
     const colors = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#d97706', '#0891b2', '#be123c', '#4f46e5'];
     const maxProblemLogRows = 200;
     const minChartGapMs = 5 * 60 * 1000;
+    const rollupIntervalMs = {{.RollupIntervalMins}} * 60 * 1000;
     const selectedAgent = '{{.Agent}}';
     const defaultOfflineAfterSeconds = {{.OfflineAfterSeconds}};
     let selectedRange = '{{.SelectedRange}}';
@@ -1282,7 +1285,7 @@ const dashboardHTML = `<!doctype html>
     }
     function splitLongGaps(points, typicalGap) {
       if (points.length < 2) return points;
-      const threshold = Math.max(minChartGapMs, (typicalGap || medianInterval(points)) * 3);
+      const threshold = Math.max(minChartGapMs, rollupIntervalMs * 3, (typicalGap || medianInterval(points)) * 3);
       const split = [points[0]];
       for (let i = 1; i < points.length; i++) {
         if (points[i].x - points[i - 1].x > threshold) {

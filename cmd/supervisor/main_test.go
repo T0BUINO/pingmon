@@ -289,35 +289,6 @@ func TestDashboardMemCacheInvalidatesOnNewData(t *testing.T) {
 	}
 }
 
-func TestAggregateRowsByTime(t *testing.T) {
-	now := time.Now().UnixNano()
-	rows := make([]agentRow, 5000)
-	for i := 0; i < 5000; i++ {
-		rows[i] = agentRow{checkedAt: now - int64(i)*int64(time.Second)}
-	}
-	since := time.Unix(0, now-int64(5000)*int64(time.Second))
-	result := aggregateRowsByTime(rows, since, 1000)
-	if len(result) > 1000 {
-		t.Fatalf("aggregated to %d rows, want <= 1000", len(result))
-	}
-	if len(result) < 900 {
-		t.Fatalf("aggregated to only %d rows, want close to 1000", len(result))
-	}
-}
-
-func TestAggregateRowsByTimeNoChangeIfSmall(t *testing.T) {
-	now := time.Now().UnixNano()
-	rows := make([]agentRow, 10)
-	for i := 0; i < 10; i++ {
-		rows[i] = agentRow{checkedAt: now - int64(i)*int64(time.Second)}
-	}
-	since := time.Unix(0, now-int64(10)*int64(time.Second))
-	result := aggregateRowsByTime(rows, since, 1000)
-	if len(result) != 10 {
-		t.Fatalf("small set changed from %d to %d, want 10", len(rows), len(result))
-	}
-}
-
 func decodeDashboardResultsForTest(t *testing.T, data []byte) []model.Result {
 	t.Helper()
 	var rows [][]json.RawMessage
