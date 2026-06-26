@@ -1318,12 +1318,9 @@ const dashboardHTML = `<!doctype html>
         this.container.replaceChildren(this.canvas);
         this.ctx = this.canvas.getContext('2d');
         this.hoverX = null;
-        this.hoverLine = null;
-        if (!this.options.mini) {
-          this.hoverLine = document.createElement('div');
-          this.hoverLine.className = 'chart-hover-line';
-          this.container.appendChild(this.hoverLine);
-        }
+        this.hoverLine = document.createElement('div');
+        this.hoverLine.className = 'chart-hover-line';
+        this.container.appendChild(this.hoverLine);
         this.tooltipCache = new Map();
         this.lastTooltipX = null;
         this.lastTooltipPixel = null;
@@ -1668,7 +1665,23 @@ const dashboardHTML = `<!doctype html>
         this.lastPointerClientY = clientY;
         cancelAnimationFrame(this.tooltipRaf);
         this.tooltipRaf = requestAnimationFrame(() => {
-          if (this.tooltipActive) showChartTooltip(this, clientX, clientY);
+          if (!this.tooltipActive) return;
+          if (this.options.mini) {
+            const area = this.lastArea || this.chartArea();
+            const xRange = this.lastXRange || this.xRange();
+            const rect = this.container.getBoundingClientRect();
+            const mx = clientX - rect.left;
+            if (mx < area.left || mx > area.right) {
+              this.hoverLine.style.opacity = '0';
+              return;
+            }
+            this.hoverLine.style.top = area.top.toFixed(1) + 'px';
+            this.hoverLine.style.bottom = (area.height - area.bottom).toFixed(1) + 'px';
+            this.hoverLine.style.opacity = '1';
+            this.hoverLine.style.transform = 'translate3d(' + mx.toFixed(1) + 'px, 0, 0)';
+          } else {
+            showChartTooltip(this, clientX, clientY);
+          }
         });
       }
     }
