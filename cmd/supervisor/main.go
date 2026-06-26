@@ -931,10 +931,10 @@ const dashboardHTML = `<!doctype html>
     .chart-wrap { position: relative; height: 390px; width: 100%; touch-action: pan-y; }
     .chart-surface { width: 100%; min-width: 0; overflow: hidden; }
     .chart-wrap .chart-surface { position: absolute; inset: 0; height: 100%; }
+    .chart-surface canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+    .chart-surface canvas.dragging { cursor: grabbing; }
     .mini-chart.chart-surface { height: 86px; }
-    .chart-surface svg { display: block; width: 100%; height: 100%; cursor: grab; overflow: hidden; }
-    .chart-surface svg * { pointer-events: none; }
-    .chart-surface.dragging svg { cursor: grabbing; }
+    .mini-chart.chart-surface canvas { height: 86px; }
     .chart-hover-line { position: absolute; top: 0; bottom: 0; left: 0; width: 1px; background: repeating-linear-gradient(to bottom, #94a3b8 0 4px, transparent 4px 8px); pointer-events: none; opacity: 0; transform: translate3d(0, 0, 0); }
     .chart-tooltip { position: fixed; z-index: 1000; max-width: min(560px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 24px)); overflow: hidden; pointer-events: none; border-radius: 6px; padding: 9px 10px; background: rgba(24, 24, 27, .92); color: #fff; font-size: 13px; line-height: 1.35; box-shadow: 0 16px 40px rgba(15, 23, 42, .24); opacity: 0; transform: translate3d(0, 0, 0); transition: opacity .12s ease; }
     .chart-tooltip-title { margin-bottom: 6px; font-weight: 700; white-space: nowrap; }
@@ -1305,18 +1305,18 @@ const dashboardHTML = `<!doctype html>
       if (range === '24h') return date.toLocaleString([], {month: '2-digit', day: '2-digit', hour: '2-digit'});
       return date.toLocaleDateString([], {month: '2-digit', day: '2-digit'});
     }
-    class SvgLineChart {
+    class CanvasLineChart {
       constructor(container, data, options) {
         this.container = container;
         this.data = data || {datasets: []};
         this.options = options || {};
         this.visibility = new Map();
         this.raf = 0;
-        this.svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-        this.svg.setAttribute('role', 'img');
-        this.svg.setAttribute('aria-label', '延迟图表');
-        this.container.replaceChildren(this.svg);
-        this.canvas = this.container;
+        this.canvas = document.createElement('canvas');
+        this.canvas.setAttribute('role', 'img');
+        this.canvas.setAttribute('aria-label', '\u5ef6\u8fdf\u56fe\u8868');
+        this.container.replaceChildren(this.canvas);
+        this.ctx = this.canvas.getContext('2d');
         this.hoverX = null;
         this.hoverLine = null;
         if (!this.options.mini) {
@@ -1332,7 +1332,11 @@ const dashboardHTML = `<!doctype html>
         this.lastXRange = null;
         this.tooltipActive = false;
         this.scales = {x: {getValueForPixel: pixel => this.valueForPixel(pixel)}};
-        this.resizeObserver = new ResizeObserver(() => this.update());
+        this._resizeTimer = 0;
+        this.resizeObserver = new ResizeObserver(() => {
+          clearTimeout(this._resizeTimer);
+          this._resizeTimer = setTimeout(() => this.update(), 150);
+        });
         this.resizeObserver.observe(this.container);
         this.container.addEventListener('pointermove', event => this.scheduleTooltip(event));
         this.container.addEventListener('pointerleave', () => hideChartTooltip(this));
@@ -1341,6 +1345,7 @@ const dashboardHTML = `<!doctype html>
       destroy() {
         cancelAnimationFrame(this.raf);
         cancelAnimationFrame(this.tooltipRaf);
+        clearTimeout(this._resizeTimer);
         if (this.resizeObserver) this.resizeObserver.disconnect();
         this.container.replaceChildren();
       }
@@ -1403,95 +1408,85 @@ const dashboardHTML = `<!doctype html>
         const y = area.bottom - (point.y - yRange.min) / Math.max(1, yRange.max - yRange.min) * (area.bottom - area.top);
         return {x, y};
       }
-      segmentPath(segment) {
-        if (!segment.length) return '';
-        if (segment.length === 1) {
-          const p = segment[0];
-          return 'M' + p.x.toFixed(1) + ' ' + (p.y - 1).toFixed(1) + ' L' + (p.x + 1).toFixed(1) + ' ' + (p.y + 1).toFixed(1) + ' L' + (p.x - 1).toFixed(1) + ' ' + (p.y + 1).toFixed(1) + ' Z';
+      segmentVertexData(segment, xRange, yRange, area) {
+        if (!segment.length) return [];
+        if (segment.length < 3 || this.options.smooth === false) {
+          const px = segment.map(p => this.pointToPixel(p, xRange, yRange, area));
+          if (px.length < 2) return [{x0: px[0].x, y0: px[0].y, c1x: px[0].x, c1y: px[0].y, c2x: px[0].x, c2y: px[0].y, x1: px[0].x, y1: px[0].y}];
+          const result = [];
+          for (let i = 0; i < px.length - 1; i++) {
+            result.push({x0: px[i].x, y0: px[i].y, c1x: px[i].x, c1y: px[i].y, c2x: px[i+1].x, c2y: px[i+1].y, x1: px[i+1].x, y1: px[i+1].y});
+          }
+          return result;
         }
-        if (segment.length === 2 || this.options.smooth === false) {
-          return segment.map((point, index) => (index ? 'L' : 'M') + point.x.toFixed(1) + ' ' + point.y.toFixed(1)).join('');
-        }
-        const slopes = [];
-        const tangents = new Array(segment.length).fill(0);
-        for (let i = 0; i < segment.length - 1; i++) {
-          const dx = segment[i + 1].x - segment[i].x;
-          slopes[i] = dx === 0 ? 0 : (segment[i + 1].y - segment[i].y) / dx;
+        const px = segment.map(p => this.pointToPixel(p, xRange, yRange, area));
+        const n = px.length;
+        const slopes = new Float64Array(n - 1);
+        const tangents = new Float64Array(n);
+        for (let i = 0; i < n - 1; i++) {
+          const dx = px[i + 1].x - px[i].x;
+          slopes[i] = dx === 0 ? 0 : (px[i + 1].y - px[i].y) / dx;
         }
         tangents[0] = slopes[0];
-        tangents[segment.length - 1] = slopes[slopes.length - 1];
-        for (let i = 1; i < segment.length - 1; i++) {
+        tangents[n - 1] = slopes[n - 2];
+        for (let i = 1; i < n - 1; i++) {
           tangents[i] = slopes[i - 1] * slopes[i] <= 0 ? 0 : (slopes[i - 1] + slopes[i]) / 2;
         }
-        for (let i = 0; i < slopes.length; i++) {
-          if (slopes[i] === 0) {
-            tangents[i] = 0;
-            tangents[i + 1] = 0;
-            continue;
-          }
+        for (let i = 0; i < n - 1; i++) {
+          if (slopes[i] === 0) { tangents[i] = 0; tangents[i + 1] = 0; continue; }
           const a = tangents[i] / slopes[i];
           const b = tangents[i + 1] / slopes[i];
           const h = Math.hypot(a, b);
-          if (h > 3) {
-            const scale = 3 / h;
-            tangents[i] = scale * a * slopes[i];
-            tangents[i + 1] = scale * b * slopes[i];
-          }
+          if (h > 3) { const s = 3 / h; tangents[i] = s * a * slopes[i]; tangents[i + 1] = s * b * slopes[i]; }
         }
-        let d = 'M' + segment[0].x.toFixed(1) + ' ' + segment[0].y.toFixed(1);
-        for (let i = 0; i < segment.length - 1; i++) {
-          const current = segment[i];
-          const next = segment[i + 1];
-          const dx = next.x - current.x;
-          const c1x = current.x + dx / 3;
-          const c1y = current.y + tangents[i] * dx / 3;
-          const c2x = next.x - dx / 3;
-          const c2y = next.y - tangents[i + 1] * dx / 3;
-          d += 'C' + c1x.toFixed(1) + ' ' + c1y.toFixed(1) + ' ' + c2x.toFixed(1) + ' ' + c2y.toFixed(1) + ' ' + next.x.toFixed(1) + ' ' + next.y.toFixed(1);
+        const result = [];
+        for (let i = 0; i < n - 1; i++) {
+          const dx = px[i + 1].x - px[i].x;
+          result.push({
+            x0: px[i].x, y0: px[i].y,
+            c1x: px[i].x + dx / 3, c1y: px[i].y + tangents[i] * dx / 3,
+            c2x: px[i + 1].x - dx / 3, c2y: px[i + 1].y - tangents[i + 1] * dx / 3,
+            x1: px[i + 1].x, y1: px[i + 1].y
+          });
         }
-        return d;
+        return result;
       }
       pointWindow(points, xRange) {
-        let start = 0;
-        let end = points.length;
-        let lo = 0;
-        let hi = points.length;
-        while (lo < hi) {
-          const mid = Math.floor((lo + hi) / 2);
-          if (points[mid].x < xRange.min) lo = mid + 1; else hi = mid;
-        }
+        let start = 0, end = points.length;
+        let lo = 0, hi = points.length;
+        while (lo < hi) { const mid = Math.floor((lo + hi) / 2); if (points[mid].x < xRange.min) lo = mid + 1; else hi = mid; }
         start = Math.max(0, lo - 1);
-        lo = 0;
-        hi = points.length;
-        while (lo < hi) {
-          const mid = Math.floor((lo + hi) / 2);
-          if (points[mid].x <= xRange.max) lo = mid + 1; else hi = mid;
-        }
+        lo = 0; hi = points.length;
+        while (lo < hi) { const mid = Math.floor((lo + hi) / 2); if (points[mid].x <= xRange.max) lo = mid + 1; else hi = mid; }
         end = Math.min(points.length, lo + 1);
         return points.slice(start, end);
       }
-      pathFor(dataset, xRange, yRange, area) {
-        let d = '';
+      drawDataset(dataset, xRange, yRange, area) {
+        const ctx = this.ctx;
         let segment = [];
         const flush = () => {
-          if (segment.length) d += this.segmentPath(segment);
-          segment = [];
+          if (segment.length) {
+            const beziers = this.segmentVertexData(segment, xRange, yRange, area);
+            if (beziers.length) {
+              ctx.beginPath();
+              ctx.moveTo(beziers[0].x0, beziers[0].y0);
+              for (const b of beziers) {
+                if (b.x0 === b.x1 && b.y0 === b.y1) { ctx.lineTo(b.x1 + 1, b.y1); }
+                else { ctx.bezierCurveTo(b.c1x, b.c1y, b.c2x, b.c2y, b.x1, b.y1); }
+              }
+              ctx.stroke();
+            }
+            segment = [];
+          }
         };
         for (const point of this.pointWindow(dataset.data, xRange)) {
           if (point.y === null || !Number.isFinite(point.y) || point.x < xRange.min || point.x > xRange.max) {
             flush();
             continue;
           }
-          segment.push(this.pointToPixel(point, xRange, yRange, area));
+          segment.push(point);
         }
         flush();
-        return d;
-      }
-      appendEl(parent, name, attrs) {
-        const el = document.createElementNS('http://www.w3.org/2000/svg', name);
-        Object.entries(attrs || {}).forEach(([key, value]) => el.setAttribute(key, String(value)));
-        parent.appendChild(el);
-        return el;
       }
       niceStep(rawStep) {
         const exponent = Math.floor(Math.log10(Math.max(1, rawStep)));
@@ -1510,31 +1505,13 @@ const dashboardHTML = `<!doctype html>
         return ticks.length >= 2 ? ticks : [0, top || step];
       }
       xStepMs(span) {
-        const steps = [
-          60 * 1000,
-          5 * 60 * 1000,
-          15 * 60 * 1000,
-          30 * 60 * 1000,
-          60 * 60 * 1000,
-          2 * 60 * 60 * 1000,
-          3 * 60 * 60 * 1000,
-          6 * 60 * 60 * 1000,
-          12 * 60 * 60 * 1000,
-          24 * 60 * 60 * 1000,
-          2 * 24 * 60 * 60 * 1000,
-          7 * 24 * 60 * 60 * 1000,
-          14 * 24 * 60 * 60 * 1000,
-          30 * 24 * 60 * 60 * 1000
-        ];
+        const steps = [60*1000,5*60*1000,15*60*1000,30*60*1000,60*60*1000,2*60*60*1000,3*60*60*1000,6*60*60*1000,12*60*60*1000,24*60*60*1000,2*24*60*60*1000,7*24*60*60*1000,14*24*60*60*1000,30*24*60*60*1000];
         const target = window.innerWidth <= 760 ? 4 : 7;
         const dataStep = this.dataStepMs();
         return steps.find(step => step >= dataStep && span / step <= target) || steps[steps.length - 1];
       }
       dataStepMs() {
-        const gaps = this.visibleDatasets()
-          .map(dataset => dataset.typicalGap)
-          .filter(gap => Number.isFinite(gap) && gap > 0)
-          .sort((a, b) => a - b);
+        const gaps = this.visibleDatasets().map(d => d.typicalGap).filter(g => Number.isFinite(g) && g > 0).sort((a, b) => a - b);
         return gaps.length ? gaps[Math.floor(gaps.length / 2)] : minChartGapMs;
       }
       xTicks(xRange) {
@@ -1542,10 +1519,7 @@ const dashboardHTML = `<!doctype html>
         const step = this.xStepMs(span);
         const ticks = [xRange.min];
         let value = Math.ceil(xRange.min / step) * step;
-        while (value < xRange.max) {
-          if (value > xRange.min) ticks.push(value);
-          value += step;
-        }
+        while (value < xRange.max) { if (value > xRange.min) ticks.push(value); value += step; }
         if (ticks[ticks.length - 1] !== xRange.max) ticks.push(xRange.max);
         return ticks;
       }
@@ -1555,9 +1529,9 @@ const dashboardHTML = `<!doctype html>
         const pixelFor = value => area.left + (value - xRange.min) / Math.max(1, xRange.max - xRange.min) * (area.right - area.left);
         for (const value of ticks) {
           const x = pixelFor(value);
-          const width = measure(value);
-          const start = x - width / 2;
-          const end = x + width / 2;
+          const w = measure(value);
+          const start = x - w / 2;
+          const end = x + w / 2;
           const last = placed[placed.length - 1];
           if (!last || start > last.end + 8 || value === xRange.max) {
             if (value === xRange.max && last && start <= last.end + 8 && last.value !== xRange.min) placed.pop();
@@ -1567,21 +1541,32 @@ const dashboardHTML = `<!doctype html>
         return placed.map(item => item.value);
       }
       renderAxes(area, xRange, yRange) {
-        const grid = this.appendEl(this.svg, 'g', {stroke: '#e7ebf1', 'stroke-width': 1});
-        const labels = this.appendEl(this.svg, 'g', {fill: '#64748b', 'font-size': 11});
+        const ctx = this.ctx;
+        ctx.strokeStyle = '#e7ebf1';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([]);
         this.yTicks(yRange).forEach(value => {
           const y = area.bottom - (value - yRange.min) / Math.max(1, yRange.max - yRange.min) * (area.bottom - area.top);
           if (y < area.top - 1 || y > area.bottom + 1) return;
-          this.appendEl(grid, 'line', {x1: area.left, x2: area.right, y1: y, y2: y});
-          const text = this.appendEl(labels, 'text', {x: 4, y, 'dominant-baseline': value === 0 ? 'auto' : 'middle'});
-          text.textContent = value === 0 ? '0' : Math.round(value) + 'ms';
+          ctx.beginPath();
+          ctx.moveTo(area.left, y);
+          ctx.lineTo(area.right, y);
+          ctx.stroke();
+          ctx.fillStyle = '#64748b';
+          ctx.font = '11px system-ui, sans-serif';
+          ctx.textAlign = 'left';
+          ctx.textBaseline = value === 0 ? 'top' : 'middle';
+          ctx.fillText(value === 0 ? '0' : Math.round(value) + 'ms', 4, value === 0 ? y + 2 : y);
         });
         const xTicks = this.visibleXTicks(this.xTicks(xRange), xRange, area);
         xTicks.forEach((value, index) => {
           const x = area.left + (value - xRange.min) / Math.max(1, xRange.max - xRange.min) * (area.right - area.left);
-          const anchor = index === 0 ? 'start' : index === xTicks.length - 1 ? 'end' : 'middle';
-          const text = this.appendEl(labels, 'text', {x, y: area.height - 8, 'text-anchor': anchor});
-          text.textContent = formatTimeTick(value);
+          const anchor = index === 0 ? 'left' : index === xTicks.length - 1 ? 'right' : 'center';
+          ctx.fillStyle = '#64748b';
+          ctx.font = '11px system-ui, sans-serif';
+          ctx.textAlign = anchor;
+          ctx.textBaseline = 'top';
+          ctx.fillText(formatTimeTick(value), x, area.height - 8);
         });
       }
       update() {
@@ -1593,16 +1578,28 @@ const dashboardHTML = `<!doctype html>
           const yRange = this.yRange(xRange);
           this.lastArea = area;
           this.lastXRange = xRange;
-          this.svg.setAttribute('viewBox', '0 0 ' + area.width + ' ' + area.height);
-          this.svg.replaceChildren();
+          const dpr = window.devicePixelRatio || 1;
+          this.canvas.width = Math.round(area.width * dpr);
+          this.canvas.height = Math.round(area.height * dpr);
+          this.canvas.style.width = area.width + 'px';
+          this.canvas.style.height = area.height + 'px';
+          const ctx = this.ctx;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, area.width, area.height);
           if (!this.options.mini) this.renderAxes(area, xRange, yRange);
-          const lines = this.appendEl(this.svg, 'g', {fill: 'none', 'stroke-linecap': 'round', 'stroke-linejoin': 'round'});
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(area.left, area.top, area.right - area.left, area.bottom - area.top);
+          ctx.clip();
           this.data.datasets.forEach((dataset, index) => {
             if (!this.isDatasetVisible(index)) return;
-            const d = this.pathFor(dataset, xRange, yRange, area);
-            if (!d) return;
-            this.appendEl(lines, 'path', {d, stroke: dataset.borderColor, 'stroke-width': this.options.mini ? 1.6 : 2});
+            ctx.strokeStyle = dataset.borderColor;
+            ctx.lineWidth = this.options.mini ? 1.6 : 2;
+            ctx.lineJoin = 'round';
+            ctx.setLineDash([]);
+            this.drawDataset(dataset, xRange, yRange, area);
           });
+          ctx.restore();
           this.updateHoverLine();
         });
       }
@@ -1631,12 +1628,8 @@ const dashboardHTML = `<!doctype html>
       }
       nearestInDataset(dataset, xValue) {
         const points = dataset.data;
-        let lo = 0;
-        let hi = points.length - 1;
-        while (lo < hi) {
-          const mid = Math.floor((lo + hi) / 2);
-          if (points[mid].x < xValue) lo = mid + 1; else hi = mid;
-        }
+        let lo = 0, hi = points.length - 1;
+        while (lo < hi) { const mid = Math.floor((lo + hi) / 2); if (points[mid].x < xValue) lo = mid + 1; else hi = mid; }
         let best = null;
         [lo - 2, lo - 1, lo, lo + 1, lo + 2].forEach(index => {
           const point = points[index];
@@ -1675,9 +1668,33 @@ const dashboardHTML = `<!doctype html>
         this.lastPointerClientY = clientY;
         cancelAnimationFrame(this.tooltipRaf);
         this.tooltipRaf = requestAnimationFrame(() => {
-          if (this.tooltipActive) showSvgTooltip(this, clientX, clientY);
+          if (this.tooltipActive) showChartTooltip(this, clientX, clientY);
         });
       }
+    }
+    function lttb(points, targetCount) {
+      const n = points.length;
+      if (n <= targetCount || targetCount < 3) return points.slice();
+      const result = new Array(targetCount);
+      result[0] = points[0];
+      result[targetCount - 1] = points[n - 1];
+      const bucketSize = (n - 2) / (targetCount - 2);
+      let idx = 0;
+      for (let i = 0; i < targetCount - 2; i++) {
+        const start = Math.floor(i * bucketSize) + 1;
+        const end = Math.floor((i + 1) * bucketSize) + 1;
+        const nextStart = Math.floor((i + 2) * bucketSize) + 1;
+        const endCap = Math.min(n - 1, nextStart);
+        const avgX = points[endCap].x;
+        const avgY = points[endCap].y;
+        let maxArea = -1;
+        for (let j = start; j < end; j++) {
+          const area = Math.abs((points[j].x - avgX) * (result[idx].y - points[j].y) - (points[j].x - result[idx].x) * (avgY - points[j].y));
+          if (area > maxArea) { maxArea = area; result[i + 1] = points[j]; }
+        }
+        idx = i + 1;
+      }
+      return result;
     }
     function buildDatasets(rows) {
       const grouped = new Map();
@@ -1689,10 +1706,12 @@ const dashboardHTML = `<!doctype html>
         if (!grouped.has(key)) grouped.set(key, []);
         grouped.get(key).push({x: ts, y: row.average_latency_ms});
       }
+      const maxPoints = 600;
       const datasets = Array.from(grouped.entries()).map(([label, points], index) => {
         points.sort((a, b) => a.x - b.x);
         const typicalGap = medianInterval(points);
-        const displayPoints = splitLongGaps(points, typicalGap);
+        let displayPoints = splitLongGaps(points, typicalGap);
+        if (displayPoints.length > maxPoints) displayPoints = lttb(displayPoints, maxPoints);
         return {
           label,
           data: displayPoints,
@@ -1837,7 +1856,7 @@ const dashboardHTML = `<!doctype html>
         chart.updateHoverLine();
       }
     }
-    function showSvgTooltip(chart, clientX, clientY) {
+    function showChartTooltip(chart, clientX, clientY) {
       const tooltipData = chart.tooltipPoints(clientX);
       const tooltip = chartTooltip();
       if (!tooltipData.items.length) {
@@ -1870,35 +1889,16 @@ const dashboardHTML = `<!doctype html>
         return;
       }
       chart.lastTooltipX = tooltipData.xValue;
-      tooltip.innerHTML = '';
-      const title = document.createElement('div');
-      title.className = 'chart-tooltip-title';
-      title.textContent = new Date(tooltipData.xValue).toLocaleString();
-      tooltip.appendChild(title);
-      const compactTooltip = window.matchMedia('(max-width: 760px), (pointer: coarse)').matches;
-      const maxItems = compactTooltip ? 8 : 18;
-      tooltipData.items.slice(0, maxItems).forEach(item => {
-        const row = document.createElement('div');
-        row.className = 'chart-tooltip-row';
-        const swatch = document.createElement('span');
-        swatch.className = 'chart-tooltip-swatch';
-        swatch.style.background = item.dataset.borderColor;
-        const name = document.createElement('span');
-        name.className = 'chart-tooltip-name';
-        name.textContent = item.dataset.label;
-        const value = document.createElement('span');
-        value.className = 'chart-tooltip-value';
-        value.textContent = item.point.y.toFixed(2) + ' ms';
-        row.append(swatch, name, value);
-        tooltip.appendChild(row);
-      });
+      const compact = window.matchMedia('(max-width: 760px), (pointer: coarse)').matches;
+      const maxItems = compact ? 8 : 18;
+      let html = '<div class="chart-tooltip-title">' + new Date(tooltipData.xValue).toLocaleString() + '</div>';
+      const visible = tooltipData.items.slice(0, maxItems);
+      for (const item of visible) {
+        html += '<div class="chart-tooltip-row"><span class="chart-tooltip-swatch" style="background:' + item.dataset.borderColor + '"></span><span class="chart-tooltip-name">' + item.dataset.label + '</span><span class="chart-tooltip-value">' + item.point.y.toFixed(2) + ' ms</span></div>';
+      }
       const hiddenCount = tooltipData.items.length - maxItems;
-      if (hiddenCount > 0) {
-        const more = document.createElement('div');
-        more.className = 'chart-tooltip-more';
-        more.textContent = '还有 ' + hiddenCount + ' 项';
-          tooltip.appendChild(more);
-        }
+      if (hiddenCount > 0) html += '<div class="chart-tooltip-more">\u8fd8\u6709 ' + hiddenCount + ' \u9879</div>';
+      tooltip.innerHTML = html;
       positionTooltip();
     }
     function attachChartZoomHandlers(chart) {
@@ -2068,7 +2068,7 @@ const dashboardHTML = `<!doctype html>
         surface.__miniChart.setData(chartData);
         return;
       }
-      const miniChart = new SvgLineChart(surface, chartData, {mini: true, smooth: true, scales: {x: {}}});
+      const miniChart = new CanvasLineChart(surface, chartData, {mini: true, smooth: true, scales: {x: {}}});
       surface.__miniChart = miniChart;
       miniCharts.add(miniChart);
     }
@@ -2271,7 +2271,7 @@ const dashboardHTML = `<!doctype html>
         applyDetailChartRange('none');
         return;
       }
-      detailChart = new SvgLineChart(document.getElementById('latency'), chartData, {mini: false, smooth: true, deferUpdate: true, scales: {x: {}}});
+      detailChart = new CanvasLineChart(document.getElementById('latency'), chartData, {mini: false, smooth: true, deferUpdate: true, scales: {x: {}}});
       attachChartZoomHandlers(detailChart);
       renderToggles(detailChart);
       applyDetailChartRange('none');
@@ -2347,6 +2347,7 @@ const dashboardHTML = `<!doctype html>
       const scrollY = window.scrollY;
       const [rows, agents] = await Promise.all([loadResults(), loadAgents()]);
       currentAgents = agents;
+      _agentHash = agentHash(agents);
       renderDashboardRows(rows);
       requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
     }
@@ -2356,6 +2357,7 @@ const dashboardHTML = `<!doctype html>
       currentRows = mergeRows(currentRows, rows);
       try {
         currentAgents = await loadAgents();
+        _agentHash = agentHash(currentAgents);
       } catch (err) {
         console.warn(err);
       }
@@ -2473,10 +2475,19 @@ const dashboardHTML = `<!doctype html>
       hideChartTooltip(detailChart);
     });
     refreshDashboard().catch(handleRefreshError);
+    let _agentHash = '';
+    function agentHash(agents) {
+      return agents.map(a => a.agent + '\x00' + a.status + '\x00' + (a.cache_status || '')).sort().join('|');
+    }
     window.setInterval(async () => {
       try {
-        currentAgents = await loadAgents();
-        renderDashboardRows(currentRows);
+        const agents = await loadAgents();
+        const hash = agentHash(agents);
+        if (hash !== _agentHash) {
+          _agentHash = hash;
+          currentAgents = agents;
+          renderDashboardRows(currentRows);
+        }
       } catch (err) {
         console.warn(err);
       }
