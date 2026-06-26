@@ -5,21 +5,22 @@ const dashboardHTML = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PingMon Supervisor</title>
+  <title>PingMon 连通性面板</title>
   <style>
     :root {
       color-scheme: light;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --line: #d9dee7;
-      --text: #18202b;
-      --muted: #657184;
-      --ok: #11875d;
-      --warn: #b76b00;
-      --bad: #c73737;
-      --blue: #2458d3;
-      --ink: #0e1624;
-      --shadow: 0 10px 28px rgba(24, 32, 43, .08);
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-soft: #f9fafb;
+      --line: #d8dee8;
+      --text: #17202c;
+      --muted: #667386;
+      --ok: #13835d;
+      --warn: #a56500;
+      --bad: #be3a3a;
+      --blue: #2457c5;
+      --cyan: #007d89;
+      --shadow: 0 12px 30px rgba(23, 32, 44, .08);
     }
     * { box-sizing: border-box; }
     body {
@@ -29,23 +30,23 @@ const dashboardHTML = `<!doctype html>
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     button, select, input { font: inherit; }
-    .shell {
+    .app {
       min-height: 100vh;
       display: grid;
-      grid-template-columns: 280px minmax(0, 1fr);
+      grid-template-columns: 292px minmax(0, 1fr);
     }
     aside {
-      border-right: 1px solid var(--line);
-      background: #fbfcfe;
-      padding: 18px;
+      height: 100vh;
       position: sticky;
       top: 0;
-      height: 100vh;
       overflow: auto;
+      border-right: 1px solid var(--line);
+      background: #fbfcfd;
+      padding: 18px;
     }
     main {
       min-width: 0;
-      padding: 18px 22px 28px;
+      padding: 20px 24px 32px;
     }
     .brand {
       display: flex;
@@ -58,25 +59,27 @@ const dashboardHTML = `<!doctype html>
       margin: 0;
       font-size: 20px;
       letter-spacing: 0;
-      color: var(--ink);
     }
     .live {
       border: 1px solid var(--line);
       border-radius: 999px;
-      padding: 4px 9px;
+      padding: 4px 10px;
       color: var(--muted);
       background: #fff;
       font-size: 12px;
       white-space: nowrap;
     }
-    .live.ok { color: var(--ok); border-color: rgba(17, 135, 93, .3); }
-    .live.warn { color: var(--warn); border-color: rgba(183, 107, 0, .3); }
-    .controls {
+    .live.ok { color: var(--ok); border-color: rgba(19, 131, 93, .32); }
+    .live.warn { color: var(--warn); border-color: rgba(165, 101, 0, .32); }
+    .filters {
       display: grid;
       gap: 10px;
-      margin-bottom: 16px;
+      margin-bottom: 18px;
     }
-    .field { display: grid; gap: 5px; }
+    .field {
+      display: grid;
+      gap: 5px;
+    }
     .field span {
       color: var(--muted);
       font-size: 12px;
@@ -87,42 +90,39 @@ const dashboardHTML = `<!doctype html>
       border-radius: 7px;
       background: #fff;
       color: var(--text);
-      padding: 8px 9px;
+      padding: 8px 10px;
     }
-    .agent-list {
+    .server-list {
       display: grid;
       gap: 7px;
     }
-    .agent-row {
+    .server {
       width: 100%;
       display: grid;
       grid-template-columns: 1fr auto;
-      gap: 6px;
+      gap: 5px 8px;
       align-items: center;
       border: 1px solid transparent;
+      border-radius: 8px;
       background: transparent;
+      padding: 9px;
       text-align: left;
-      border-radius: 7px;
-      padding: 8px;
       cursor: pointer;
       color: var(--text);
     }
-    .agent-row:hover, .agent-row.active {
+    .server:hover, .server.active {
+      border-color: #c7d5fa;
       background: #eef3ff;
-      border-color: #c9d7ff;
     }
-    .agent-row strong {
+    .server strong, .server small {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      font-size: 13px;
     }
-    .agent-row small {
+    .server strong { font-size: 13px; }
+    .server small {
       grid-column: 1 / -1;
       color: var(--muted);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
     }
     .dot {
       width: 9px;
@@ -132,21 +132,20 @@ const dashboardHTML = `<!doctype html>
     }
     .dot.online { background: var(--ok); }
     .dot.offline { background: var(--bad); }
-    .topbar {
+    .top {
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
       gap: 16px;
-      margin-bottom: 18px;
+      margin-bottom: 16px;
     }
     .title h2 {
       margin: 0;
       font-size: 24px;
       letter-spacing: 0;
-      color: var(--ink);
     }
     .title p {
-      margin: 4px 0 0;
+      margin: 5px 0 0;
       color: var(--muted);
     }
     .actions {
@@ -155,7 +154,7 @@ const dashboardHTML = `<!doctype html>
       flex-wrap: wrap;
       justify-content: flex-end;
     }
-    .icon-btn, .danger-btn {
+    .btn {
       min-height: 36px;
       border: 1px solid var(--line);
       border-radius: 7px;
@@ -164,42 +163,41 @@ const dashboardHTML = `<!doctype html>
       padding: 7px 11px;
       cursor: pointer;
     }
-    .icon-btn:hover { border-color: #b8c4d6; }
-    .danger-btn {
+    .btn:hover { border-color: #b6c2d2; }
+    .btn.danger {
       color: var(--bad);
-      border-color: rgba(199, 55, 55, .35);
+      border-color: rgba(190, 58, 58, .35);
     }
-    .danger-btn[hidden] { display: none; }
-    .metrics {
+    .btn[hidden] { display: none; }
+    .summary {
       display: grid;
-      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      grid-template-columns: repeat(5, minmax(128px, 1fr));
       gap: 10px;
       margin-bottom: 14px;
     }
     .metric, .panel {
-      background: var(--panel);
+      background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 8px;
       box-shadow: var(--shadow);
     }
     .metric {
+      min-height: 84px;
       padding: 12px;
-      min-height: 82px;
     }
     .metric span {
       display: block;
+      margin-bottom: 8px;
       color: var(--muted);
       font-size: 12px;
-      margin-bottom: 8px;
     }
     .metric strong {
-      font-size: 23px;
-      color: var(--ink);
+      font-size: 24px;
       letter-spacing: 0;
     }
-    .grid {
+    .layout {
       display: grid;
-      grid-template-columns: minmax(0, 1.25fr) minmax(360px, .75fr);
+      grid-template-columns: minmax(0, 1.35fr) minmax(360px, .65fr);
       gap: 14px;
       align-items: start;
     }
@@ -214,12 +212,12 @@ const dashboardHTML = `<!doctype html>
       gap: 12px;
       padding: 12px 14px;
       border-bottom: 1px solid var(--line);
+      background: var(--surface-soft);
     }
     .panel-head h3 {
       margin: 0;
       font-size: 15px;
       letter-spacing: 0;
-      color: var(--ink);
     }
     .panel-head span {
       color: var(--muted);
@@ -227,9 +225,9 @@ const dashboardHTML = `<!doctype html>
     }
     .chart {
       width: 100%;
-      height: 260px;
+      height: 280px;
       display: block;
-      background: linear-gradient(#fff, #fafbfc);
+      background: linear-gradient(#fff, #fbfcfd);
     }
     table {
       width: 100%;
@@ -244,9 +242,9 @@ const dashboardHTML = `<!doctype html>
     }
     th {
       color: var(--muted);
-      font-weight: 600;
       font-size: 12px;
-      background: #fbfcfe;
+      font-weight: 650;
+      background: var(--surface-soft);
     }
     td.wrap {
       white-space: normal;
@@ -259,20 +257,20 @@ const dashboardHTML = `<!doctype html>
       border-radius: 999px;
       padding: 2px 8px;
       font-size: 12px;
-      background: #eef1f5;
+      background: #edf1f5;
       color: var(--muted);
       white-space: nowrap;
     }
-    .badge.ok { background: rgba(17, 135, 93, .12); color: var(--ok); }
-    .badge.warn { background: rgba(183, 107, 0, .14); color: var(--warn); }
-    .badge.bad { background: rgba(199, 55, 55, .12); color: var(--bad); }
+    .badge.ok { background: rgba(19, 131, 93, .12); color: var(--ok); }
+    .badge.warn { background: rgba(165, 101, 0, .14); color: var(--warn); }
+    .badge.bad { background: rgba(190, 58, 58, .12); color: var(--bad); }
     .empty {
-      padding: 22px;
+      padding: 24px;
       color: var(--muted);
       text-align: center;
     }
-    @media (max-width: 980px) {
-      .shell { grid-template-columns: 1fr; }
+    @media (max-width: 1020px) {
+      .app { grid-template-columns: 1fr; }
       aside {
         position: static;
         height: auto;
@@ -280,85 +278,88 @@ const dashboardHTML = `<!doctype html>
         border-bottom: 1px solid var(--line);
       }
       main { padding: 16px; }
-      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .grid { grid-template-columns: 1fr; }
+      .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .layout { grid-template-columns: 1fr; }
     }
-    @media (max-width: 620px) {
-      .topbar { display: grid; }
+    @media (max-width: 640px) {
+      .top { display: grid; }
       .actions { justify-content: flex-start; }
-      .metrics { grid-template-columns: 1fr; }
+      .summary { grid-template-columns: 1fr; }
       th, td { padding: 8px; }
     }
   </style>
 </head>
 <body>
-  <div class="shell">
+  <div class="app">
     <aside>
       <div class="brand">
         <h1>PingMon</h1>
         <span id="liveState" class="live">连接中</span>
       </div>
-      <div class="controls">
+      <div class="filters">
         <label class="field">
-          <span>时间范围</span>
+          <span>观察窗口</span>
           <select id="rangeSelect">
             {{range .Ranges}}<option value="{{.}}" {{if eq . $.DefaultRange}}selected{{end}}>{{.}}</option>{{end}}
           </select>
         </label>
         <label class="field">
-          <span>自定义范围</span>
-          <input id="customRange" placeholder="例如 45m、6h、10d、2w、3mo">
+          <span>自定义窗口</span>
+          <input id="customRange" placeholder="45m / 6h / 10d / 2w / 3mo">
         </label>
       </div>
-      <div id="agentList" class="agent-list"></div>
+      <div id="serverList" class="server-list"></div>
     </aside>
     <main>
-      <div class="topbar">
+      <div class="top">
         <div class="title">
-          <h2 id="viewTitle">Supervisor</h2>
-          <p id="viewSubtitle">加载数据中</p>
+          <h2 id="viewTitle">服务器连通性</h2>
+          <p id="viewSubtitle">正在载入连通性数据</p>
         </div>
         <div class="actions">
-          <button id="backButton" class="icon-btn" hidden title="返回全部节点">全部节点</button>
-          <button id="refreshButton" class="icon-btn" title="刷新">刷新</button>
-          <button id="deleteAgentButton" class="danger-btn" hidden title="删除离线节点数据">删除节点</button>
+          <button id="backButton" class="btn" hidden title="查看全部服务器">全部服务器</button>
+          <button id="refreshButton" class="btn" title="刷新">刷新</button>
+          <button id="deleteAgentButton" class="btn danger" hidden title="删除离线服务器历史数据">删除离线服务器</button>
         </div>
       </div>
-      <section class="metrics" id="metrics"></section>
-      <section class="grid">
+
+      <section class="summary" id="summary"></section>
+
+      <section class="layout">
         <div class="panel">
           <div class="panel-head">
-            <h3>趋势</h3>
+            <h3>出站连通性趋势</h3>
             <span id="chartMeta"></span>
           </div>
-          <svg id="chart" class="chart" role="img" aria-label="监控趋势"></svg>
+          <svg id="chart" class="chart" role="img" aria-label="服务器出站连通性趋势"></svg>
         </div>
         <div class="panel">
           <div class="panel-head">
-            <h3>异常</h3>
+            <h3>连接失败与抖动</h3>
             <span id="problemMeta"></span>
           </div>
           <div style="overflow:auto">
             <table>
               <thead>
-                <tr><th>时间</th><th>级别</th><th>节点</th><th>目标</th><th>成功率</th></tr>
+                <tr><th>时间</th><th>级别</th><th>服务器</th><th>探测点</th><th>连通率</th></tr>
               </thead>
               <tbody id="problemBody"></tbody>
             </table>
           </div>
         </div>
       </section>
+
       <section class="panel" style="margin-top:14px">
         <div class="panel-head">
-          <h3>目标</h3>
-          <span id="targetMeta"></span>
+          <h3>探测点连通性</h3>
+          <span id="probeMeta"></span>
         </div>
         <div style="overflow:auto">
           <table>
             <thead>
-              <tr><th>节点</th><th>目标</th><th>地址</th><th>标签</th><th>样本</th><th>成功率</th><th>延迟</th><th>最后检查</th></tr>
+              <tr><th>服务器</th><th>探测点</th><th>地址</th><th>标签</th><th>样本</th><th>连通率</th><th>延迟</th><th>最后探测</th></tr>
             </thead>
-            <tbody id="targetBody"></tbody>
+            <tbody id="probeBody"></tbody>
           </table>
         </div>
       </section>
@@ -375,14 +376,14 @@ const dashboardHTML = `<!doctype html>
       live: document.getElementById('liveState'),
       range: document.getElementById('rangeSelect'),
       customRange: document.getElementById('customRange'),
-      agentList: document.getElementById('agentList'),
+      serverList: document.getElementById('serverList'),
       title: document.getElementById('viewTitle'),
       subtitle: document.getElementById('viewSubtitle'),
-      metrics: document.getElementById('metrics'),
+      summary: document.getElementById('summary'),
       chart: document.getElementById('chart'),
       chartMeta: document.getElementById('chartMeta'),
-      targetBody: document.getElementById('targetBody'),
-      targetMeta: document.getElementById('targetMeta'),
+      probeBody: document.getElementById('probeBody'),
+      probeMeta: document.getElementById('probeMeta'),
       problemBody: document.getElementById('problemBody'),
       problemMeta: document.getElementById('problemMeta'),
       refresh: document.getElementById('refreshButton'),
@@ -417,51 +418,51 @@ const dashboardHTML = `<!doctype html>
     function metric(label, value) {
       return '<div class="metric"><span>' + esc(label) + '</span><strong>' + esc(value) + '</strong></div>';
     }
-    function renderMetrics(summary) {
-      els.metrics.innerHTML = [
-        metric('在线节点', summary.agents_online + ' / ' + summary.agents_total),
-        metric('目标', summary.targets),
-        metric('成功率', fmtPct(summary.success_rate)),
-        metric('平均延迟', fmtMs(summary.average_latency_ms)),
-        metric('异常样本', summary.problems)
+    function renderSummary(summary) {
+      els.summary.innerHTML = [
+        metric('在线服务器', summary.agents_online + ' / ' + summary.agents_total),
+        metric('探测点', summary.probe_points ?? summary.targets),
+        metric('整体连通率', fmtPct(summary.success_rate)),
+        metric('平均连接延迟', fmtMs(summary.average_latency_ms)),
+        metric('失败/抖动样本', summary.problems)
       ].join('');
     }
-    function renderAgents(agents) {
+    function renderServers(servers) {
       const all = document.createElement('button');
-      all.className = 'agent-row' + (state.agent ? '' : ' active');
-      all.innerHTML = '<strong>全部节点</strong><span class="dot online"></span><small>查看全局状态</small>';
-      all.onclick = () => selectAgent('');
-      els.agentList.replaceChildren(all);
-      if (!agents.length) {
+      all.className = 'server' + (state.agent ? '' : ' active');
+      all.innerHTML = '<strong>全部服务器</strong><span class="dot online"></span><small>汇总所有 agent 的出站连通性</small>';
+      all.onclick = () => selectServer('');
+      els.serverList.replaceChildren(all);
+      if (!servers.length) {
         const empty = document.createElement('div');
         empty.className = 'empty';
-        empty.textContent = '暂无节点';
-        els.agentList.appendChild(empty);
+        empty.textContent = '暂无服务器上报';
+        els.serverList.appendChild(empty);
         return;
       }
-      agents.forEach(agent => {
+      servers.forEach(server => {
         const button = document.createElement('button');
-        button.className = 'agent-row' + (state.agent === agent.agent ? ' active' : '');
+        button.className = 'server' + (state.agent === server.agent ? ' active' : '');
         button.innerHTML =
-          '<strong>' + esc(agent.agent) + '</strong>' +
-          '<span class="dot ' + esc(agent.status) + '"></span>' +
-          '<small>' + esc(agent.agent_ip || '未知 IP') + ' · ' + fmtPct(agent.success_rate) + ' · ' + fmtTime(agent.updated_at) + '</small>';
-        button.onclick = () => selectAgent(agent.agent);
-        els.agentList.appendChild(button);
+          '<strong>' + esc(server.agent) + '</strong>' +
+          '<span class="dot ' + esc(server.status) + '"></span>' +
+          '<small>' + esc(server.agent_ip || '未知 IP') + ' · ' + fmtPct(server.success_rate) + ' · ' + fmtTime(server.updated_at) + '</small>';
+        button.onclick = () => selectServer(server.agent);
+        els.serverList.appendChild(button);
       });
     }
-    function renderTargets(targets) {
-      els.targetMeta.textContent = targets.length + ' 个目标';
-      els.targetBody.innerHTML = '';
-      if (!targets.length) {
-        els.targetBody.innerHTML = '<tr><td colspan="8" class="empty">暂无目标数据</td></tr>';
+    function renderProbes(probes) {
+      els.probeMeta.textContent = probes.length + ' 个探测点';
+      els.probeBody.innerHTML = '';
+      if (!probes.length) {
+        els.probeBody.innerHTML = '<tr><td colspan="8" class="empty">当前窗口没有连通性样本</td></tr>';
         return;
       }
-      targets.forEach(row => {
+      probes.forEach(row => {
         const rateClass = row.success_rate >= .99 ? 'ok' : row.success_rate > 0 ? 'warn' : 'bad';
         const labels = (row.labels || []).map(label => '<span class="badge">' + esc(label) + '</span>').join(' ');
-        els.targetBody.insertAdjacentHTML('beforeend',
-          '<tr><td>' + esc(row.agent) + '</td><td class="wrap">' + esc(row.target_name) + '</td><td>' + esc(row.address + ':' + row.port) + '</td>' +
+        els.probeBody.insertAdjacentHTML('beforeend',
+          '<tr><td>' + esc(row.agent) + '</td><td class="wrap">' + esc(row.probe_name || row.target_name) + '</td><td>' + esc(row.address + ':' + row.port) + '</td>' +
           '<td class="wrap">' + labels + '</td><td>' + row.samples + '</td><td><span class="badge ' + rateClass + '">' + fmtPct(row.success_rate) + '</span></td>' +
           '<td>' + fmtMs(row.average_latency_ms) + '</td><td>' + fmtTime(row.last_checked_at) + '</td></tr>');
       });
@@ -470,38 +471,38 @@ const dashboardHTML = `<!doctype html>
       els.problemMeta.textContent = problems.length + ' 条';
       els.problemBody.innerHTML = '';
       if (!problems.length) {
-        els.problemBody.innerHTML = '<tr><td colspan="5" class="empty">当前范围没有异常</td></tr>';
+        els.problemBody.innerHTML = '<tr><td colspan="5" class="empty">当前窗口没有连接失败</td></tr>';
         return;
       }
       problems.forEach(row => {
         const cls = row.severity === 'ERROR' ? 'bad' : 'warn';
         els.problemBody.insertAdjacentHTML('beforeend',
           '<tr><td>' + fmtTime(row.checked_at) + '</td><td><span class="badge ' + cls + '">' + esc(row.severity) + '</span></td>' +
-          '<td>' + esc(row.agent) + '</td><td class="wrap">' + esc(row.target_name + ' ' + row.address + ':' + row.port) + '</td><td>' + fmtPct(row.success_rate) + '</td></tr>');
+          '<td>' + esc(row.agent) + '</td><td class="wrap">' + esc((row.probe_name || row.target_name) + ' · ' + row.address + ':' + row.port) + '</td><td>' + fmtPct(row.success_rate) + '</td></tr>');
       });
     }
     function renderChart(points) {
       const svg = els.chart;
       const width = Math.max(320, svg.clientWidth || 720);
-      const height = 260;
+      const height = 280;
       svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
       svg.innerHTML = '';
-      els.chartMeta.textContent = points.length + ' 点';
+      els.chartMeta.textContent = points.length + ' 个聚合点';
       if (!points.length) {
-        svg.innerHTML = '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#657184">暂无趋势数据</text>';
+        svg.innerHTML = '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#667386">暂无趋势数据</text>';
         return;
       }
-      const pad = {l: 42, r: 16, t: 16, b: 30};
+      const pad = {l: 44, r: 16, t: 18, b: 32};
       const minT = Math.min(...points.map(p => new Date(p.timestamp).getTime()));
       const maxT = Math.max(...points.map(p => new Date(p.timestamp).getTime()));
       const maxLatency = Math.max(1, ...points.map(p => p.average_latency_ms || 0));
       const groups = new Map();
       points.forEach(p => {
-        const key = state.agent ? (p.target_name || 'target') : (p.agent || 'agent');
+        const key = state.agent ? (p.target_name || '探测点') : (p.agent || '服务器');
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(p);
       });
-      const colors = ['#2458d3', '#11875d', '#b76b00', '#c73737', '#5b5fc7', '#008999'];
+      const colors = ['#2457c5', '#13835d', '#a56500', '#be3a3a', '#5b5fc7', '#007d89'];
       function x(t) {
         if (maxT === minT) return pad.l;
         return pad.l + (new Date(t).getTime() - minT) / (maxT - minT) * (width - pad.l - pad.r);
@@ -512,7 +513,7 @@ const dashboardHTML = `<!doctype html>
       const axis = document.createElementNS('http://www.w3.org/2000/svg', 'path');
       axis.setAttribute('d', 'M' + pad.l + ' ' + pad.t + 'V' + (height - pad.b) + 'H' + (width - pad.r));
       axis.setAttribute('fill', 'none');
-      axis.setAttribute('stroke', '#d9dee7');
+      axis.setAttribute('stroke', '#d8dee8');
       svg.appendChild(axis);
       Array.from(groups.entries()).slice(0, 8).forEach(([name, rows], index) => {
         rows.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
@@ -528,12 +529,12 @@ const dashboardHTML = `<!doctype html>
     }
     function render() {
       const data = state.data;
-      renderAgents(data.agents || []);
-      renderMetrics(data.summary || {});
-      renderTargets(data.targets || []);
+      renderServers(data.agents || []);
+      renderSummary(data.summary || {});
+      renderProbes(data.targets || []);
       renderProblems(data.problems || []);
       renderChart(data.series || []);
-      els.title.textContent = state.agent || 'Supervisor';
+      els.title.textContent = state.agent ? state.agent + ' 出站连通性' : '服务器连通性';
       els.subtitle.textContent = data.range + ' · 生成于 ' + fmtTime(data.generated_at);
       els.back.hidden = !state.agent;
       const selected = (data.agents || []).find(agent => agent.agent === state.agent);
@@ -544,12 +545,12 @@ const dashboardHTML = `<!doctype html>
       history.replaceState(null, '', url);
       document.cookie = 'pingmon_range=' + encodeURIComponent(state.range) + '; Max-Age=31536000; Path=/; SameSite=Lax';
     }
-    function selectAgent(agent) {
+    function selectServer(agent) {
       state.agent = agent;
       loadOverview().catch(showError);
     }
     function showError(err) {
-      els.subtitle.textContent = '加载失败：' + err.message;
+      els.subtitle.textContent = '载入失败：' + err.message;
       els.live.textContent = '失败';
       els.live.className = 'live warn';
     }
@@ -568,9 +569,9 @@ const dashboardHTML = `<!doctype html>
       loadOverview().catch(showError);
     };
     els.refresh.onclick = () => loadOverview().catch(showError);
-    els.back.onclick = () => selectAgent('');
+    els.back.onclick = () => selectServer('');
     els.del.onclick = async () => {
-      if (!state.agent || !confirm('删除 ' + state.agent + ' 的历史数据？')) return;
+      if (!state.agent || !confirm('删除 ' + state.agent + ' 的历史连通性数据？')) return;
       const url = '/api/agents?agent=' + encodeURIComponent(state.agent);
       const res = await fetch(url, {method: 'DELETE'});
       if (!res.ok) throw new Error(await res.text() || res.statusText);

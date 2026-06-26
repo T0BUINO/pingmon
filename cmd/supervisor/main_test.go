@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -314,11 +316,41 @@ func TestBuildOverviewStreamsInsteadOfMaterializingResults(t *testing.T) {
 	if store.resultsSinceCalls != 1 {
 		t.Fatalf("stream calls = %d, want 1", store.resultsSinceCalls)
 	}
-	if overview.Summary.Targets != 2 || overview.Summary.Problems != 1 {
-		t.Fatalf("summary = %+v, want 2 targets and 1 problem", overview.Summary)
+	if overview.Summary.ProbePoints != 2 || overview.Summary.Targets != 2 || overview.Summary.Problems != 1 {
+		t.Fatalf("summary = %+v, want 2 probe points and 1 problem", overview.Summary)
+	}
+	if len(overview.Targets) != 2 || overview.Targets[0].ProbeName == "" {
+		t.Fatalf("targets should expose probe point names: %+v", overview.Targets)
 	}
 	if len(overview.Series) == 0 {
 		t.Fatalf("series should be aggregated")
+	}
+}
+
+func TestDashboardUsesServerConnectivityLanguage(t *testing.T) {
+	tpl := template.Must(template.New("dashboard").Parse(dashboardHTML))
+	var out bytes.Buffer
+	err := tpl.Execute(&out, struct {
+		Ranges        []string
+		DefaultRange  string
+		SelectedAgent string
+	}{
+		Ranges:       []string{"24h"},
+		DefaultRange: "24h",
+	})
+	if err != nil {
+		t.Fatalf("render dashboard: %v", err)
+	}
+	html := out.String()
+	for _, want := range []string{"服务器连通性", "探测点连通性", "出站连通性趋势"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("dashboard missing %q", want)
+		}
+	}
+	for _, old := range []string{"目标健康", "监控目标"} {
+		if strings.Contains(html, old) {
+			t.Fatalf("dashboard should not use target-health wording %q", old)
+		}
 	}
 }
 

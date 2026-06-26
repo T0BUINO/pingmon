@@ -68,6 +68,7 @@ type overviewSummary struct {
 	AgentsOnline   int     `json:"agents_online"`
 	AgentsTotal    int     `json:"agents_total"`
 	Targets        int     `json:"targets"`
+	ProbePoints    int     `json:"probe_points"`
 	SuccessRate    float64 `json:"success_rate"`
 	AverageLatency float64 `json:"average_latency_ms"`
 	Problems       int     `json:"problems"`
@@ -75,23 +76,25 @@ type overviewSummary struct {
 }
 
 type agentOverview struct {
-	Agent          string    `json:"agent"`
-	AgentIP        string    `json:"agent_ip,omitempty"`
-	Status         string    `json:"status"`
-	FirstSeenAt    time.Time `json:"first_seen_at"`
-	LastSeenAt     time.Time `json:"last_seen_at"`
-	TargetCount    int       `json:"target_count"`
-	Samples        int       `json:"samples"`
-	Problems       int       `json:"problems"`
-	SuccessRate    float64   `json:"success_rate"`
-	AverageLatency float64   `json:"average_latency_ms"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	Agent           string    `json:"agent"`
+	AgentIP         string    `json:"agent_ip,omitempty"`
+	Status          string    `json:"status"`
+	FirstSeenAt     time.Time `json:"first_seen_at"`
+	LastSeenAt      time.Time `json:"last_seen_at"`
+	TargetCount     int       `json:"target_count"`
+	ProbePointCount int       `json:"probe_point_count"`
+	Samples         int       `json:"samples"`
+	Problems        int       `json:"problems"`
+	SuccessRate     float64   `json:"success_rate"`
+	AverageLatency  float64   `json:"average_latency_ms"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type targetOverview struct {
 	Key            string    `json:"key"`
 	Agent          string    `json:"agent"`
 	TargetName     string    `json:"target_name"`
+	ProbeName      string    `json:"probe_name"`
 	Address        string    `json:"address"`
 	Port           int       `json:"port"`
 	Labels         []string  `json:"labels,omitempty"`
@@ -108,6 +111,7 @@ type problemOverview struct {
 	Agent          string    `json:"agent"`
 	AgentIP        string    `json:"agent_ip,omitempty"`
 	TargetName     string    `json:"target_name"`
+	ProbeName      string    `json:"probe_name"`
 	Address        string    `json:"address"`
 	Port           int       `json:"port"`
 	Severity       string    `json:"severity"`
@@ -308,7 +312,7 @@ func (s *server) checkFailureAlerts(results []model.Result) {
 		seenTargets[key] = true
 		failures, err := s.store.ConsecutiveFailures(result.TargetName, result.Address, result.Port, limit)
 		if err == nil && failures > s.cfg.FailureThreshold {
-			log.Printf("[ALERT] target=%s address=%s:%d consecutive_failures=%d threshold=%d",
+			log.Printf("[CONNECTIVITY] agent_path target=%s address=%s:%d consecutive_failures=%d threshold=%d",
 				result.TargetName, result.Address, result.Port, failures, s.cfg.FailureThreshold)
 		}
 	}
@@ -595,6 +599,7 @@ func (b *overviewBuilder) rememberProblem(row model.Result) {
 		Agent:          row.Agent,
 		AgentIP:        row.AgentIP,
 		TargetName:     row.TargetName,
+		ProbeName:      row.TargetName,
 		Address:        row.Address,
 		Port:           row.Port,
 		Severity:       resultSeverity(row),
@@ -641,6 +646,7 @@ func (b *overviewBuilder) finish() {
 	b.overview.Summary = overviewSummary{
 		AgentsTotal:    len(b.overview.Agents),
 		Targets:        len(b.overview.Targets),
+		ProbePoints:    len(b.overview.Targets),
 		SuccessRate:    b.all.successRate(),
 		AverageLatency: b.all.averageLatency(),
 		Problems:       b.all.problems,
@@ -661,17 +667,18 @@ func (b *overviewBuilder) finishAgents() {
 	for agent, agg := range b.agentAggs {
 		status := b.statuses[agent]
 		next := agentOverview{
-			Agent:          agent,
-			AgentIP:        status.AgentIP,
-			Status:         status.Status,
-			FirstSeenAt:    status.FirstSeenAt,
-			LastSeenAt:     status.LastSeenAt,
-			TargetCount:    len(b.agentTargets[agent]),
-			Samples:        agg.samples,
-			Problems:       agg.problems,
-			SuccessRate:    agg.successRate(),
-			AverageLatency: agg.averageLatency(),
-			UpdatedAt:      agg.last,
+			Agent:           agent,
+			AgentIP:         status.AgentIP,
+			Status:          status.Status,
+			FirstSeenAt:     status.FirstSeenAt,
+			LastSeenAt:      status.LastSeenAt,
+			TargetCount:     len(b.agentTargets[agent]),
+			ProbePointCount: len(b.agentTargets[agent]),
+			Samples:         agg.samples,
+			Problems:        agg.problems,
+			SuccessRate:     agg.successRate(),
+			AverageLatency:  agg.averageLatency(),
+			UpdatedAt:       agg.last,
 		}
 		if next.AgentIP == "" {
 			next.AgentIP = agg.agentIP
@@ -684,6 +691,7 @@ func (b *overviewBuilder) finishAgents() {
 				b.overview.Agents[i].AgentIP = next.AgentIP
 			}
 			b.overview.Agents[i].TargetCount = next.TargetCount
+			b.overview.Agents[i].ProbePointCount = next.ProbePointCount
 			b.overview.Agents[i].Samples = next.Samples
 			b.overview.Agents[i].Problems = next.Problems
 			b.overview.Agents[i].SuccessRate = next.SuccessRate
@@ -704,6 +712,7 @@ func (b *overviewBuilder) finishTargets() {
 			Key:            key,
 			Agent:          row.Agent,
 			TargetName:     row.TargetName,
+			ProbeName:      row.TargetName,
 			Address:        row.Address,
 			Port:           row.Port,
 			Labels:         b.targetLabels[key],
