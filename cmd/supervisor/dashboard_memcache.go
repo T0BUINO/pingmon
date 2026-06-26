@@ -176,27 +176,13 @@ func aggregateRowsByTime(rows []agentRow, since time.Time, targetCount int) []ag
 	if n <= targetCount {
 		return rows
 	}
-	newestTime := rows[0].checkedAt
-	span := newestTime - since.UnixNano()
-	if span < 1 {
-		return rows
-	}
-	bucketNanos := span / int64(targetCount)
-	if bucketNanos < 1 {
-		return rows
+	step := n / targetCount
+	if step < 1 {
+		step = 1
 	}
 	result := make([]agentRow, 0, targetCount)
-	bucketEnd := newestTime
-	rowIdx := 0
-	for b := 0; b < targetCount && rowIdx < n; b++ {
-		bucketStart := bucketEnd - bucketNanos
-		if rows[rowIdx].checkedAt >= bucketStart {
-			result = append(result, rows[rowIdx])
-			for rowIdx < n && rows[rowIdx].checkedAt >= bucketStart {
-				rowIdx++
-			}
-		}
-		bucketEnd = bucketStart
+	for i := 0; i < n; i += step {
+		result = append(result, rows[i])
 	}
 	return result
 }
