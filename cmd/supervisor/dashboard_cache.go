@@ -3,6 +3,7 @@ package main
 import (
 	"strconv"
 	"sync"
+	"time"
 
 	"pingmon/internal/model"
 )
@@ -31,7 +32,7 @@ func marshalDashboardResult(result model.Result) ([]byte, error) {
 	buf = append(buf, ',')
 	buf = appendLabels(buf, result.Labels)
 	buf = append(buf, ',')
-	buf = appendJSONString(buf, strconv.FormatInt(result.CheckedAt.UTC().UnixNano(), 36))
+	buf = appendJSONString(buf, result.CheckedAt.UTC().Format(time.RFC3339Nano))
 	buf = append(buf, ',')
 	buf = strconv.AppendInt(buf, int64(result.SuccessCount), 10)
 	buf = append(buf, ',')

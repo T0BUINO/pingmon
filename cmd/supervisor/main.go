@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"crypto/sha1"
 	"crypto/subtle"
 	"encoding/base64"
@@ -123,7 +124,7 @@ func main() {
 	mux.HandleFunc("/dashboard", s.handleDashboard)
 
 	log.Printf("supervisor listening on %s", cfg.Listen)
-	log.Fatal(http.ListenAndServe(cfg.Listen, mux))
+	log.Fatal(http.ListenAndServe(cfg.Listen, gzipHandler(mux)))
 }
 
 func (s *server) handleTasks(w http.ResponseWriter, r *http.Request) {
@@ -467,6 +468,11 @@ func (s *server) resultsSince(since time.Time, agent string) ([]model.Result, er
 }
 
 func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, agent string) {
+	if agent == "" {
+		if d := rangeDuration(selectedRange); d > 24*time.Hour {
+			selectedRange = "24h"
+		}
+	}
 	since := time.Now().Add(-rangeDuration(selectedRange))
 	rawCutoff := time.Now().AddDate(0, 0, -s.cfg.RawRetentionDays)
 
@@ -808,6 +814,29 @@ func (s *server) cleanOldData() {
 	}
 }
 
+type gzipResponseWriter struct {
+	io.Writer
+	http.ResponseWriter
+}
+
+func (w *gzipResponseWriter) Write(data []byte) (int, error) {
+	return w.Writer.Write(data)
+}
+
+func gzipHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		next.ServeHTTP(&gzipResponseWriter{Writer: gz, ResponseWriter: w}, r)
+	})
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
@@ -929,7 +958,7 @@ const dashboardHTML = `<!doctype html>
     .chart-tools button { width: 34px; padding: 0; font-size: 18px; font-weight: 600; }
     .chart-tools button:disabled { color: #94a3b8; cursor: not-allowed; }
     .chart-wrap { position: relative; height: 390px; width: 100%; touch-action: pan-y; }
-    .chart-surface { width: 100%; min-width: 0; overflow: hidden; }
+    .chart-surface { width: 100%; min-width: 0; overflow: hidden; position: relative; }
     .chart-wrap .chart-surface { position: absolute; inset: 0; height: 100%; }
     .chart-surface canvas { display: block; width: 100%; height: 100%; cursor: grab; }
     .chart-surface canvas.dragging { cursor: grabbing; }
@@ -1076,7 +1105,6 @@ const dashboardHTML = `<!doctype html>
     const colors = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#d97706', '#0891b2', '#be123c', '#4f46e5'];
     const maxProblemLogRows = 200;
     const minChartGapMs = 5 * 60 * 1000;
-    const rollupIntervalMs = {{.RollupIntervalMins}} * 60 * 1000;
     const selectedAgent = '{{.Agent}}';
     const defaultOfflineAfterSeconds = {{.OfflineAfterSeconds}};
     let selectedRange = '{{.SelectedRange}}';
@@ -1108,7 +1136,9 @@ const dashboardHTML = `<!doctype html>
         return loadResults();
       }
       if (!res.ok) throw new Error('结果数据加载失败，状态码：' + res.status);
-      return normalizeResultRows(await res.json()).reverse();
+      const rows = await res.json();
+      const normalized = normalizeResultRows(rows);
+      return normalized.reverse();
     }
     async function pollCacheReady(agent) {
       for (let i = 0; i < 150; i++) {
@@ -1186,9 +1216,9 @@ const dashboardHTML = `<!doctype html>
       if (!Array.isArray(rows)) return [];
       return rows.map(normalizeResultRow).filter(Boolean);
     }
-    function normalizeResultRow(row) {
-      if (!Array.isArray(row)) return row && typeof row === 'object' ? row : null;
-      return {
+function normalizeResultRow(row) {
+    if (!Array.isArray(row)) return row && typeof row === 'object' ? row : null;
+    const normalized = {
         agent: row[0] || '',
         agent_ip: row[1] || '',
         target_name: row[2] || '',
@@ -1201,8 +1231,9 @@ const dashboardHTML = `<!doctype html>
         average_latency_ms: row[9] || 0,
         success_rate: row[10] || 0,
         error: row[11] || ''
-      };
-    }
+    };
+    return normalized;
+}
     function decodeCompactTime(value) {
       if (typeof value !== 'string' || value.length < 10 || !/^[0-9a-z]+$/i.test(value)) return value || '';
       const ns = parseBase36BigInt(value);
@@ -1282,19 +1313,6 @@ const dashboardHTML = `<!doctype html>
       if (!intervals.length) return minChartGapMs;
       intervals.sort((a, b) => a - b);
       return intervals[Math.floor(intervals.length / 2)];
-    }
-    function splitLongGaps(points, typicalGap) {
-      if (points.length < 2) return points;
-      const threshold = Math.max(minChartGapMs, rollupIntervalMs * 3, (typicalGap || medianInterval(points)) * 3);
-      const split = [points[0]];
-      for (let i = 1; i < points.length; i++) {
-        if (points[i].x - points[i - 1].x > threshold) {
-          split.push({x: points[i - 1].x + 1, y: null});
-          split.push({x: points[i].x - 1, y: null});
-        }
-        split.push(points[i]);
-      }
-      return split;
     }
     function formatTimeTick(value) {
       const date = new Date(Number(value));
@@ -1460,30 +1478,15 @@ const dashboardHTML = `<!doctype html>
       }
       drawDataset(dataset, xRange, yRange, area) {
         const ctx = this.ctx;
-        let segment = [];
-        const flush = () => {
-          if (segment.length) {
-            const beziers = this.segmentVertexData(segment, xRange, yRange, area);
-            if (beziers.length) {
-              ctx.beginPath();
-              ctx.moveTo(beziers[0].x0, beziers[0].y0);
-              for (const b of beziers) {
-                if (b.x0 === b.x1 && b.y0 === b.y1) { ctx.lineTo(b.x1 + 1, b.y1); }
-                else { ctx.bezierCurveTo(b.c1x, b.c1y, b.c2x, b.c2y, b.x1, b.y1); }
-              }
-              ctx.stroke();
-            }
-            segment = [];
-          }
-        };
-        for (const point of this.pointWindow(dataset.data, xRange)) {
-          if (point.y === null || !Number.isFinite(point.y) || point.x < xRange.min || point.x > xRange.max) {
-            flush();
-            continue;
-          }
-          segment.push(point);
+        const pts = this.pointWindow(dataset.data, xRange).filter(p => p.y !== null && Number.isFinite(p.y));
+        if (pts.length < 1) return;
+        const segments = this.segmentVertexData(pts, xRange, yRange, area);
+        ctx.beginPath();
+        ctx.moveTo(segments[0].x0, segments[0].y0);
+        for (const seg of segments) {
+          ctx.bezierCurveTo(seg.c1x, seg.c1y, seg.c2x, seg.c2y, seg.x1, seg.y1);
         }
-        flush();
+        ctx.stroke();
       }
       niceStep(rawStep) {
         const exponent = Math.floor(Math.log10(Math.max(1, rawStep)));
@@ -1571,6 +1574,7 @@ const dashboardHTML = `<!doctype html>
         cancelAnimationFrame(this.raf);
         this.raf = requestAnimationFrame(() => {
           const area = this.chartArea();
+          if (area.width < 2 || area.height < 2) return;
           const xRange = this.xRange();
           const yRange = this.yRange(xRange);
           this.lastArea = area;
@@ -1665,23 +1669,7 @@ const dashboardHTML = `<!doctype html>
         this.lastPointerClientY = clientY;
         cancelAnimationFrame(this.tooltipRaf);
         this.tooltipRaf = requestAnimationFrame(() => {
-          if (!this.tooltipActive) return;
-          if (this.options.mini) {
-            const area = this.lastArea || this.chartArea();
-            const xRange = this.lastXRange || this.xRange();
-            const rect = this.container.getBoundingClientRect();
-            const mx = clientX - rect.left;
-            if (mx < area.left || mx > area.right) {
-              this.hoverLine.style.opacity = '0';
-              return;
-            }
-            this.hoverLine.style.top = area.top.toFixed(1) + 'px';
-            this.hoverLine.style.bottom = (area.height - area.bottom).toFixed(1) + 'px';
-            this.hoverLine.style.opacity = '1';
-            this.hoverLine.style.transform = 'translate3d(' + mx.toFixed(1) + 'px, 0, 0)';
-          } else {
-            showChartTooltip(this, clientX, clientY);
-          }
+          if (this.tooltipActive) showChartTooltip(this, clientX, clientY);
         });
       }
     }
@@ -1695,16 +1683,24 @@ const dashboardHTML = `<!doctype html>
       let idx = 0;
       for (let i = 0; i < targetCount - 2; i++) {
         const start = Math.floor(i * bucketSize) + 1;
-        const end = Math.floor((i + 1) * bucketSize) + 1;
+        const end = Math.min(n - 1, Math.floor((i + 1) * bucketSize) + 1);
         const nextStart = Math.floor((i + 2) * bucketSize) + 1;
-        const endCap = Math.min(n - 1, nextStart);
+        let endCap = Math.min(n - 1, nextStart);
+        while (endCap > start && endCap < n && points[endCap].y === null) endCap--;
+        if (endCap <= start || !Number.isFinite(points[endCap].y)) {
+          result[i + 1] = points[Math.floor((start + end) / 2)];
+          idx = i + 1;
+          continue;
+        }
         const avgX = points[endCap].x;
         const avgY = points[endCap].y;
         let maxArea = -1;
         for (let j = start; j < end; j++) {
+          if (points[j].y === null || !Number.isFinite(points[j].y)) continue;
           const area = Math.abs((points[j].x - avgX) * (result[idx].y - points[j].y) - (points[j].x - result[idx].x) * (avgY - points[j].y));
           if (area > maxArea) { maxArea = area; result[i + 1] = points[j]; }
         }
+        if (maxArea < 0) result[i + 1] = points[Math.floor((start + end) / 2)];
         idx = i + 1;
       }
       return result;
@@ -1719,27 +1715,15 @@ const dashboardHTML = `<!doctype html>
         if (!grouped.has(key)) grouped.set(key, []);
         grouped.get(key).push({x: ts, y: row.average_latency_ms});
       }
-      const maxPoints = 600;
       const datasets = Array.from(grouped.entries()).map(([label, points], index) => {
         points.sort((a, b) => a.x - b.x);
+        points = lttb(points, 600);
         const typicalGap = medianInterval(points);
-        let displayPoints = splitLongGaps(points, typicalGap);
-        if (displayPoints.length > maxPoints) displayPoints = lttb(displayPoints, maxPoints);
         return {
           label,
-          data: displayPoints,
+          data: points,
           borderColor: colors[index % colors.length],
-          backgroundColor: colors[index % colors.length],
-          typicalGap,
-          tension: 0.18,
-          cubicInterpolationMode: 'monotone',
-          pointRadius: 0,
-          pointHoverRadius: 4,
-          pointHitRadius: 10,
-          borderWidth: 2,
-          spanGaps: false,
-          parsing: false,
-          normalized: true
+          typicalGap
         };
       });
       return {datasets};
@@ -2077,18 +2061,30 @@ const dashboardHTML = `<!doctype html>
     function renderMiniChart(surface, rows) {
       if (!surface.isConnected) return;
       const chartData = buildDatasets(rows);
+      if (!chartData.datasets.length) {
+        destroyMiniChartSurface(surface);
+        surface.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px">暂无数据</div>';
+        return;
+      }
       if (surface.__miniChart) {
         surface.__miniChart.setData(chartData);
         return;
       }
-      const miniChart = new CanvasLineChart(surface, chartData, {mini: true, smooth: true, scales: {x: {}}});
+      const miniChart = new CanvasLineChart(surface, chartData, {mini: true, smooth: true, deferUpdate: true, scales: {x: {}}});
       surface.__miniChart = miniChart;
       miniCharts.add(miniChart);
+      miniChart.update();
     }
     function queueMiniChart(surface, rows) {
       if (!surface) return;
       if (surface.__miniChart) {
-        surface.__miniChart.setData(buildDatasets(rows));
+        const chartData = buildDatasets(rows);
+        if (!chartData.datasets.length) {
+          destroyMiniChartSurface(surface);
+          surface.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px">暂无数据</div>';
+          return;
+        }
+        surface.__miniChart.setData(chartData);
         return;
       }
       if (!('IntersectionObserver' in window)) {
@@ -2183,7 +2179,7 @@ const dashboardHTML = `<!doctype html>
           chartSurface.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px">缓存生成中&hellip;</div>';
         } else {
           destroyMiniChartSurface(chartSurface);
-          chartSurface.innerHTML = '';
+          chartSurface.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px">暂无数据</div>';
         }
       });
       existingCards.forEach((card, agent) => {
@@ -2427,6 +2423,9 @@ const dashboardHTML = `<!doctype html>
       return /^\d+(m|h|d|w|mo)$/.test(value) && parseRangeMillis(value) > 0 ? value : '';
     }
     function applyRange(nextRange) {
+      if (!selectedAgent && parseRangeMillis(nextRange) > 24 * 60 * 60 * 1000) {
+        nextRange = '24h';
+      }
       selectedRange = nextRange;
       rangeButton.textContent = selectedRange;
       setCookie(rangeCookieName, selectedRange, 365 * 24 * 60 * 60);
@@ -2452,6 +2451,13 @@ const dashboardHTML = `<!doctype html>
         applyRange(option.dataset.range);
       });
     });
+    if (!selectedAgent) {
+      document.querySelectorAll('.range-option').forEach(option => {
+        if (parseRangeMillis(option.dataset.range) > 24 * 60 * 60 * 1000) {
+          option.hidden = true;
+        }
+      });
+    }
     if (rangeCustomForm && rangeCustomInput && rangeCustomApply) {
       function submitCustomRange() {
         const nextRange = normalizeRange(rangeCustomInput.value);

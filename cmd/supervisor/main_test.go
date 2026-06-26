@@ -602,3 +602,189 @@ func assertNoReportWrites(t *testing.T, store *fakeStore) {
 		t.Fatalf("heartbeats = %d, want 0", len(store.heartbeats))
 	}
 }
+
+func TestAggregateRowsByTime_NoAggregationNeeded(t *testing.T) {
+	now := time.Now()
+	rows := []agentRow{
+		{checkedAt: now.UnixNano(), data: []byte("[1]")},
+		{checkedAt: now.Add(-1 * time.Hour).UnixNano(), data: []byte("[2]")},
+	}
+	got := aggregateRowsByTime(rows, now.Add(-2*time.Hour), 3000)
+	if len(got) != 2 {
+		t.Fatalf("got %d rows, want 2", len(got))
+	}
+}
+
+func TestAggregateRowsByTime_EmptyInput(t *testing.T) {
+	rows := aggregateRowsByTime(nil, time.Now(), 3000)
+	if len(rows) != 0 {
+		t.Fatalf("got %d rows, want 0", len(rows))
+	}
+}
+
+func TestAggregateRowsByTime_SameBucket(t *testing.T) {
+	base := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	rows := make([]agentRow, 100)
+	for i := 0; i < 100; i++ {
+		rows[i] = agentRow{
+			checkedAt: base.Add(time.Duration(99-i) * time.Second).UnixNano(),
+			data:      []byte("[x]"),
+		}
+	}
+	since := base
+	targetCount := 10
+	bucketNanos := int64(base.Add(99*time.Second).Sub(since))
+	_ = bucketNanos
+	got := aggregateRowsByTime(rows, since, targetCount)
+	if len(got) > targetCount {
+		t.Fatalf("got %d rows, want at most %d", len(got), targetCount)
+	}
+	if len(got) == 0 {
+		t.Fatal("expected at least 1 row")
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i].checkedAt >= got[i-1].checkedAt {
+			t.Errorf("rows not strictly decreasing: got[%d]=%d, got[%d]=%d", i-1, got[i-1].checkedAt, i, got[i].checkedAt)
+		}
+	}
+}
+
+func TestAggregateRowsByTime_ProducesDistinctRows(t *testing.T) {
+	base := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	rows := make([]agentRow, 500)
+	for i := 0; i < 500; i++ {
+		rows[i] = agentRow{
+			checkedAt: base.Add(time.Duration(499-i) * time.Minute).UnixNano(),
+			data:      []byte("[x]"),
+		}
+	}
+	since := base
+	got := aggregateRowsByTime(rows, since, 50)
+	seen := make(map[int64]bool)
+	for _, r := range got {
+		if seen[r.checkedAt] {
+			t.Errorf("duplicate checkedAt %d in aggregated output", r.checkedAt)
+		}
+		seen[r.checkedAt] = true
+	}
+	if len(got) > 50 {
+		t.Fatalf("got %d rows, want at most 50", len(got))
+	}
+}
+
+func TestAggregateRowsByTime_ExactTargetCount(t *testing.T) {
+	base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	n := int64(10000)
+	rows := make([]agentRow, n)
+	for i := int64(0); i < n; i++ {
+		rows[i] = agentRow{
+			checkedAt: base.Add(time.Duration(n-1-i) * time.Second).UnixNano(),
+			data:      []byte("[x]"),
+		}
+	}
+	got := aggregateRowsByTime(rows, base, 3000)
+	if len(got) != 3000 {
+		t.Fatalf("got %d rows, want 3000", len(got))
+	}
+}
+
+func TestAggregateRowsByTime_SpanTooSmall(t *testing.T) {
+	now := time.Now()
+	rows := []agentRow{
+		{checkedAt: now.UnixNano(), data: []byte("[1]")},
+		{checkedAt: now.UnixNano(), data: []byte("[2]")},
+	}
+	got := aggregateRowsByTime(rows, now, 5)
+	if len(got) != 2 {
+		t.Fatalf("got %d rows, want 2 (span too small, return all)", len(got))
+	}
+}
+
+func TestAggregateRowsByTime_BucketNanosTooSmall(t *testing.T) {
+	base := time.Unix(0, 0)
+	rows := []agentRow{
+		{checkedAt: base.Add(10 * time.Nanosecond).UnixNano(), data: []byte("[1]")},
+		{checkedAt: base.Add(9 * time.Nanosecond).UnixNano(), data: []byte("[2]")},
+		{checkedAt: base.Add(8 * time.Nanosecond).UnixNano(), data: []byte("[3]")},
+	}
+	got := aggregateRowsByTime(rows, base, 100)
+	if len(got) != 3 {
+		t.Fatalf("got %d rows, want 3 (bucket too small, return all)", len(got))
+	}
+}
+
+func TestAggregateRowsByTime_CachePathServesFilteredRows(t *testing.T) {
+	now := time.Now().UTC()
+	results := []model.Result{
+		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "192.0.2.1", Port: 443, CheckedAt: now, SuccessCount: 1, AverageLatencyMS: 10, SuccessRate: 1},
+		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "192.0.2.1", Port: 443, CheckedAt: now.Add(-30 * time.Minute), SuccessCount: 1, FailureCount: 1, AverageLatencyMS: 11, SuccessRate: 0.5, Error: "timeout"},
+		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "db", Address: "192.0.2.2", Port: 5432, CheckedAt: now.Add(-2 * time.Hour), SuccessCount: 1, AverageLatencyMS: 5, SuccessRate: 1},
+		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "192.0.2.1", Port: 443, CheckedAt: now.Add(-4 * time.Hour), SuccessCount: 0, FailureCount: 3, AverageLatencyMS: 0, SuccessRate: 0, Error: "refused"},
+	}
+	store := &fakeStore{streamedResults: results}
+	s := &server{cfg: config.DefaultConfig(), store: store, dashMem: newDashMemCache()}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=24h&agent=agent-1", nil)
+	rr := httptest.NewRecorder()
+	s.handleResults(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200", rr.Code)
+	}
+	firstGot := decodeDashboardResultsForTest(t, rr.Body.Bytes())
+	if len(firstGot) != 4 {
+		t.Fatalf("first request returned %d rows, want 4", len(firstGot))
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=1h&agent=agent-1", nil)
+	rr2 := httptest.NewRecorder()
+	s.handleResults(rr2, req2)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("second request status = %d, want 200", rr2.Code)
+	}
+	secondGot := decodeDashboardResultsForTest(t, rr2.Body.Bytes())
+	if len(secondGot) != 2 {
+		t.Fatalf("second request (1h) returned %d rows, want 2", len(secondGot))
+	}
+}
+
+func TestAggregateRowsByTime_DirectStreamAggregatesToChartPoints(t *testing.T) {
+	base := time.Now().UTC().Add(-7 * 24 * time.Hour)
+	results := make([]model.Result, 5000)
+	for i := 0; i < 5000; i++ {
+		results[i] = model.Result{
+			Agent:            "agent-1",
+			AgentIP:          "203.0.113.1",
+			TargetName:       "web",
+			Address:          "192.0.2.1",
+			Port:             443,
+			CheckedAt:        base.Add(time.Duration(4999-i) * (10 * time.Minute)).UTC(),
+			SuccessCount:     1,
+			AverageLatencyMS: float64(10 + (i % 5)),
+			SuccessRate:      1,
+		}
+	}
+	store := &fakeStore{streamedResults: results}
+	s := &server{cfg: config.DefaultConfig(), store: store}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=365d&agent=agent-1", nil)
+	rr := httptest.NewRecorder()
+	s.handleResults(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	got := decodeDashboardResultsForTest(t, rr.Body.Bytes())
+	if len(got) == 0 {
+		t.Fatal("direct stream returned 0 rows")
+	}
+	if len(got) > maxChartPoints {
+		t.Fatalf("direct stream returned %d rows, want at most %d", len(got), maxChartPoints)
+	}
+	seen := make(map[int64]bool)
+	for _, r := range got {
+		key := r.CheckedAt.UnixNano()
+		if seen[key] {
+			t.Errorf("duplicate timestamp %d in direct stream output", key)
+		}
+		seen[key] = true
+	}
+}

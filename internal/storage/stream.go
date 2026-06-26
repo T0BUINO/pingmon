@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"fmt"
 	"time"
 
 	"pingmon/internal/model"
@@ -13,7 +14,7 @@ const (
 )
 
 func (s *SQLiteStore) StreamResultsSince(since time.Time, agent string, fn func(model.Result) error) error {
-	return s.streamResultsWindowed(since, time.Now().UTC().Add(time.Nanosecond), agent, fn)
+	return s.streamResultsWindowed(since, time.Now().UTC(), agent, fn)
 }
 
 func (s *SQLiteStore) StreamResultsSinceCompacted(since, rawCutoff time.Time, agent string, fn func(model.Result) error) error {
@@ -29,6 +30,34 @@ func (s *SQLiteStore) StreamResultsSinceCompacted(since, rawCutoff time.Time, ag
 func (s *SQLiteStore) streamResultsWindowed(since, before time.Time, agent string, fn func(model.Result) error) error {
 	since = since.UTC()
 	cursor := before.UTC()
+
+	// 如果查询开始时间已经超过当前时间，直接返回错误
+	if !cursor.After(since) {
+		return nil
+	}
+
+	// 检查查询开始时间是否超过数据库最新数据
+	// 获取数据库最新数据时间戳
+	var latestTimeStr string
+	err := s.db.QueryRow(`SELECT MAX(checked_at) FROM results`).Scan(&latestTimeStr)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("failed to get latest time: %w", err)
+	}
+
+	// 如果查询开始时间超过最新数据，将 since 设置为最新数据时间
+	if latestTimeStr != "" {
+		latestTime, err := time.Parse(time.RFC3339Nano, latestTimeStr)
+		if err != nil {
+			return fmt.Errorf("failed to parse latest time: %w", err)
+		}
+		if since.After(latestTime) {
+			since = latestTime
+			if !cursor.After(since) {
+				return nil
+			}
+		}
+	}
+
 	for cursor.After(since) {
 		start := cursor.Add(-streamQueryWindow)
 		if start.Before(since) {
@@ -59,7 +88,8 @@ ORDER BY r.checked_at DESC LIMIT ?`,
 r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
 FROM results r JOIN result_series rs ON rs.id = r.series_id
 WHERE r.checked_at >= ? AND r.checked_at < ?
-ORDER BY r.checked_at DESC`, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+ORDER BY r.checked_at DESC LIMIT ?`,
+				since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow)
 		}
 	} else {
 		if shortRange {
