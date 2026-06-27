@@ -51,6 +51,74 @@ func TestDashboardSessionIsSignedAndExpires(t *testing.T) {
 	}
 }
 
+func TestDashboardSessionSurvivesSupervisorRestart(t *testing.T) {
+	cfg := config.Config{DashboardUser: "admin", DashboardPassword: "secret"}
+	beforeRestart := &server{cfg: cfg, authKey: dashboardAuthKey(cfg)}
+	afterRestart := &server{cfg: cfg, authKey: dashboardAuthKey(cfg)}
+
+	token := beforeRestart.dashboardSession(cfg.DashboardUser, time.Now().Add(time.Hour))
+	if !afterRestart.validDashboardCookie(token) {
+		t.Fatal("a valid dashboard session was rejected after supervisor restart")
+	}
+
+	changedCredentials := config.Config{DashboardUser: "admin", DashboardPassword: "new-secret"}
+	afterPasswordChange := &server{cfg: changedCredentials, authKey: dashboardAuthKey(changedCredentials)}
+	if afterPasswordChange.validDashboardCookie(token) {
+		t.Fatal("dashboard session remained valid after credentials changed")
+	}
+}
+
+func TestDashboardAuthenticationAcceptsValidDuplicateCookie(t *testing.T) {
+	cfg := config.Config{DashboardUser: "admin", DashboardPassword: "secret"}
+	s := &server{cfg: cfg, authKey: dashboardAuthKey(cfg)}
+	valid := s.dashboardSession(cfg.DashboardUser, time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	req.Header.Set("Cookie", "pingmon_auth=stale; pingmon_auth="+valid)
+
+	if !s.dashboardAuthenticated(req) {
+		t.Fatal("valid dashboard session was shadowed by a stale same-name cookie")
+	}
+}
+
+func TestAuthenticatedRootRequestReachesDashboard(t *testing.T) {
+	cfg := config.DefaultConfig()
+	s := &server{
+		cfg:     cfg,
+		authKey: dashboardAuthKey(cfg),
+		tpl:     template.Must(template.New("dashboard").Parse(dashboardHTML)),
+	}
+	handler := newSupervisorMux(s)
+
+	loginRequest := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=admin&password=admin&next=%2Fdashboard"))
+	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(loginResponse, loginRequest)
+	cookies := loginResponse.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login cookies = %d, want 1", len(cookies))
+	}
+	if cookies[0].Path != "/" || cookies[0].MaxAge <= 0 || cookies[0].Expires.IsZero() ||
+		!cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
+		t.Fatalf("login cookie is not persistent across page/browser reopen: %+v", cookies[0])
+	}
+
+	rootRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	rootRequest.AddCookie(cookies[0])
+	rootResponse := httptest.NewRecorder()
+	handler.ServeHTTP(rootResponse, rootRequest)
+	if rootResponse.Code != http.StatusFound || rootResponse.Header().Get("Location") != "/dashboard" {
+		t.Fatalf("root response = %d %q, want redirect to dashboard", rootResponse.Code, rootResponse.Header().Get("Location"))
+	}
+
+	dashboardRequest := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	dashboardRequest.AddCookie(cookies[0])
+	dashboardResponse := httptest.NewRecorder()
+	handler.ServeHTTP(dashboardResponse, dashboardRequest)
+	if dashboardResponse.Code != http.StatusOK {
+		t.Fatalf("dashboard response = %d, want 200", dashboardResponse.Code)
+	}
+}
+
 func TestDashboardLoginFlowAvoidsBasicAuthPrompt(t *testing.T) {
 	s := &server{
 		cfg:     config.DefaultConfig(),

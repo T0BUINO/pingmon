@@ -3,7 +3,6 @@ package main
 import (
 	"compress/gzip"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
@@ -118,20 +117,32 @@ func main() {
 		log.Fatalf("init storage: %v", err)
 	}
 	tpl := template.Must(template.New("dashboard").Parse(dashboardHTML))
-	authKey := make([]byte, 32)
-	if _, err := rand.Read(authKey); err != nil {
-		log.Fatalf("initialize dashboard session key: %v", err)
-	}
 	s := &server{
 		cfg:          cfg,
 		store:        store,
 		tpl:          tpl,
 		hub:          newWebsocketHub(),
 		resultsCache: newResultsCache(resultsCacheTTL, resultsCacheMaxEntries),
-		authKey:      authKey,
+		authKey:      dashboardAuthKey(cfg),
 	}
 	go s.startRetentionCleaner()
 
+	mux := newSupervisorMux(s)
+
+	log.Printf("supervisor listening on %s", cfg.Listen)
+	httpServer := &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           gzipHandler(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+	log.Fatal(httpServer.ListenAndServe())
+}
+
+func newSupervisorMux(s *server) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/dashboard", http.StatusFound)
@@ -146,18 +157,7 @@ func main() {
 	mux.HandleFunc("/login", s.handleLogin)
 	mux.HandleFunc("/logout", s.handleLogout)
 	mux.HandleFunc("/dashboard", s.handleDashboard)
-
-	log.Printf("supervisor listening on %s", cfg.Listen)
-	httpServer := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           gzipHandler(mux),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      2 * time.Minute,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    16 << 10,
-	}
-	log.Fatal(httpServer.ListenAndServe())
+	return mux
 }
 
 func (s *server) handleTasks(w http.ResponseWriter, r *http.Request) {
@@ -692,8 +692,13 @@ func (s *server) dashboardAuthenticated(r *http.Request) bool {
 		subtle.ConstantTimeCompare([]byte(pass), []byte(s.cfg.DashboardPassword)) == 1 {
 		return true
 	}
-	if cookie, err := r.Cookie("pingmon_auth"); err == nil && s.validDashboardCookie(cookie.Value) {
-		return true
+	// Browsers may retain same-name cookies with different Path or Domain
+	// attributes. Accept any valid session instead of letting the first stale
+	// cookie shadow a valid one later in the Cookie header.
+	for _, cookie := range r.CookiesNamed("pingmon_auth") {
+		if s.validDashboardCookie(cookie.Value) {
+			return true
+		}
 	}
 	return false
 }
@@ -732,7 +737,7 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: "pingmon_auth", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil})
+	http.SetCookie(w, &http.Cookie{Name: "pingmon_auth", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
@@ -744,7 +749,7 @@ func (s *server) setDashboardSession(w http.ResponseWriter, r *http.Request, use
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: http.SameSiteLaxMode,
 		Expires:  expires,
 		MaxAge:   int(dashboardSessionLifetime.Seconds()),
 	})
@@ -755,6 +760,14 @@ func safeRedirectPath(raw string) string {
 		return "/dashboard"
 	}
 	return raw
+}
+
+// dashboardAuthKey must remain stable across supervisor restarts so a valid
+// session cookie does not silently become invalid while it is still alive.
+// Changing either dashboard credential intentionally invalidates old sessions.
+func dashboardAuthKey(cfg config.Config) []byte {
+	key := sha256.Sum256([]byte("pingmon dashboard session\x00" + cfg.DashboardUser + "\x00" + cfg.DashboardPassword))
+	return key[:]
 }
 
 func (s *server) validDashboardCookie(value string) bool {
