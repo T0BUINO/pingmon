@@ -42,14 +42,14 @@ func TestStreamResultsSinceFutureReturnsNoResults(t *testing.T) {
 	}
 }
 
-func TestSQLiteStoreUsesSingleConnectionPool(t *testing.T) {
+func TestSQLiteStoreUsesBoundedConnectionPool(t *testing.T) {
 	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pingmon.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
 	defer store.db.Close()
-	if got := store.db.Stats().MaxOpenConnections; got != 1 {
-		t.Fatalf("MaxOpenConnections = %d, want 1", got)
+	if got := store.db.Stats().MaxOpenConnections; got != 2 {
+		t.Fatalf("MaxOpenConnections = %d, want 2", got)
 	}
 	var cacheSize int
 	if err := store.db.QueryRow("PRAGMA cache_size").Scan(&cacheSize); err != nil {

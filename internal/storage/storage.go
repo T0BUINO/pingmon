@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -32,7 +33,6 @@ type Store interface {
 	DeleteBefore(cutoff time.Time) (int, error)
 	DeleteRollupsBefore(cutoff time.Time) (int, error)
 	Vacuum() error
-	ConsecutiveFailures(targetName, address string, port int, limit int) (int, error)
 }
 
 func New(sqlitePath string) (Store, error) {
@@ -55,8 +55,8 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
 	store := &SQLiteStore{db: db}
 	if err := store.init(); err != nil {
 		_ = db.Close()
@@ -68,6 +68,7 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 func sqliteDSN(path string) string {
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "foreign_keys(ON)")
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Add("_pragma", "temp_store(FILE)")
@@ -75,6 +76,9 @@ func sqliteDSN(path string) string {
 	q.Add("_pragma", "wal_autocheckpoint(1000)")
 	return path + "?" + q.Encode()
 }
+
+func (s *SQLiteStore) Close() error                          { return s.db.Close() }
+func (s *SQLiteStore) PingContext(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 func (s *SQLiteStore) init() error {
 	if _, err := MigrateSQLiteDB(s.db); err != nil {
@@ -471,57 +475,6 @@ func (s *SQLiteStore) DeleteRollupsBefore(cutoff time.Time) (int, error) {
 func (s *SQLiteStore) Vacuum() error {
 	_, err := s.db.Exec("VACUUM")
 	return err
-}
-
-func (s *SQLiteStore) ConsecutiveFailures(targetName, address string, port int, limit int) (int, error) {
-	seriesRows, err := s.db.Query(`
-SELECT id FROM result_series
-WHERE target_name = ? AND address = ? AND port = ?`, targetName, address, port)
-	if err != nil {
-		return 0, err
-	}
-	seriesIDs := make([]int64, 0, 4)
-	for seriesRows.Next() {
-		var id int64
-		if err := seriesRows.Scan(&id); err != nil {
-			seriesRows.Close()
-			return 0, err
-		}
-		seriesIDs = append(seriesIDs, id)
-	}
-	err = seriesRows.Err()
-	seriesRows.Close()
-	if err != nil || len(seriesIDs) == 0 {
-		return 0, err
-	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(seriesIDs)), ",")
-	query := `SELECT success_count FROM results WHERE series_id IN (` + placeholders + `)
-ORDER BY checked_at DESC, id DESC`
-	args := make([]any, len(seriesIDs), len(seriesIDs)+1)
-	for i, id := range seriesIDs {
-		args[i] = id
-	}
-	if limit > 0 {
-		query += "\nLIMIT ?"
-		args = append(args, limit)
-	}
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-	failures := 0
-	for rows.Next() {
-		var successCount int
-		if err := rows.Scan(&successCount); err != nil {
-			return 0, err
-		}
-		if successCount > 0 {
-			break
-		}
-		failures++
-	}
-	return failures, rows.Err()
 }
 
 type resultScanner interface {

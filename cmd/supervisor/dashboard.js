@@ -772,14 +772,34 @@ function normalizeResultRow(row) {
       chart.lastTooltipX = tooltipData.xValue;
       const compact = window.matchMedia('(max-width: 760px), (pointer: coarse)').matches;
       const maxItems = compact ? 8 : 18;
-      let html = '<div class="chart-tooltip-title">' + new Date(tooltipData.xValue).toLocaleString() + '</div>';
+      tooltip.replaceChildren();
+      const title = document.createElement('div');
+      title.className = 'chart-tooltip-title';
+      title.textContent = new Date(tooltipData.xValue).toLocaleString();
+      tooltip.appendChild(title);
       const visible = tooltipData.items.slice(0, maxItems);
       for (const item of visible) {
-        html += '<div class="chart-tooltip-row"><span class="chart-tooltip-swatch" style="background:' + item.dataset.borderColor + '"></span><span class="chart-tooltip-name">' + item.dataset.label + '</span><span class="chart-tooltip-value">' + item.point.y.toFixed(2) + ' ms</span></div>';
+        const row = document.createElement('div');
+        row.className = 'chart-tooltip-row';
+        const swatch = document.createElement('span');
+        swatch.className = 'chart-tooltip-swatch';
+        swatch.style.background = item.dataset.borderColor;
+        const name = document.createElement('span');
+        name.className = 'chart-tooltip-name';
+        name.textContent = item.dataset.label;
+        const value = document.createElement('span');
+        value.className = 'chart-tooltip-value';
+        value.textContent = item.point.y.toFixed(2) + ' ms';
+        row.append(swatch, name, value);
+        tooltip.appendChild(row);
       }
       const hiddenCount = tooltipData.items.length - maxItems;
-      if (hiddenCount > 0) html += '<div class="chart-tooltip-more">\u8fd8\u6709 ' + hiddenCount + ' \u9879</div>';
-      tooltip.innerHTML = html;
+      if (hiddenCount > 0) {
+        const more = document.createElement('div');
+        more.className = 'chart-tooltip-more';
+        more.textContent = '\u8fd8\u6709 ' + hiddenCount + ' \u9879';
+        tooltip.appendChild(more);
+      }
       positionTooltip();
     }
     function attachChartZoomHandlers(chart) {
@@ -876,8 +896,9 @@ function normalizeResultRow(row) {
       const totalFailure = rows.reduce((sum, row) => sum + row.failure_count, 0);
       const total = totalSuccess + totalFailure;
       const successRate = total ? totalSuccess / total : 0;
-      const latencies = rows.filter(row => row.success_count > 0).map(row => row.average_latency_ms);
-      const averageLatency = latencies.length ? latencies.reduce((a, b) => a + b, 0) / latencies.length : 0;
+      const latencyWeight = rows.reduce((sum, row) => sum + (row.success_count > 0 ? row.success_count : 0), 0);
+      const weightedLatency = rows.reduce((sum, row) => sum + (row.success_count > 0 ? row.average_latency_ms * row.success_count : 0), 0);
+      const averageLatency = latencyWeight ? weightedLatency / latencyWeight : 0;
       const targets = new Set(rows.map(targetKey));
       return {latest, successRate, averageLatency, targetCount: targets.size};
     }
@@ -888,6 +909,8 @@ function normalizeResultRow(row) {
       const lastSeen = agentLastSeenTime(status, summary);
       const offlineAfter = Number((status && status.offline_after_seconds) || defaultOfflineAfterSeconds || 90) * 1000;
       if (lastSeen !== null && Date.now() - lastSeen > offlineAfter) return {text: '离线', className: 'offline'};
+      if (status && (status.status === 'degraded' || status.connectivity === 'failed')) return {text: '\u7f51\u7edc\u5f02\u5e38', className: 'bad'};
+      if (status && status.connectivity === 'checking') return {text: '\u68c0\u6d4b\u4e2d', className: 'idle'};
       if (!summary) return {text: '暂无数据', className: 'idle'};
       return summary.successRate >= 0.99 ? {text: '正常', className: 'ok'} : {text: '异常', className: 'bad'};
     }
@@ -1085,6 +1108,10 @@ function normalizeResultRow(row) {
       subtitle.innerHTML = '最后在线：' + lastSeenText(statusInfo, summary) + '<span class="live-badge" id="liveState">实时</span>' + agentStateBadgeHTML(state);
       wrap.append(metric('节点名称', (summary && summary.latest.agent) || (statusInfo && statusInfo.agent) || selectedAgent));
       wrap.append(metric('节点 IP', agentIPText(statusInfo, summary)));
+      const connectivityText = statusInfo && statusInfo.connectivity === 'failed'
+        ? '异常（连续 ' + statusInfo.consecutive_failures + ' 轮）'
+        : statusInfo && statusInfo.connectivity === 'checking' ? '检测中' : '正常';
+      wrap.append(metric('网络连通性', connectivityText));
       wrap.append(metric('监测目标', summary ? String(summary.targetCount) : '0'));
       wrap.append(metric('最后在线', lastSeenText(statusInfo, summary)));
     }

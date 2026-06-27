@@ -188,8 +188,10 @@ func aggregateSingleSeries(rows []agentRow, since time.Time, targetCount int) []
 			startIdx++
 		}
 
-		var sumLatency float64
-		var validCount int
+		var weightedLatency float64
+		var successCount, failureCount int
+		var sampleCount int
+		var problem bool
 		var template model.Result
 		var fallback agentRow
 		var hasFallback bool
@@ -198,11 +200,15 @@ func aggregateSingleSeries(rows []agentRow, since time.Time, targetCount int) []
 
 		bucketIdx := startIdx
 		for bucketIdx < n && rows[bucketIdx].checkedAt >= bucketStart {
-			if validCount == 0 {
+			if sampleCount == 0 {
 				template = rows[bucketIdx].result
 			}
-			sumLatency += rows[bucketIdx].latency
-			validCount++
+			result := rows[bucketIdx].result
+			weightedLatency += rows[bucketIdx].latency * float64(result.SuccessCount)
+			successCount += result.SuccessCount
+			failureCount += result.FailureCount
+			problem = problem || result.FailureCount > 0 || result.Error != ""
+			sampleCount++
 			if !hasFallback {
 				fallback = rows[bucketIdx]
 				hasFallback = true
@@ -214,11 +220,25 @@ func aggregateSingleSeries(rows []agentRow, since time.Time, targetCount int) []
 			bucketIdx++
 		}
 
-		if validCount > 0 {
+		if sampleCount > 0 {
 			checkedAt := bucketOldest + (bucketNewest-bucketOldest)/2
 			template.CheckedAt = time.Unix(0, checkedAt).UTC()
-			template.SuccessCount = 1
-			template.AverageLatencyMS = sumLatency / float64(validCount)
+			template.SuccessCount = successCount
+			template.FailureCount = failureCount
+			if successCount > 0 {
+				template.AverageLatencyMS = weightedLatency / float64(successCount)
+			} else {
+				template.AverageLatencyMS = 0
+			}
+			total := successCount + failureCount
+			if total > 0 {
+				template.SuccessRate = float64(successCount) / float64(total)
+			}
+			if problem {
+				template.Error = "aggregated interval contains failures"
+			} else {
+				template.Error = ""
+			}
 			row, err := newAgentRow(template)
 			if err == nil {
 				result = append(result, row)

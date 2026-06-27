@@ -2,6 +2,8 @@ listen = ":8080"
 sqlite_path = "data/pingmon.db"
 dashboard_user = "admin"
 dashboard_password = "change-me"
+# Set the same non-empty random value in agent.toml to protect agent APIs.
+agent_token = ""
 dashboard_ranges = ["5m", "15m", "30m", "12h", "24h", "3d", "7d", "14d", "30d", "60d", "180d", "365d"]
 default_range = "24h"
 retention_days = 365

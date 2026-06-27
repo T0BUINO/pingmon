@@ -44,3 +44,17 @@ func TestLoadAgentProbeConcurrency(t *testing.T) {
 		t.Fatalf("ProbeConcurrency = %d, want 7", cfg.ProbeConcurrency)
 	}
 }
+
+func TestLoadAgentSecurityAndQueueSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.toml")
+	if err := os.WriteFile(path, []byte("agent_token = \"secret\"\nmax_pending_results = 42\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadAgent(path, "toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AgentToken != "secret" || cfg.MaxPendingResults != 42 {
+		t.Fatalf("config = %+v", cfg)
+	}
+}

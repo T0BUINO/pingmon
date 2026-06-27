@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PingMon Dashboard</title>
-  <link rel="stylesheet" href="/assets/dashboard.css">
+  <link rel="stylesheet" href="/assets/dashboard.css?v={{.AssetVersion}}">
 </head>
 <body data-agent="{{.Agent}}" data-offline-after="{{.OfflineAfterSeconds}}" data-selected-range="{{.SelectedRange}}">
   <main>
@@ -69,6 +69,6 @@
       <section class="cards" id="agentCards"></section>
     {{end}}
   </main>
-  <script src="/assets/dashboard.js" defer></script>
+  <script src="/assets/dashboard.js?v={{.AssetVersion}}" defer></script>
 </body>
 </html>

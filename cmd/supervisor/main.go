@@ -2,6 +2,7 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -13,12 +14,17 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"pingmon/internal/config"
@@ -29,12 +35,22 @@ import (
 )
 
 type server struct {
-	cfg          config.Config
-	store        storage.Store
-	tpl          *template.Template
-	hub          *websocketHub
-	resultsCache *resultsCache
-	authKey      []byte
+	cfgMu          sync.RWMutex
+	cfg            config.Config
+	store          storage.Store
+	tpl            *template.Template
+	hub            *websocketHub
+	resultsCache   *resultsCache
+	authKey        []byte
+	connectivityMu sync.Mutex
+	connectivity   map[string]agentConnectivity
+}
+
+type agentConnectivity struct {
+	Status              string
+	ConsecutiveFailures int
+	FirstFailedAt       time.Time
+	LastChangedAt       time.Time
 }
 
 type dashboardData struct {
@@ -44,6 +60,7 @@ type dashboardData struct {
 	CustomRange         bool
 	OfflineAfterSeconds int
 	RollupIntervalMins  int
+	AssetVersion        string
 }
 
 type websocketHub struct {
@@ -63,17 +80,23 @@ type websocketEvent struct {
 }
 
 type agentStatusView struct {
-	Agent               string    `json:"agent"`
-	AgentIP             string    `json:"agent_ip,omitempty"`
-	FirstSeenAt         time.Time `json:"first_seen_at"`
-	LastSeenAt          time.Time `json:"last_seen_at"`
-	OfflineAfterSeconds int       `json:"offline_after_seconds"`
-	Status              string    `json:"status"`
+	Agent                 string    `json:"agent"`
+	AgentIP               string    `json:"agent_ip,omitempty"`
+	FirstSeenAt           time.Time `json:"first_seen_at"`
+	LastSeenAt            time.Time `json:"last_seen_at"`
+	OfflineAfterSeconds   int       `json:"offline_after_seconds"`
+	Status                string    `json:"status"`
+	Connectivity          string    `json:"connectivity"`
+	ConsecutiveFailures   int       `json:"consecutive_failures"`
+	ConnectivityChangedAt time.Time `json:"connectivity_changed_at,omitempty"`
 }
 
 const resultsCacheTTL = 2 * time.Second
-const resultsCacheMaxEntries = 256
+const resultsCacheMaxEntries = 64
+const resultsCacheMaxBytes = 16 << 20
 const dashboardSessionLifetime = 12 * time.Hour
+const maxReportBodyBytes = 1 << 20
+const maxReportBatchSize = 1000
 
 var websocketUpgrader = websocket.Upgrader{
 	HandshakeTimeout: 5 * time.Second,
@@ -90,6 +113,11 @@ var dashboardCSS string
 //go:embed dashboard.js
 var dashboardJS string
 
+var embeddedAssetVersion = func() string {
+	sum := sha256.Sum256([]byte(dashboardCSS + "\x00" + dashboardJS))
+	return fmt.Sprintf("%x", sum[:6])
+}()
+
 func main() {
 	configPath := flag.String("config", "configs/supervisor.toml", "path to JSON or TOML config")
 	format := flag.String("format", "", "config format: json or toml")
@@ -99,6 +127,12 @@ func main() {
 	cfg, err := config.Load(*configPath, *format)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+	if err := validateSupervisorConfig(cfg); err != nil {
+		log.Fatalf("validate config: %v", err)
+	}
+	if cfg.AgentToken == "" {
+		log.Printf("WARNING: agent_token is empty; /api/tasks and /api/report are not protected")
 	}
 	if *migrateOnly {
 		migrated, err := storage.MigrateSQLite(cfg.SQLitePath)
@@ -124,8 +158,12 @@ func main() {
 		hub:          newWebsocketHub(),
 		resultsCache: newResultsCache(resultsCacheTTL, resultsCacheMaxEntries),
 		authKey:      dashboardAuthKey(cfg),
+		connectivity: make(map[string]agentConnectivity),
 	}
-	go s.startRetentionCleaner()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go s.startRetentionCleaner(ctx)
+	go s.watchConfig(ctx, *configPath, *format)
 
 	mux := newSupervisorMux(s)
 
@@ -139,7 +177,116 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
-	log.Fatal(httpServer.ListenAndServe())
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("http shutdown: %v", err)
+		}
+		s.hub.closeAll()
+		if closer, ok := store.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				log.Printf("close storage: %v", err)
+			}
+		}
+	}()
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+}
+
+func (s *server) currentConfig() config.Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg
+}
+
+func (s *server) watchConfig(ctx context.Context, path, format string) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		log.Printf("config reload disabled: %v", err)
+		return
+	}
+	lastMod, lastSize := info.ModTime(), info.Size()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			info, err := os.Stat(path)
+			if err != nil {
+				log.Printf("config reload stat: %v", err)
+				continue
+			}
+			if info.ModTime().Equal(lastMod) && info.Size() == lastSize {
+				continue
+			}
+			lastMod, lastSize = info.ModTime(), info.Size()
+			loaded, err := config.Load(path, format)
+			if err != nil {
+				log.Printf("config reload rejected: %v", err)
+				continue
+			}
+			if err := validateSupervisorConfig(loaded); err != nil {
+				log.Printf("config reload rejected: %v", err)
+				continue
+			}
+			if s.applyReloadedConfig(loaded) {
+				log.Printf("config reloaded: targets=%d schedule=%ds", len(loaded.Targets), loaded.Params.ScheduleSeconds)
+			}
+		}
+	}
+}
+
+func validateSupervisorConfig(cfg config.Config) error {
+	for i, target := range cfg.Targets {
+		if strings.TrimSpace(target.Name) == "" || strings.TrimSpace(target.Address) == "" {
+			return fmt.Errorf("target %d requires name and address", i+1)
+		}
+		if target.Port < 1 || target.Port > 65535 {
+			return fmt.Errorf("target %q has invalid port", target.Name)
+		}
+	}
+	for _, value := range cfg.DashboardRanges {
+		if _, ok := parseRangeDuration(value); !ok {
+			return fmt.Errorf("invalid dashboard range %q", value)
+		}
+	}
+	if _, ok := parseRangeDuration(cfg.DefaultRange); !ok {
+		return fmt.Errorf("invalid default range %q", cfg.DefaultRange)
+	}
+	return nil
+}
+
+func (s *server) applyReloadedConfig(loaded config.Config) bool {
+	current := s.currentConfig()
+	if loaded.Listen != current.Listen || loaded.SQLitePath != current.SQLitePath ||
+		loaded.DashboardUser != current.DashboardUser || loaded.DashboardPassword != current.DashboardPassword {
+		log.Printf("config reload: listen, sqlite_path and dashboard credentials require restart")
+		loaded.Listen = current.Listen
+		loaded.SQLitePath = current.SQLitePath
+		loaded.DashboardUser = current.DashboardUser
+		loaded.DashboardPassword = current.DashboardPassword
+	}
+	if reflect.DeepEqual(current, loaded) {
+		return false
+	}
+	s.cfgMu.Lock()
+	s.cfg = loaded
+	s.cfgMu.Unlock()
+	if s.resultsCache != nil {
+		s.resultsCache.clear()
+	}
+	if s.hub != nil {
+		s.hub.broadcast("refresh")
+	}
+	return true
 }
 
 func newSupervisorMux(s *server) *http.ServeMux {
@@ -147,8 +294,10 @@ func newSupervisorMux(s *server) *http.ServeMux {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/dashboard", http.StatusFound)
 	})
-	mux.HandleFunc("/api/tasks", s.handleTasks)
-	mux.HandleFunc("/api/report", s.handleReport)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/readyz", s.handleReady)
+	mux.HandleFunc("/api/tasks", s.requireAgentAuth(s.handleTasks))
+	mux.HandleFunc("/api/report", s.requireAgentAuth(s.handleReport))
 	mux.HandleFunc("/api/agents", s.requireDashboardAuth(s.handleAgents))
 	mux.HandleFunc("/api/results", s.requireDashboardAuth(s.handleResults))
 	mux.HandleFunc("/ws", s.requireDashboardAuth(s.handleWebSocket))
@@ -158,6 +307,22 @@ func newSupervisorMux(s *server) *http.ServeMux {
 	mux.HandleFunc("/logout", s.handleLogout)
 	mux.HandleFunc("/dashboard", s.handleDashboard)
 	return mux
+}
+
+func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pinger, ok := s.store.(interface{ PingContext(context.Context) error }); ok {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		if err := pinger.PingContext(ctx); err != nil {
+			http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *server) handleTasks(w http.ResponseWriter, r *http.Request) {
@@ -175,9 +340,10 @@ func (s *server) handleTasks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	tasks := make([]model.Task, 0, len(s.cfg.Targets))
-	for _, target := range s.cfg.Targets {
-		tasks = append(tasks, model.Task{Target: target, Params: s.cfg.Params})
+	cfg := s.currentConfig()
+	tasks := make([]model.Task, 0, len(cfg.Targets))
+	for _, target := range cfg.Targets {
+		tasks = append(tasks, model.Task{Target: target, Params: cfg.Params})
 	}
 	writeJSON(w, tasks)
 }
@@ -188,6 +354,7 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, maxReportBodyBytes)
 	var raw json.RawMessage
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(&raw); err != nil {
@@ -211,12 +378,21 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "empty report payload", http.StatusBadRequest)
 		return
 	}
+	if len(results) > maxReportBatchSize {
+		http.Error(w, "too many report results", http.StatusRequestEntityTooLarge)
+		return
+	}
 	agentIP := remoteIP(r.RemoteAddr)
 	seenAt := time.Now()
 	validatedResults := make([]model.Result, 0, len(results))
 	for _, result := range results {
 		if err := validateReportResult(result); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cfg := s.currentConfig()
+		if !result.CheckedAt.IsZero() && (result.CheckedAt.After(seenAt.Add(10*time.Minute)) || result.CheckedAt.Before(seenAt.AddDate(0, 0, -cfg.RetentionDays))) {
+			http.Error(w, "checked_at is outside the accepted range", http.StatusBadRequest)
 			return
 		}
 		normalizeReport(&result, agentIP)
@@ -228,21 +404,8 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.resultsCache.clear()
+	s.updateAgentConnectivity(saved, seenAt)
 	s.hub.broadcastJSON(websocketEvent{Type: "results", Results: saved})
-	limit := s.cfg.FailureThreshold + 1
-	seenTargets := make(map[string]bool, len(saved))
-	for _, result := range saved {
-		key := result.TargetName + "\x00" + result.Address + "\x00" + strconv.Itoa(result.Port)
-		if seenTargets[key] {
-			continue
-		}
-		seenTargets[key] = true
-		failures, err := s.store.ConsecutiveFailures(result.TargetName, result.Address, result.Port, limit)
-		if err == nil && failures > s.cfg.FailureThreshold {
-			log.Printf("[ALERT] target=%s address=%s:%d consecutive_failures=%d threshold=%d",
-				result.TargetName, result.Address, result.Port, failures, s.cfg.FailureThreshold)
-		}
-	}
 	writeJSON(w, map[string]any{"status": "ok", "saved": len(results)})
 }
 
@@ -291,11 +454,34 @@ func validateReportResult(result model.Result) error {
 	if strings.TrimSpace(result.Agent) == "" {
 		return fmt.Errorf("agent is required")
 	}
+	if len(result.Agent) > 128 {
+		return fmt.Errorf("agent is too long")
+	}
 	if strings.TrimSpace(result.TargetName) == "" {
 		return fmt.Errorf("target_name is required")
 	}
+	if len(result.TargetName) > 256 {
+		return fmt.Errorf("target_name is too long")
+	}
 	if strings.TrimSpace(result.Address) == "" {
 		return fmt.Errorf("address is required")
+	}
+	if len(result.Address) > 512 {
+		return fmt.Errorf("address is too long")
+	}
+	if len(result.AgentIP) > 256 {
+		return fmt.Errorf("agent_ip is too long")
+	}
+	if len(result.Error) > 2048 {
+		return fmt.Errorf("error is too long")
+	}
+	if len(result.Labels) > 64 {
+		return fmt.Errorf("too many labels")
+	}
+	for _, label := range result.Labels {
+		if len(label) > 128 {
+			return fmt.Errorf("label is too long")
+		}
 	}
 	if result.Port < 1 || result.Port > 65535 {
 		return fmt.Errorf("invalid port")
@@ -309,7 +495,10 @@ func validateReportResult(result model.Result) error {
 	if result.SuccessCount+result.FailureCount <= 0 {
 		return fmt.Errorf("success_count and failure_count must include at least one sample")
 	}
-	if result.AverageLatencyMS < 0 {
+	if result.SuccessCount > 10000 || result.FailureCount > 10000 {
+		return fmt.Errorf("sample count is too large")
+	}
+	if result.AverageLatencyMS < 0 || math.IsNaN(result.AverageLatencyMS) || math.IsInf(result.AverageLatencyMS, 0) {
 		return fmt.Errorf("average_latency_ms must be non-negative")
 	}
 	if result.SuccessRate < 0 || result.SuccessRate > 1 {
@@ -331,22 +520,83 @@ func normalizeReport(result *model.Result, agentIP string) {
 	}
 }
 
+func (s *server) updateAgentConnectivity(results []model.Result, now time.Time) {
+	type round struct{ total, failed int }
+	rounds := make(map[string]round)
+	for _, result := range results {
+		r := rounds[result.Agent]
+		r.total++
+		if result.SuccessCount == 0 {
+			r.failed++
+		}
+		rounds[result.Agent] = r
+	}
+	threshold := s.currentConfig().FailureThreshold
+	if threshold < 1 {
+		threshold = 1
+	}
+	s.connectivityMu.Lock()
+	defer s.connectivityMu.Unlock()
+	if s.connectivity == nil {
+		s.connectivity = make(map[string]agentConnectivity)
+	}
+	for agent, round := range rounds {
+		state := s.connectivity[agent]
+		failed := round.failed*2 > round.total
+		if failed {
+			state.ConsecutiveFailures++
+			if state.FirstFailedAt.IsZero() {
+				state.FirstFailedAt = now
+			}
+			if state.ConsecutiveFailures >= threshold {
+				if state.Status != "failed" {
+					state.Status = "failed"
+					state.LastChangedAt = now
+					log.Printf("[ALERT] agent=%s connectivity=failed consecutive_rounds=%d", agent, state.ConsecutiveFailures)
+				}
+			} else if state.Status != "checking" {
+				state.Status = "checking"
+				state.LastChangedAt = now
+			}
+		} else {
+			if state.Status == "failed" {
+				log.Printf("[RECOVERY] agent=%s connectivity=ok", agent)
+			}
+			if state.Status != "ok" {
+				state.LastChangedAt = now
+			}
+			state.Status = "ok"
+			state.ConsecutiveFailures = 0
+			state.FirstFailedAt = time.Time{}
+		}
+		s.connectivity[agent] = state
+	}
+}
+
+func (s *server) connectivityFor(agent string) agentConnectivity {
+	s.connectivityMu.Lock()
+	defer s.connectivityMu.Unlock()
+	return s.connectivity[agent]
+}
+
 func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if !s.dashboardAuthenticated(r) {
 		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
 		return
 	}
 	selectedRange := s.selectedRange(r)
+	cfg := s.currentConfig()
 	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, max-age=10")
 	if err := s.tpl.Execute(w, dashboardData{
 		Agent:               agent,
-		Ranges:              s.cfg.DashboardRanges,
+		Ranges:              cfg.DashboardRanges,
 		SelectedRange:       selectedRange,
-		CustomRange:         !rangeInList(selectedRange, s.cfg.DashboardRanges),
+		CustomRange:         !rangeInList(selectedRange, cfg.DashboardRanges),
 		OfflineAfterSeconds: s.agentOfflineAfterSeconds(),
-		RollupIntervalMins:  s.cfg.RollupIntervalMins,
+		RollupIntervalMins:  cfg.RollupIntervalMins,
+		AssetVersion:        embeddedAssetVersion,
 	}); err != nil {
 		log.Printf("render dashboard: %v", err)
 	}
@@ -401,16 +651,25 @@ func (s *server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	out := make([]agentStatusView, 0, len(statuses))
 	for _, status := range statuses {
 		state := "online"
+		connectivity := s.connectivityFor(status.Agent)
+		if connectivity.Status == "" {
+			connectivity.Status = "unknown"
+		}
 		if now.Sub(status.LastSeenAt) > time.Duration(offlineAfter)*time.Second {
 			state = "offline"
+		} else if connectivity.Status == "failed" {
+			state = "degraded"
 		}
 		out = append(out, agentStatusView{
-			Agent:               status.Agent,
-			AgentIP:             status.AgentIP,
-			FirstSeenAt:         status.FirstSeenAt,
-			LastSeenAt:          status.LastSeenAt,
-			OfflineAfterSeconds: offlineAfter,
-			Status:              state,
+			Agent:                 status.Agent,
+			AgentIP:               status.AgentIP,
+			FirstSeenAt:           status.FirstSeenAt,
+			LastSeenAt:            status.LastSeenAt,
+			OfflineAfterSeconds:   offlineAfter,
+			Status:                state,
+			Connectivity:          connectivity.Status,
+			ConsecutiveFailures:   connectivity.ConsecutiveFailures,
+			ConnectivityChangedAt: connectivity.LastChangedAt,
 		})
 	}
 	writeJSON(w, out)
@@ -426,6 +685,9 @@ func (s *server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.connectivityMu.Lock()
+	delete(s.connectivity, agent)
+	s.connectivityMu.Unlock()
 	s.resultsCache.clear()
 	if s.hub != nil {
 		s.hub.broadcast("refresh")
@@ -434,9 +696,10 @@ func (s *server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) agentOfflineAfterSeconds() int {
-	seconds := s.cfg.Params.ScheduleSeconds
+	cfg := s.currentConfig()
+	seconds := cfg.Params.ScheduleSeconds
 	if seconds <= 0 {
-		seconds = s.cfg.TaskIntervalSeconds
+		seconds = cfg.TaskIntervalSeconds
 	}
 	if seconds <= 0 {
 		seconds = 30
@@ -445,6 +708,7 @@ func (s *server) agentOfflineAfterSeconds() int {
 }
 
 func (s *server) selectedRange(r *http.Request) string {
+	cfg := s.currentConfig()
 	raw := r.URL.Query().Get("range")
 	if raw == "" {
 		if cookie, err := r.Cookie("pingmon_range"); err == nil {
@@ -452,9 +716,9 @@ func (s *server) selectedRange(r *http.Request) string {
 		}
 	}
 	if raw == "" {
-		raw = s.cfg.DefaultRange
+		raw = cfg.DefaultRange
 	}
-	for _, allowed := range s.cfg.DashboardRanges {
+	for _, allowed := range cfg.DashboardRanges {
 		if raw == allowed {
 			return raw
 		}
@@ -462,14 +726,14 @@ func (s *server) selectedRange(r *http.Request) string {
 	if _, ok := parseRangeDuration(raw); ok {
 		return strings.TrimSpace(strings.ToLower(raw))
 	}
-	if len(s.cfg.DashboardRanges) > 0 {
-		return s.cfg.DashboardRanges[0]
+	if len(cfg.DashboardRanges) > 0 {
+		return cfg.DashboardRanges[0]
 	}
 	return "24h"
 }
 
 func (s *server) resultsSince(since time.Time, agent string) ([]model.Result, error) {
-	rawCutoff := time.Now().AddDate(0, 0, -s.cfg.RawRetentionDays)
+	rawCutoff := time.Now().AddDate(0, 0, -s.currentConfig().RawRetentionDays)
 	if since.Before(rawCutoff) {
 		if agent != "" {
 			return s.store.ResultsSinceCompactedForAgent(since, rawCutoff, agent)
@@ -507,7 +771,7 @@ func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, age
 }
 
 func (s *server) streamResultsSince(since time.Time, agent string, fn func(model.Result) error) error {
-	rawCutoff := time.Now().AddDate(0, 0, -s.cfg.RawRetentionDays)
+	rawCutoff := time.Now().AddDate(0, 0, -s.currentConfig().RawRetentionDays)
 	if since.Before(rawCutoff) {
 		return s.store.StreamResultsSinceCompacted(since, rawCutoff, agent, fn)
 	}
@@ -648,6 +912,18 @@ func (h *websocketHub) broadcast(message string) {
 	h.broadcastBytes([]byte(message))
 }
 
+func (h *websocketHub) closeAll() {
+	h.mu.Lock()
+	clients := make([]*wsClient, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.mu.Unlock()
+	for _, c := range clients {
+		h.remove(c)
+	}
+}
+
 func (h *websocketHub) broadcastBytes(payload []byte) {
 	h.mu.Lock()
 	clients := make([]*wsClient, 0, len(h.clients))
@@ -675,6 +951,23 @@ func (h *websocketHub) broadcastJSON(event websocketEvent) {
 	h.broadcastBytes(payload)
 }
 
+func (s *server) requireAgentAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimSpace(s.currentConfig().AgentToken)
+		if token == "" {
+			next(w, r)
+			return
+		}
+		provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="pingmon-agent"`)
+			http.Error(w, "agent authentication required", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func (s *server) requireDashboardAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.dashboardAuthenticated(r) {
@@ -686,10 +979,11 @@ func (s *server) requireDashboardAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *server) dashboardAuthenticated(r *http.Request) bool {
+	cfg := s.currentConfig()
 	user, pass, ok := r.BasicAuth()
 	if ok &&
-		subtle.ConstantTimeCompare([]byte(user), []byte(s.cfg.DashboardUser)) == 1 &&
-		subtle.ConstantTimeCompare([]byte(pass), []byte(s.cfg.DashboardPassword)) == 1 {
+		subtle.ConstantTimeCompare([]byte(user), []byte(cfg.DashboardUser)) == 1 &&
+		subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.DashboardPassword)) == 1 {
 		return true
 	}
 	// Browsers may retain same-name cookies with different Path or Domain
@@ -725,8 +1019,9 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	user := r.Form.Get("username")
 	pass := r.Form.Get("password")
-	if subtle.ConstantTimeCompare([]byte(user), []byte(s.cfg.DashboardUser)) != 1 ||
-		subtle.ConstantTimeCompare([]byte(pass), []byte(s.cfg.DashboardPassword)) != 1 {
+	cfg := s.currentConfig()
+	if subtle.ConstantTimeCompare([]byte(user), []byte(cfg.DashboardUser)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.DashboardPassword)) != 1 {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = io.WriteString(w, strings.ReplaceAll(strings.ReplaceAll(loginHTML, "{{NEXT}}", template.HTMLEscapeString(next)), "{{ERROR}}", "用户名或密码错误"))
@@ -771,6 +1066,7 @@ func dashboardAuthKey(cfg config.Config) []byte {
 }
 
 func (s *server) validDashboardCookie(value string) bool {
+	cfg := s.currentConfig()
 	encodedPayload, encodedSignature, ok := strings.Cut(value, ".")
 	if !ok {
 		return false
@@ -789,7 +1085,7 @@ func (s *server) validDashboardCookie(value string) bool {
 		return false
 	}
 	user, expiresText, ok := strings.Cut(string(payload), "\n")
-	if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(s.cfg.DashboardUser)) != 1 {
+	if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(cfg.DashboardUser)) != 1 {
 		return false
 	}
 	expiresUnix, err := strconv.ParseInt(expiresText, 10, 64)
@@ -804,20 +1100,26 @@ func (s *server) dashboardSession(user string, expires time.Time) string {
 		base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func (s *server) startRetentionCleaner() {
+func (s *server) startRetentionCleaner(ctx context.Context) {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 	s.cleanOldData()
-	for range ticker.C {
-		s.cleanOldData()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.cleanOldData()
+		}
 	}
 }
 
 func (s *server) cleanOldData() {
 	now := time.Now()
-	rawCutoff := now.AddDate(0, 0, -s.cfg.RawRetentionDays)
-	retentionCutoff := now.AddDate(0, 0, -s.cfg.RetentionDays)
-	rollupInterval := time.Duration(s.cfg.RollupIntervalMins) * time.Minute
+	cfg := s.currentConfig()
+	rawCutoff := now.AddDate(0, 0, -cfg.RawRetentionDays)
+	retentionCutoff := now.AddDate(0, 0, -cfg.RetentionDays)
+	rollupInterval := time.Duration(cfg.RollupIntervalMins) * time.Minute
 
 	rolled, err := s.store.RollupBefore(rawCutoff, rollupInterval)
 	if err != nil {
@@ -914,6 +1216,8 @@ type resultsCache struct {
 	mu         sync.RWMutex
 	ttl        time.Duration
 	maxEntries int
+	maxBytes   int
+	bytes      int
 	entries    map[resultsCacheKey]resultsCacheEntry
 }
 
@@ -925,6 +1229,7 @@ func newResultsCache(ttl time.Duration, maxEntries ...int) *resultsCache {
 	return &resultsCache{
 		ttl:        ttl,
 		maxEntries: max,
+		maxBytes:   resultsCacheMaxBytes,
 		entries:    make(map[resultsCacheKey]resultsCacheEntry),
 	}
 }
@@ -941,6 +1246,7 @@ func (c *resultsCache) get(key resultsCacheKey) ([]byte, bool) {
 		if ok {
 			c.mu.Lock()
 			if current, exists := c.entries[key]; exists && now.After(current.expiresAt) {
+				c.bytes -= len(current.data)
 				delete(c.entries, key)
 			}
 			c.mu.Unlock()
@@ -955,14 +1261,22 @@ func (c *resultsCache) set(key resultsCacheKey, data []byte) {
 	if c == nil || c.ttl <= 0 {
 		return
 	}
+	if c.maxBytes > 0 && len(data) > c.maxBytes {
+		return
+	}
 	c.mu.Lock()
 	now := time.Now()
 	for existingKey, entry := range c.entries {
 		if !now.Before(entry.expiresAt) {
+			c.bytes -= len(entry.data)
 			delete(c.entries, existingKey)
 		}
 	}
-	if c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
+	if previous, ok := c.entries[key]; ok {
+		c.bytes -= len(previous.data)
+		delete(c.entries, key)
+	}
+	for (c.maxEntries > 0 && len(c.entries) >= c.maxEntries) || (c.maxBytes > 0 && c.bytes+len(data) > c.maxBytes) {
 		var oldestKey resultsCacheKey
 		var oldestExpiry time.Time
 		for existingKey, entry := range c.entries {
@@ -970,12 +1284,14 @@ func (c *resultsCache) set(key resultsCacheKey, data []byte) {
 				oldestKey, oldestExpiry = existingKey, entry.expiresAt
 			}
 		}
+		c.bytes -= len(c.entries[oldestKey].data)
 		delete(c.entries, oldestKey)
 	}
 	c.entries[key] = resultsCacheEntry{
 		data:      append([]byte(nil), data...),
 		expiresAt: now.Add(c.ttl),
 	}
+	c.bytes += len(data)
 	c.mu.Unlock()
 }
 
@@ -985,5 +1301,6 @@ func (c *resultsCache) clear() {
 	}
 	c.mu.Lock()
 	c.entries = make(map[resultsCacheKey]resultsCacheEntry)
+	c.bytes = 0
 	c.mu.Unlock()
 }

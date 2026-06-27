@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,8 +10,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"pingmon/internal/config"
@@ -21,6 +25,7 @@ var supervisorHTTPClient = &http.Client{Timeout: 10 * time.Second}
 var publicIPHTTPClient = &http.Client{Timeout: 3 * time.Second}
 
 const agentIPCacheTTL = 15 * time.Minute
+const uploadBatchSize = 200
 
 var agentIPCache struct {
 	sync.Mutex
@@ -50,34 +55,101 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	pending := make([]model.Result, 0)
+	consecutiveFailures := 0
 	for {
-		sleepSeconds, err := runCycle(base, cfg)
+		cycleStarted := time.Now()
+		sleepSeconds, batch, err := collectCycle(ctx, base, cfg)
+		if err == nil {
+			pending = appendPendingResults(pending, batch, cfg.MaxPendingResults)
+			if len(pending) > 0 {
+				pending, err = uploadPendingResults(ctx, base, pending, cfg.AgentToken)
+			}
+		}
 		if err != nil {
-			log.Printf("cycle failed: %v", err)
-			sleepSeconds = cfg.PollIntervalSeconds
+			consecutiveFailures++
+			log.Printf("cycle failed (pending=%d): %v", len(pending), err)
+			sleepSeconds = retrySeconds(cfg.PollIntervalSeconds, consecutiveFailures)
+		} else {
+			consecutiveFailures = 0
 		}
 		if *once {
 			return
 		}
-		time.Sleep(time.Duration(sleepSeconds) * time.Second)
+		delay := time.Duration(sleepSeconds)*time.Second - time.Since(cycleStarted)
+		if delay < 0 {
+			delay = 0
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
 	}
 }
 
-func runCycle(supervisor string, cfg config.AgentConfig) (int, error) {
+func uploadPendingResults(ctx context.Context, supervisor string, pending []model.Result, token string) ([]model.Result, error) {
+	for len(pending) > 0 {
+		n := uploadBatchSize
+		if n > len(pending) {
+			n = len(pending)
+		}
+		if err := uploadResults(ctx, supervisor, pending[:n], token); err != nil {
+			return pending, err
+		}
+		pending = pending[n:]
+	}
+	return pending, nil
+}
+
+func collectCycle(ctx context.Context, supervisor string, cfg config.AgentConfig) (int, []model.Result, error) {
 	agentIP := fetchAgentIP(cfg)
-	tasks, err := fetchTasks(supervisor, cfg.AgentName, agentIP)
+	tasks, err := fetchTasks(ctx, supervisor, cfg.AgentName, agentIP, cfg.AgentToken)
 	if err != nil {
-		return cfg.PollIntervalSeconds, err
+		return cfg.PollIntervalSeconds, nil, err
 	}
 	sleepSeconds := nextPollInterval(tasks, cfg.PollIntervalSeconds)
-	batch := probeTasks(cfg, tasks, agentIP, tcpPing)
-	if len(batch) == 0 {
-		return sleepSeconds, nil
-	}
-	return sleepSeconds, uploadResults(supervisor, batch)
+	batch := probeTasks(ctx, cfg, tasks, agentIP, tcpPing)
+	return sleepSeconds, batch, nil
 }
 
-func probeTasks(cfg config.AgentConfig, tasks []model.Task, agentIP string, probe func(string, model.Task) model.Result) []model.Result {
+func appendPendingResults(pending, batch []model.Result, maximum int) []model.Result {
+	pending = append(pending, batch...)
+	if maximum > 0 && len(pending) > maximum {
+		pending = append([]model.Result(nil), pending[len(pending)-maximum:]...)
+	}
+	return pending
+}
+
+func retrySeconds(base, failures int) int {
+	if base <= 0 {
+		base = 30
+	}
+	if failures < 1 {
+		return base
+	}
+	shift := failures - 1
+	if shift > 4 {
+		shift = 4
+	}
+	seconds := base * (1 << shift)
+	if seconds > 300 {
+		seconds = 300
+	}
+	// Small time-based jitter prevents many agents reconnecting simultaneously.
+	jitter := seconds / 5
+	if jitter > 0 {
+		seconds += int(time.Now().UnixNano()%int64(jitter*2+1)) - jitter
+	}
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
+func probeTasks(ctx context.Context, cfg config.AgentConfig, tasks []model.Task, agentIP string, probe func(context.Context, string, model.Task) model.Result) []model.Result {
 	concurrency := cfg.ProbeConcurrency
 	if concurrency <= 0 {
 		concurrency = 20
@@ -96,7 +168,10 @@ func probeTasks(cfg config.AgentConfig, tasks []model.Task, agentIP string, prob
 		go func() {
 			defer wg.Done()
 			for task := range jobs {
-				result := probe(cfg.AgentName, task)
+				if ctx.Err() != nil {
+					return
+				}
+				result := probe(ctx, cfg.AgentName, task)
 				result.AgentIP = agentIP
 				results <- result
 			}
@@ -104,7 +179,14 @@ func probeTasks(cfg config.AgentConfig, tasks []model.Task, agentIP string, prob
 	}
 	go func() {
 		for _, task := range tasks {
-			jobs <- task
+			select {
+			case jobs <- task:
+			case <-ctx.Done():
+				close(jobs)
+				wg.Wait()
+				close(results)
+				return
+			}
 		}
 		close(jobs)
 		wg.Wait()
@@ -129,7 +211,7 @@ func nextPollInterval(tasks []model.Task, fallback int) int {
 	return fallback
 }
 
-func fetchTasks(supervisor, agent, agentIP string) ([]model.Task, error) {
+func fetchTasks(ctx context.Context, supervisor, agent, agentIP, token string) ([]model.Task, error) {
 	taskURL, err := url.Parse(supervisor + "/api/tasks")
 	if err != nil {
 		return nil, err
@@ -142,7 +224,12 @@ func fetchTasks(supervisor, agent, agentIP string) ([]model.Task, error) {
 		query.Set("agent_ip", agentIP)
 	}
 	taskURL.RawQuery = query.Encode()
-	resp, err := supervisorHTTPClient.Get(taskURL.String())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, taskURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	setBearerToken(req, token)
+	resp, err := supervisorHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +329,7 @@ func fetchPublicIP(endpoint string) (string, error) {
 	return ip, nil
 }
 
-func tcpPing(agent string, task model.Task) model.Result {
+func tcpPing(ctx context.Context, agent string, task model.Task) model.Result {
 	params := task.Params
 	if params.Count <= 0 {
 		params.Count = 3
@@ -271,7 +358,7 @@ func tcpPing(agent string, task model.Task) model.Result {
 	var latencySum time.Duration
 	for i := 0; i < params.Count; i++ {
 		start := time.Now()
-		conn, err := net.DialTimeout(network, address, timeout)
+		conn, err := (&net.Dialer{Timeout: timeout}).DialContext(ctx, network, address)
 		if err != nil {
 			result.FailureCount++
 			result.Error = err.Error()
@@ -281,7 +368,12 @@ func tcpPing(agent string, task model.Task) model.Result {
 			_ = conn.Close()
 		}
 		if i < params.Count-1 {
-			time.Sleep(interval)
+			select {
+			case <-ctx.Done():
+				result.Error = ctx.Err().Error()
+				return result
+			case <-time.After(interval):
+			}
 		}
 	}
 	if result.SuccessCount > 0 {
@@ -294,12 +386,18 @@ func tcpPing(agent string, task model.Task) model.Result {
 	return result
 }
 
-func uploadResults(supervisor string, results []model.Result) error {
+func uploadResults(ctx context.Context, supervisor string, results []model.Result, token string) error {
 	body, err := json.Marshal(results)
 	if err != nil {
 		return err
 	}
-	resp, err := supervisorHTTPClient.Post(supervisor+"/api/report", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, supervisor+"/api/report", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setBearerToken(req, token)
+	resp, err := supervisorHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -308,6 +406,12 @@ func uploadResults(supervisor string, results []model.Result) error {
 		return fmt.Errorf("report status: %s", resp.Status)
 	}
 	return nil
+}
+
+func setBearerToken(req *http.Request, token string) {
+	if token = strings.TrimSpace(token); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 func normalizeBaseURL(raw string) (string, error) {

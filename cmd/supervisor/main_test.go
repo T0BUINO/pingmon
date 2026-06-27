@@ -347,10 +347,6 @@ func (s *fakeStore) Vacuum() error {
 	return nil
 }
 
-func (s *fakeStore) ConsecutiveFailures(targetName, address string, port int, limit int) (int, error) {
-	return 0, nil
-}
-
 func TestHandleDashboardResultsStreamsFromDB(t *testing.T) {
 	now := time.Now().UTC()
 	store := &fakeStore{
@@ -600,6 +596,73 @@ func equalLabels(got, want []string) bool {
 		return true
 	}
 	return reflect.DeepEqual(got, want)
+}
+
+func TestAgentBearerTokenProtectsAPI(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.AgentToken = "secret"
+	s := &server{cfg: cfg, store: &fakeStore{}, hub: newWebsocketHub(), resultsCache: newResultsCache(time.Second, 2)}
+	mux := newSupervisorMux(s)
+
+	unauthorized := httptest.NewRecorder()
+	mux.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/api/tasks", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("without token status = %d, want 401", unauthorized.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/tasks", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	authorized := httptest.NewRecorder()
+	mux.ServeHTTP(authorized, req)
+	if authorized.Code != http.StatusOK {
+		t.Fatalf("with token status = %d, want 200", authorized.Code)
+	}
+}
+
+func TestApplyReloadedConfigUpdatesDynamicFieldsOnly(t *testing.T) {
+	current := config.DefaultConfig()
+	current.Listen = ":8080"
+	current.SQLitePath = "old.db"
+	s := &server{cfg: current, hub: newWebsocketHub(), resultsCache: newResultsCache(time.Second, 2)}
+	loaded := current
+	loaded.Listen = ":9090"
+	loaded.SQLitePath = "new.db"
+	loaded.AgentToken = "new-token"
+	loaded.Params.ScheduleSeconds = 60
+	if !s.applyReloadedConfig(loaded) {
+		t.Fatal("reload reported no change")
+	}
+	got := s.currentConfig()
+	if got.Listen != current.Listen || got.SQLitePath != current.SQLitePath {
+		t.Fatalf("restart-only fields changed: %+v", got)
+	}
+	if got.AgentToken != "new-token" || got.Params.ScheduleSeconds != 60 {
+		t.Fatalf("dynamic fields not applied: %+v", got)
+	}
+}
+
+func TestAgentConnectivityUsesMajorityAndThreshold(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.FailureThreshold = 2
+	s := &server{cfg: cfg}
+	now := time.Now()
+	failedRound := []model.Result{
+		{Agent: "agent-1", TargetName: "a", FailureCount: 1},
+		{Agent: "agent-1", TargetName: "b", FailureCount: 1},
+		{Agent: "agent-1", TargetName: "c", SuccessCount: 1},
+	}
+	s.updateAgentConnectivity(failedRound, now)
+	if got := s.connectivityFor("agent-1"); got.Status != "checking" || got.ConsecutiveFailures != 1 {
+		t.Fatalf("first failed round = %+v", got)
+	}
+	s.updateAgentConnectivity(failedRound, now.Add(time.Second))
+	if got := s.connectivityFor("agent-1"); got.Status != "failed" || got.ConsecutiveFailures != 2 {
+		t.Fatalf("second failed round = %+v", got)
+	}
+	s.updateAgentConnectivity([]model.Result{{Agent: "agent-1", SuccessCount: 1}}, now.Add(2*time.Second))
+	if got := s.connectivityFor("agent-1"); got.Status != "ok" || got.ConsecutiveFailures != 0 {
+		t.Fatalf("recovered round = %+v", got)
+	}
 }
 
 func TestHandleTasksSavesAgentHeartbeat(t *testing.T) {
@@ -858,6 +921,30 @@ func TestAggregateRowsByTime_EmptyInput(t *testing.T) {
 	}
 }
 
+func TestAggregateSingleSeriesPreservesCountsAndWeightedLatency(t *testing.T) {
+	base := time.Now().UTC()
+	results := []model.Result{
+		{Agent: "a", TargetName: "t", Address: "1.1.1.1", Port: 53, CheckedAt: base, SuccessCount: 3, AverageLatencyMS: 10, SuccessRate: 1},
+		{Agent: "a", TargetName: "t", Address: "1.1.1.1", Port: 53, CheckedAt: base.Add(-time.Second), FailureCount: 2, SuccessRate: 0, Error: "timeout"},
+	}
+	rows := make([]agentRow, 0, len(results))
+	for _, result := range results {
+		row, err := newAgentRow(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows = append(rows, row)
+	}
+	got := aggregateSingleSeries(rows, base.Add(-2*time.Second), 1)
+	if len(got) != 1 {
+		t.Fatalf("rows = %d", len(got))
+	}
+	result := got[0].result
+	if result.SuccessCount != 3 || result.FailureCount != 2 || result.AverageLatencyMS != 10 || result.SuccessRate != 0.6 || result.Error == "" {
+		t.Fatalf("aggregated result = %+v", result)
+	}
+}
+
 func TestAggregateRowsByTime_SameBucket(t *testing.T) {
 	base := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
 	rows := make([]agentRow, 100)
@@ -981,6 +1068,18 @@ func TestResultsCacheEvictsWhenCapacityExceeded(t *testing.T) {
 	defer cache.mu.RUnlock()
 	if len(cache.entries) != 2 {
 		t.Fatalf("cache entries = %d, want 2", len(cache.entries))
+	}
+}
+
+func TestResultsCacheRespectsByteLimit(t *testing.T) {
+	cache := newResultsCache(time.Minute, 10)
+	cache.maxBytes = 5
+	cache.set(resultsCacheKey{selectedRange: "1h"}, []byte("1234"))
+	cache.set(resultsCacheKey{selectedRange: "2h"}, []byte("5678"))
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+	if cache.bytes > cache.maxBytes || len(cache.entries) != 1 {
+		t.Fatalf("cache bytes=%d entries=%d", cache.bytes, len(cache.entries))
 	}
 }
 

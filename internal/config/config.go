@@ -18,6 +18,7 @@ type Config struct {
 	SQLitePath          string             `json:"sqlite_path"`
 	DashboardUser       string             `json:"dashboard_user"`
 	DashboardPassword   string             `json:"dashboard_password"`
+	AgentToken          string             `json:"agent_token"`
 	DashboardRanges     []string           `json:"dashboard_ranges"`
 	DefaultRange        string             `json:"default_range"`
 	RetentionDays       int                `json:"retention_days"`
@@ -34,6 +35,8 @@ type AgentConfig struct {
 	AgentName           string `json:"agent_name"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds"`
 	ProbeConcurrency    int    `json:"probe_concurrency"`
+	AgentToken          string `json:"agent_token"`
+	MaxPendingResults   int    `json:"max_pending_results"`
 	PublicIPv4URL       string `json:"public_ipv4_url"`
 	PublicIPv6URL       string `json:"public_ipv6_url"`
 }
@@ -71,6 +74,7 @@ func DefaultAgentConfig() AgentConfig {
 		AgentName:           host,
 		PollIntervalSeconds: 30,
 		ProbeConcurrency:    20,
+		MaxPendingResults:   1000,
 		PublicIPv4URL:       "https://api-ipv4.ip.sb/ip",
 		PublicIPv6URL:       "https://api-ipv6.ip.sb/ip",
 	}
@@ -127,6 +131,9 @@ func LoadAgent(path, format string) (AgentConfig, error) {
 	}
 	if cfg.ProbeConcurrency <= 0 {
 		cfg.ProbeConcurrency = 20
+	}
+	if cfg.MaxPendingResults <= 0 {
+		cfg.MaxPendingResults = 1000
 	}
 	if cfg.AgentName == "" {
 		cfg.AgentName = DefaultAgentConfig().AgentName
@@ -290,6 +297,14 @@ func parseAgentTOML(input string, cfg *AgentConfig) error {
 				return fmt.Errorf("line %d: %w", lineNumber, err)
 			}
 			cfg.ProbeConcurrency = n
+		case "agent_token":
+			cfg.AgentToken = parseString(value)
+		case "max_pending_results":
+			n, err := parseInt(key, value)
+			if err != nil {
+				return fmt.Errorf("line %d: %w", lineNumber, err)
+			}
+			cfg.MaxPendingResults = n
 		case "public_ipv4_url":
 			cfg.PublicIPv4URL = parseString(value)
 		case "public_ipv6_url":
@@ -317,6 +332,8 @@ func setConfigValue(cfg *Config, key, value string) error {
 		cfg.DashboardUser = parseString(value)
 	case "dashboard_password":
 		cfg.DashboardPassword = parseString(value)
+	case "agent_token":
+		cfg.AgentToken = parseString(value)
 	case "dashboard_ranges":
 		cfg.DashboardRanges = parseStringArray(value)
 	case "default_range":

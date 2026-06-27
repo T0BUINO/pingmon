@@ -116,6 +116,22 @@ curl -X DELETE -u admin:change-me \
 
 删除节点会同时移除心跳、原始结果、聚合结果和序列元数据，且不可恢复。
 
+## Agent API 认证
+
+在 supervisor 与 agent 配置中设置相同的 `agent_token` 后，`/api/tasks` 与 `/api/report` 将要求 Bearer Token。留空可兼容旧部署，但公网部署建议务必启用。PowerShell 可生成随机 Token：
+
+```powershell
+[Convert]::ToHexString((1..32 | ForEach-Object { Get-Random -Maximum 256 }))
+```
+
+Agent 上报失败时会在内存中保留最多 `max_pending_results` 条结果，并以最多 200 条一批补报。默认上限为 1000，避免低配置机器出现无界内存增长。
+
+## 配置热加载
+
+Supervisor 每 5 秒检查一次配置文件。targets、探测参数、保留策略、Dashboard 范围、告警阈值和 `agent_token` 可热加载；`listen`、`sqlite_path`、Dashboard 用户名和密码变更需要重启。无效的新配置会被拒绝，服务继续使用上一份有效配置。
+
+健康检查端点为 `/healthz`，包含 SQLite 就绪检查的端点为 `/readyz`。
+
 ## Docker
 
 Dockerfile 从 GitHub Release 下载与目标架构匹配的预编译包：

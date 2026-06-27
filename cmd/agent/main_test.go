@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,6 +16,9 @@ import (
 
 func TestFetchTasksIncludesAgentIdentity(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Errorf("Authorization = %q", got)
+		}
 		if got := r.URL.Query().Get("agent"); got != "agent-1" {
 			t.Errorf("agent = %q", got)
 		}
@@ -25,12 +29,21 @@ func TestFetchTasksIncludesAgentIdentity(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tasks, err := fetchTasks(server.URL, "agent-1", "203.0.113.1")
+	tasks, err := fetchTasks(context.Background(), server.URL, "agent-1", "203.0.113.1", "secret")
 	if err != nil {
 		t.Fatalf("fetchTasks: %v", err)
 	}
 	if got := nextPollInterval(tasks, 30); got != 12 {
 		t.Fatalf("nextPollInterval = %d, want 12", got)
+	}
+}
+
+func TestAppendPendingResultsIsBounded(t *testing.T) {
+	pending := []model.Result{{TargetName: "old"}}
+	batch := []model.Result{{TargetName: "middle"}, {TargetName: "new"}}
+	got := appendPendingResults(pending, batch, 2)
+	if len(got) != 2 || got[0].TargetName != "middle" || got[1].TargetName != "new" {
+		t.Fatalf("bounded pending = %+v", got)
 	}
 }
 
@@ -40,7 +53,7 @@ func TestProbeTasksLimitsConcurrencyAndKeepsAllResults(t *testing.T) {
 	tasks := make([]model.Task, taskCount)
 	var active atomic.Int32
 	var peak atomic.Int32
-	probe := func(agent string, task model.Task) model.Result {
+	probe := func(_ context.Context, agent string, task model.Task) model.Result {
 		current := active.Add(1)
 		for {
 			old := peak.Load()
@@ -55,7 +68,7 @@ func TestProbeTasksLimitsConcurrencyAndKeepsAllResults(t *testing.T) {
 	for i := range tasks {
 		tasks[i].Target.Name = fmt.Sprintf("target-%d", i)
 	}
-	results := probeTasks(config.AgentConfig{AgentName: "agent-1", ProbeConcurrency: concurrency}, tasks, "203.0.113.1", probe)
+	results := probeTasks(context.Background(), config.AgentConfig{AgentName: "agent-1", ProbeConcurrency: concurrency}, tasks, "203.0.113.1", probe)
 	if len(results) != taskCount {
 		t.Fatalf("results = %d, want %d", len(results), taskCount)
 	}
@@ -94,7 +107,7 @@ func TestUploadResultsUsesClientTimeout(t *testing.T) {
 	supervisorHTTPClient = &http.Client{Timeout: 20 * time.Millisecond}
 	t.Cleanup(func() { supervisorHTTPClient = previous })
 
-	err := uploadResults(server.URL, []model.Result{{Agent: "agent-1"}})
+	err := uploadResults(context.Background(), server.URL, []model.Result{{Agent: "agent-1"}}, "")
 	if err == nil {
 		t.Fatal("uploadResults succeeded, want timeout")
 	}
