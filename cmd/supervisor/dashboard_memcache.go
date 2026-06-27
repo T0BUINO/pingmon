@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -110,7 +111,7 @@ func estimateMB(rows []agentRow) int {
 
 func (s *server) serveStreamDirect(w http.ResponseWriter, since time.Time, agent string) {
 	log.Printf("serveStreamDirect: agent=%q, since=%v", agent, since)
-	
+
 	var rows []agentRow
 	if err := s.streamResultsSince(since, agent, func(result model.Result) error {
 		line, err := marshalDashboardResult(result)
@@ -140,7 +141,7 @@ func (s *server) serveStreamDirect(w http.ResponseWriter, since time.Time, agent
 func (s *server) buildCache(agent string, since time.Time) []agentRow {
 	var rows []agentRow
 	log.Printf("buildCache called with agent=%q, since=%v", agent, since)
-	
+
 	if err := s.streamResultsSince(since, agent, func(result model.Result) error {
 		line, err := marshalDashboardResult(result)
 		if err != nil {
@@ -155,7 +156,7 @@ func (s *server) buildCache(agent string, since time.Time) []agentRow {
 		log.Printf("build cache agent=%q: %v", agent, err)
 	}
 	log.Printf("buildCache: agent=%q, total rows=%d", agent, len(rows))
-	
+
 	targets := make(map[string]bool)
 	agents := make(map[string]bool)
 	for _, row := range rows {
@@ -173,12 +174,12 @@ func (s *server) buildCache(agent string, since time.Time) []agentRow {
 	}
 	log.Printf("buildCache: agents in cache: %d unique agents", len(agents))
 	log.Printf("buildCache: targets in cache: %d unique targets", len(targets))
-	
+
 	// 检查几个实际的数据行
 	for i := 0; i < min(3, len(rows)); i++ {
 		log.Printf("buildCache: sample row %d: %s", i, string(rows[i].data))
 	}
-	
+
 	if len(rows) > 0 {
 		s.dashMem.set(agent, rows)
 	}
@@ -188,23 +189,23 @@ func (s *server) buildCache(agent string, since time.Time) []agentRow {
 func serveFromCache(w http.ResponseWriter, rows []agentRow, since time.Time) {
 	sinceUnix := since.UnixNano()
 	log.Printf("serveFromCache: total rows=%d, since=%d", len(rows), sinceUnix)
-	
+
 	cut := findFirstLessThan(rows, sinceUnix)
 	log.Printf("findFirstLessAt: cut=%d", cut)
-	
+
 	filtered := rows[:cut]
 	log.Printf("After time filter: rows=%d", len(filtered))
-	
+
 	// 检查过滤后的数据中的时间范围
 	if len(filtered) > 0 {
 		minTime := filtered[len(filtered)-1].checkedAt
 		maxTime := filtered[0].checkedAt
 		log.Printf("Filtered data time range: min=%d, max=%d", minTime, maxTime)
 	}
-	
+
 	filtered = aggregateRowsByTime(filtered, since, maxChartPoints)
 	log.Printf("After aggregation: rows=%d", len(filtered))
-	
+
 	writeRows(w, filtered)
 }
 
@@ -235,21 +236,115 @@ func aggregateRowsByTime(rows []agentRow, since time.Time, targetCount int) []ag
 	n := len(rows)
 	log.Printf("aggregateRowsByTime: input=%d, targetCount=%d", n, targetCount)
 
-	if n <= targetCount {
+	if n <= targetCount || targetCount < 1 {
 		log.Printf("aggregateRowsByTime: no aggregation needed, returning all %d rows", n)
 		return rows
 	}
 
-	newestTime := rows[0].checkedAt
-	span := newestTime - since.UnixNano()
-	if span < 1 {
-		log.Printf("aggregateRowsByTime: span too small, returning all %d rows", n)
+	// A chart row belongs to one target series. Aggregating all rows together
+	// makes the first target in each time bucket overwrite every other target,
+	// which leaves the browser with only one curve for large result sets.
+	type series struct {
+		rows   []agentRow
+		budget int
+	}
+	seriesByKey := make(map[string]int)
+	seriesList := make([]series, 0)
+	for _, row := range rows {
+		key := aggregationSeriesKey(row.data)
+		index, ok := seriesByKey[key]
+		if !ok {
+			index = len(seriesList)
+			seriesByKey[key] = index
+			seriesList = append(seriesList, series{})
+		}
+		seriesList[index].rows = append(seriesList[index].rows, row)
+	}
+
+	// Reserve enough points to draw every series before distributing the rest
+	// proportionally. In normal dashboard use the target count is far below the
+	// 3,000-point response cap, so every target gets at least two points.
+	remaining := targetCount
+	minimum := 1
+	if len(seriesList)*2 <= targetCount {
+		minimum = 2
+	}
+	for i := range seriesList {
+		if remaining == 0 {
+			break
+		}
+		seriesList[i].budget = min(minimum, len(seriesList[i].rows))
+		if seriesList[i].budget > remaining {
+			seriesList[i].budget = remaining
+		}
+		remaining -= seriesList[i].budget
+	}
+	for remaining > 0 {
+		best := -1
+		bestScore := float64(-1)
+		for i := range seriesList {
+			if seriesList[i].budget >= len(seriesList[i].rows) {
+				continue
+			}
+			score := float64(len(seriesList[i].rows)) / float64(seriesList[i].budget+1)
+			if score > bestScore {
+				best, bestScore = i, score
+			}
+		}
+		if best < 0 {
+			break
+		}
+		seriesList[best].budget++
+		remaining--
+	}
+
+	result := make([]agentRow, 0, targetCount)
+	for i := range seriesList {
+		if seriesList[i].budget == 0 {
+			continue
+		}
+		result = append(result, aggregateSingleSeries(seriesList[i].rows, since, seriesList[i].budget)...)
+	}
+	sort.SliceStable(result, func(i, j int) bool { return result[i].checkedAt > result[j].checkedAt })
+	if len(result) > targetCount {
+		result = result[:targetCount]
+	}
+	log.Printf("aggregateRowsByTime: %d rows across %d series -> %d rows", n, len(seriesList), len(result))
+	return result
+}
+
+func aggregationSeriesKey(data []byte) string {
+	var parts []json.RawMessage
+	if err := json.Unmarshal(data, &parts); err != nil || len(parts) < 5 {
+		return ""
+	}
+	// Match the browser's target identity, with agent included for safety if
+	// this helper is reused for a multi-agent response later.
+	return string(parts[0]) + "\x00" + string(parts[2]) + "\x00" + string(parts[3]) + "\x00" + string(parts[4])
+}
+
+func aggregateSingleSeries(rows []agentRow, since time.Time, targetCount int) []agentRow {
+	n := len(rows)
+	if n <= targetCount {
 		return rows
 	}
 
-	bucketNanos := span / int64(targetCount)
+	newestTime := rows[0].checkedAt
+	requestedSpan := newestTime - since.UnixNano()
+	if requestedSpan < 1 {
+		return rows
+	}
+	oldestTime := rows[n-1].checkedAt
+	span := newestTime - oldestTime + 1
+	if span < 1 {
+		return rows
+	}
+
+	// Base buckets on the data's actual time range. Using the selected range
+	// (for example 30 days) wastes nearly all buckets when only a few days of
+	// samples exist.
+	bucketNanos := (span + int64(targetCount) - 1) / int64(targetCount)
 	if bucketNanos < 1 {
-		log.Printf("aggregateRowsByTime: bucketNanos too small, returning all %d rows", n)
 		return rows
 	}
 
@@ -257,10 +352,8 @@ func aggregateRowsByTime(rows []agentRow, since time.Time, targetCount int) []ag
 	bucketEnd := newestTime
 	startIdx := 0
 
-	log.Printf("aggregateRowsByTime: span=%d, bucketNanos=%d", span, bucketNanos)
-
 	for b := 0; b < targetCount; b++ {
-		bucketStart := bucketEnd - bucketNanos
+		bucketStart := bucketEnd - bucketNanos + 1
 
 		for startIdx < n && rows[startIdx].checkedAt > bucketEnd {
 			startIdx++
@@ -271,6 +364,8 @@ func aggregateRowsByTime(rows []agentRow, since time.Time, targetCount int) []ag
 		var templateData []byte
 		var fallback agentRow
 		var hasFallback bool
+		var bucketNewest int64
+		var bucketOldest int64
 
 		bucketIdx := startIdx
 		for bucketIdx < n && rows[bucketIdx].checkedAt >= bucketStart {
@@ -286,13 +381,18 @@ func aggregateRowsByTime(rows []agentRow, since time.Time, targetCount int) []ag
 				fallback = rows[bucketIdx]
 				hasFallback = true
 			}
+			if bucketNewest == 0 {
+				bucketNewest = rows[bucketIdx].checkedAt
+			}
+			bucketOldest = rows[bucketIdx].checkedAt
 			bucketIdx++
 		}
 
 		if validCount > 0 {
-			avgData := buildAggregatedData(templateData, sumLatency/float64(validCount))
+			checkedAt := bucketOldest + (bucketNewest-bucketOldest)/2
+			avgData := buildAggregatedData(templateData, sumLatency/float64(validCount), checkedAt)
 			result = append(result, agentRow{
-				checkedAt: (bucketStart + bucketEnd) / 2,
+				checkedAt: checkedAt,
 				data:      avgData,
 			})
 		} else if hasFallback {
@@ -300,14 +400,11 @@ func aggregateRowsByTime(rows []agentRow, since time.Time, targetCount int) []ag
 		}
 
 		startIdx = bucketIdx
-		bucketEnd = bucketStart
+		bucketEnd = bucketStart - 1
+		if startIdx >= n {
+			break
+		}
 	}
-
-	if len(result) > targetCount {
-		result = result[:targetCount]
-	}
-
-	log.Printf("aggregateRowsByTime: %d -> %d rows", n, len(result))
 	return result
 }
 
@@ -323,12 +420,13 @@ func extractLatency(data []byte) (float64, bool) {
 	return lat, ok
 }
 
-func buildAggregatedData(original []byte, avgLatency float64) []byte {
+func buildAggregatedData(original []byte, avgLatency float64, checkedAt int64) []byte {
 	var parts []interface{}
 	if err := json.Unmarshal(original, &parts); err != nil {
 		return original
 	}
 	if len(parts) >= 10 {
+		parts[6] = time.Unix(0, checkedAt).UTC().Format(time.RFC3339Nano)
 		parts[7] = float64(1)
 		parts[9] = avgLatency
 	}

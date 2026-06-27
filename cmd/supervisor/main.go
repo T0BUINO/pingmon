@@ -962,6 +962,7 @@ const dashboardHTML = `<!doctype html>
     .chart-wrap .chart-surface { position: absolute; inset: 0; height: 100%; }
     .chart-surface canvas { display: block; width: 100%; height: 100%; cursor: grab; }
     .chart-surface canvas.dragging { cursor: grabbing; }
+    .chart-empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--muted); font-size: 13px; pointer-events: none; }
     .mini-chart.chart-surface { height: 86px; }
     .mini-chart.chart-surface canvas { height: 86px; }
     .chart-hover-line { position: absolute; top: 0; bottom: 0; left: 0; width: 1px; background: repeating-linear-gradient(to bottom, #94a3b8 0 4px, transparent 4px 8px); pointer-events: none; opacity: 0; transform: translate3d(0, 0, 0); }
@@ -1335,6 +1336,13 @@ function normalizeResultRow(row) {
         this.canvas.setAttribute('aria-label', '\u5ef6\u8fdf\u56fe\u8868');
         this.container.replaceChildren(this.canvas);
         this.ctx = this.canvas.getContext('2d');
+        this.emptyState = null;
+        if (!this.options.mini) {
+          this.emptyState = document.createElement('div');
+          this.emptyState.className = 'chart-empty';
+          this.emptyState.textContent = '当前周期暂无数据';
+          this.container.appendChild(this.emptyState);
+        }
         this.hoverX = null;
         this.hoverLine = document.createElement('div');
         this.hoverLine.className = 'chart-hover-line';
@@ -1397,7 +1405,11 @@ function normalizeResultRow(row) {
         if (Number.isFinite(xOptions.min) && Number.isFinite(xOptions.max) && xOptions.min < xOptions.max) {
           return {min: xOptions.min, max: xOptions.max};
         }
-        return dataRange(this.data) || {min: Date.now() - 1, max: Date.now()};
+        const range = dataRange(this.data);
+        if (range) return range;
+        const span = Math.max(minChartGapMs, parseRangeMillis(selectedRange));
+        const max = Date.now();
+        return {min: max - span, max};
       }
       yRange(xRange) {
         let max = 0;
@@ -1566,7 +1578,9 @@ function normalizeResultRow(row) {
           ctx.font = '11px system-ui, sans-serif';
           ctx.textAlign = anchor;
           ctx.textBaseline = 'top';
-          ctx.fillText(formatTimeTick(value), x, area.height - 8);
+          // Keep the full glyph box inside the canvas. Drawing at height - 8
+          // with a top baseline clips an 11px label, especially on mobile DPRs.
+          ctx.fillText(formatTimeTick(value), x, area.bottom + 8);
         });
       }
       update() {
@@ -1577,6 +1591,10 @@ function normalizeResultRow(row) {
           if (area.width < 2 || area.height < 2) return;
           const xRange = this.xRange();
           const yRange = this.yRange(xRange);
+          const hasVisibleData = this.visibleDatasets().some(dataset =>
+            this.pointWindow(dataset.data, xRange).some(point => point.y !== null && Number.isFinite(point.y))
+          );
+          if (this.emptyState) this.emptyState.style.display = hasVisibleData ? 'none' : 'flex';
           this.lastArea = area;
           this.lastXRange = xRange;
           const dpr = window.devicePixelRatio || 1;

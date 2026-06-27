@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -136,6 +137,7 @@ func (s *fakeStore) ConsecutiveFailures(targetName, address string, port int, li
 }
 
 func TestHandleDashboardResultsStreamsFromDB(t *testing.T) {
+	now := time.Now().UTC()
 	store := &fakeStore{
 		streamedResults: []model.Result{
 			{
@@ -145,7 +147,7 @@ func TestHandleDashboardResultsStreamsFromDB(t *testing.T) {
 				Address:          "198.51.100.10",
 				Port:             443,
 				Labels:           []string{"prod"},
-				CheckedAt:        time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC),
+				CheckedAt:        now.Add(-6 * 24 * time.Hour),
 				SuccessCount:     1,
 				AverageLatencyMS: 10,
 				SuccessRate:      1,
@@ -167,6 +169,18 @@ func TestHandleDashboardResultsStreamsFromDB(t *testing.T) {
 	got := decodeDashboardResultsForTest(t, rr.Body.Bytes())
 	if len(got) != 1 || got[0].Agent != "agent-1" {
 		t.Fatalf("streamed response = %+v", got)
+	}
+}
+
+func TestDashboardKeepsDetailChartVisibleWithoutRangeData(t *testing.T) {
+	for _, want := range []string{
+		"当前周期暂无数据",
+		"const span = Math.max(minChartGapMs, parseRangeMillis(selectedRange));",
+		"this.emptyState.style.display = hasVisibleData ? 'none' : 'flex';",
+	} {
+		if !strings.Contains(dashboardHTML, want) {
+			t.Fatalf("dashboard HTML missing empty detail chart behavior %q", want)
+		}
 	}
 }
 
@@ -633,7 +647,7 @@ func TestAggregateRowsByTime_SameBucket(t *testing.T) {
 	}
 	since := base
 	targetCount := 10
-	bucketNanos := int64(base.Add(99*time.Second).Sub(since))
+	bucketNanos := int64(base.Add(99 * time.Second).Sub(since))
 	_ = bucketNanos
 	got := aggregateRowsByTime(rows, since, targetCount)
 	if len(got) > targetCount {
@@ -685,6 +699,54 @@ func TestAggregateRowsByTime_ExactTargetCount(t *testing.T) {
 	got := aggregateRowsByTime(rows, base, 3000)
 	if len(got) != 3000 {
 		t.Fatalf("got %d rows, want 3000", len(got))
+	}
+}
+
+func TestAggregateRowsByTime_PreservesEveryTargetSeries(t *testing.T) {
+	base := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	const targetTotal = 12
+	const samplesPerTarget = 400
+	rows := make([]agentRow, 0, targetTotal*samplesPerTarget)
+	for sample := 0; sample < samplesPerTarget; sample++ {
+		checkedAt := base.Add(-time.Duration(sample) * time.Minute)
+		for target := 0; target < targetTotal; target++ {
+			result := model.Result{
+				Agent:            "agent-1",
+				TargetName:       fmt.Sprintf("target-%02d", target),
+				Address:          fmt.Sprintf("192.0.2.%d", target+1),
+				Port:             443,
+				CheckedAt:        checkedAt,
+				SuccessCount:     1,
+				AverageLatencyMS: float64(target + sample%10),
+				SuccessRate:      1,
+			}
+			data, err := marshalDashboardResult(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows = append(rows, agentRow{checkedAt: checkedAt.UnixNano(), data: data})
+		}
+	}
+
+	got := aggregateRowsByTime(rows, base.Add(-samplesPerTarget*time.Minute), maxChartPoints)
+	if len(got) > maxChartPoints {
+		t.Fatalf("got %d rows, want at most %d", len(got), maxChartPoints)
+	}
+	seriesCounts := make(map[string]int)
+	for _, row := range got {
+		var parts []interface{}
+		if err := json.Unmarshal(row.data, &parts); err != nil {
+			t.Fatal(err)
+		}
+		seriesCounts[parts[2].(string)]++
+	}
+	if len(seriesCounts) != targetTotal {
+		t.Fatalf("got %d target series, want %d", len(seriesCounts), targetTotal)
+	}
+	for target, count := range seriesCounts {
+		if count < 2 {
+			t.Errorf("series %q has %d point(s), want at least 2", target, count)
+		}
 	}
 }
 
