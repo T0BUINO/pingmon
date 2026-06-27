@@ -2,14 +2,13 @@ package storage
 
 import (
 	"database/sql"
-	"fmt"
 	"time"
 
 	"pingmon/internal/model"
 )
 
 const (
-	streamQueryWindow = 6 * time.Hour
+	streamQueryWindow   = 6 * time.Hour
 	maxResultsPerWindow = 50000
 )
 
@@ -31,31 +30,9 @@ func (s *SQLiteStore) streamResultsWindowed(since, before time.Time, agent strin
 	since = since.UTC()
 	cursor := before.UTC()
 
-	// 如果查询开始时间已经超过当前时间，直接返回错误
+	// A range starting at or after its end cannot contain results.
 	if !cursor.After(since) {
 		return nil
-	}
-
-	// 检查查询开始时间是否超过数据库最新数据
-	// 获取数据库最新数据时间戳
-	var latestTimeStr string
-	err := s.db.QueryRow(`SELECT MAX(checked_at) FROM results`).Scan(&latestTimeStr)
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("failed to get latest time: %w", err)
-	}
-
-	// 如果查询开始时间超过最新数据，将 since 设置为最新数据时间
-	if latestTimeStr != "" {
-		latestTime, err := time.Parse(time.RFC3339Nano, latestTimeStr)
-		if err != nil {
-			return fmt.Errorf("failed to parse latest time: %w", err)
-		}
-		if since.After(latestTime) {
-			since = latestTime
-			if !cursor.After(since) {
-				return nil
-			}
-		}
 	}
 
 	for cursor.After(since) {
@@ -72,47 +49,36 @@ func (s *SQLiteStore) streamResultsWindowed(since, before time.Time, agent strin
 }
 
 func (s *SQLiteStore) streamResultsWindow(since, before time.Time, agent string, fn func(model.Result) error) error {
-	var rows *sql.Rows
-	var err error
-	shortRange := before.Sub(since) <= 24*time.Hour
-	if agent == "" {
-		if shortRange {
+	for offset := 0; ; offset += maxResultsPerWindow {
+		var rows *sql.Rows
+		var err error
+		if agent == "" {
 			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
 r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
 FROM results r JOIN result_series rs ON rs.id = r.series_id
 WHERE r.checked_at >= ? AND r.checked_at < ?
-ORDER BY r.checked_at DESC LIMIT ?`,
-				since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow)
-		} else {
-			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
-r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
-FROM results r JOIN result_series rs ON rs.id = r.series_id
-WHERE r.checked_at >= ? AND r.checked_at < ?
-ORDER BY r.checked_at DESC LIMIT ?`,
-				since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow)
-		}
-	} else {
-		if shortRange {
-			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
-r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
-FROM result_series rs JOIN results r ON r.series_id = rs.id
-WHERE rs.agent = ? AND r.checked_at >= ? AND r.checked_at < ?
-ORDER BY r.checked_at DESC LIMIT ?`,
-				agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow)
+ORDER BY r.checked_at DESC, r.id DESC LIMIT ? OFFSET ?`,
+				since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow, offset)
 		} else {
 			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, r.checked_at,
 r.success_count, r.failure_count, r.average_latency_ms, r.success_rate, COALESCE(r.error, '')
 FROM result_series rs JOIN results r ON r.series_id = rs.id
 WHERE rs.agent = ? AND r.checked_at >= ? AND r.checked_at < ?
-ORDER BY r.checked_at DESC`,
-				agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+ORDER BY r.checked_at DESC, r.id DESC LIMIT ? OFFSET ?`,
+				agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow, offset)
+		}
+		if err != nil {
+			return err
+		}
+		count, err := streamResults(rows, fn)
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		if count < maxResultsPerWindow {
+			return nil
 		}
 	}
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	return streamResults(rows, fn)
 }
 
 func (s *SQLiteStore) streamRollupsSince(since, before time.Time, agent string, fn func(model.Result) error) error {
@@ -132,56 +98,49 @@ func (s *SQLiteStore) streamRollupsSince(since, before time.Time, agent string, 
 }
 
 func (s *SQLiteStore) streamRollupsWindow(since, before time.Time, agent string, fn func(model.Result) error) error {
-	var rows *sql.Rows
-	var err error
-	shortRange := before.Sub(since) <= 24*time.Hour
-	if agent == "" {
-		if shortRange {
+	for offset := 0; ; offset += maxResultsPerWindow {
+		var rows *sql.Rows
+		var err error
+		if agent == "" {
 			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
 rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
 FROM result_rollups rr JOIN result_series rs ON rs.id = rr.series_id
 WHERE rr.bucket_start >= ? AND rr.bucket_start < ?
-ORDER BY rr.bucket_start DESC LIMIT ?`,
-				since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow)
-		} else {
-			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
-rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
-FROM result_rollups rr JOIN result_series rs ON rs.id = rr.series_id
-WHERE rs.agent = ? AND rr.bucket_start >= ? AND rr.bucket_start < ?
-ORDER BY rr.bucket_start DESC`, agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
-		}
-	} else {
-		if shortRange {
-			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
-rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
-FROM result_series rs JOIN result_rollups rr ON rr.series_id = rs.id
-WHERE rs.agent = ? AND rr.bucket_start >= ? AND rr.bucket_start < ?
-ORDER BY rr.bucket_start DESC LIMIT ?`,
-				agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow)
+ORDER BY rr.bucket_start DESC, rr.id DESC LIMIT ? OFFSET ?`,
+				since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow, offset)
 		} else {
 			rows, err = s.db.Query(`SELECT rs.agent, rs.agent_ip, rs.target_name, rs.address, rs.port, rs.labels, rr.bucket_start,
 rr.success_count, rr.failure_count, rr.average_latency_ms, rr.success_rate, COALESCE(rr.error, '')
 FROM result_series rs JOIN result_rollups rr ON rr.series_id = rs.id
 WHERE rs.agent = ? AND rr.bucket_start >= ? AND rr.bucket_start < ?
-ORDER BY rr.bucket_start DESC`, agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano))
+ORDER BY rr.bucket_start DESC, rr.id DESC LIMIT ? OFFSET ?`,
+				agent, since.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano), maxResultsPerWindow, offset)
 		}
-	}
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	return streamResults(rows, fn)
-}
-
-func streamResults(rows resultRows, fn func(model.Result) error) error {
-	for rows.Next() {
-		result, err := scanResult(rows)
 		if err != nil {
 			return err
 		}
-		if err := fn(result); err != nil {
+		count, err := streamResults(rows, fn)
+		rows.Close()
+		if err != nil {
 			return err
 		}
+		if count < maxResultsPerWindow {
+			return nil
+		}
 	}
-	return rows.Err()
+}
+
+func streamResults(rows resultRows, fn func(model.Result) error) (int, error) {
+	count := 0
+	for rows.Next() {
+		result, err := scanResult(rows)
+		if err != nil {
+			return count, err
+		}
+		if err := fn(result); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, rows.Err()
 }

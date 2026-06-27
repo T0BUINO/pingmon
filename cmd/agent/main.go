@@ -17,6 +17,9 @@ import (
 	"pingmon/internal/model"
 )
 
+var supervisorHTTPClient = &http.Client{Timeout: 10 * time.Second}
+var publicIPHTTPClient = &http.Client{Timeout: 3 * time.Second}
+
 func main() {
 	supervisor := flag.String("supervisor", "", "optional supervisor base URL override, for example http://127.0.0.1:8080")
 	configPath := flag.String("config", "", "optional JSON or TOML agent config")
@@ -105,7 +108,7 @@ func fetchTasks(supervisor, agent, agentIP string) ([]model.Task, error) {
 		query.Set("agent_ip", agentIP)
 	}
 	taskURL.RawQuery = query.Encode()
-	resp, err := http.Get(taskURL.String())
+	resp, err := supervisorHTTPClient.Get(taskURL.String())
 	if err != nil {
 		return nil, err
 	}
@@ -121,8 +124,26 @@ func fetchTasks(supervisor, agent, agentIP string) ([]model.Task, error) {
 }
 
 func fetchAgentIP(cfg config.AgentConfig) string {
-	ipv4, _ := fetchPublicIP(cfg.PublicIPv4URL)
-	ipv6, _ := fetchPublicIP(cfg.PublicIPv6URL)
+	type lookup struct {
+		version int
+		ip      string
+	}
+	results := make(chan lookup, 2)
+	for version, endpoint := range map[int]string{4: cfg.PublicIPv4URL, 6: cfg.PublicIPv6URL} {
+		go func() {
+			ip, _ := fetchPublicIP(endpoint)
+			results <- lookup{version: version, ip: ip}
+		}()
+	}
+	var ipv4, ipv6 string
+	for range 2 {
+		result := <-results
+		if result.version == 4 {
+			ipv4 = result.ip
+		} else {
+			ipv6 = result.ip
+		}
+	}
 	switch {
 	case ipv4 != "" && ipv6 != "":
 		return ipv4 + " / " + ipv6
@@ -141,8 +162,7 @@ func fetchPublicIP(endpoint string) (string, error) {
 	if endpoint == "" {
 		return "", nil
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(endpoint)
+	resp, err := publicIPHTTPClient.Get(endpoint)
 	if err != nil {
 		return "", err
 	}
@@ -218,7 +238,7 @@ func uploadResults(supervisor string, results []model.Result) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.Post(supervisor+"/api/report", "application/json", bytes.NewReader(body))
+	resp, err := supervisorHTTPClient.Post(supervisor+"/api/report", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

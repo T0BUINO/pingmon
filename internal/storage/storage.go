@@ -21,7 +21,6 @@ type Store interface {
 	SaveAgentHeartbeat(agent, agentIP string, seenAt time.Time) error
 	ListAgentStatuses() ([]model.AgentStatus, error)
 	DeleteAgent(agent string) error
-	SaveResult(model.Result) error
 	SaveResults(results []model.Result, seenAt time.Time) ([]model.Result, error)
 	ResultsSince(since time.Time) ([]model.Result, error)
 	ResultsSinceForAgent(since time.Time, agent string) ([]model.Result, error)

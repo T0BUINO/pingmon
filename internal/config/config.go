@@ -208,7 +208,9 @@ func parseSupervisorTOML(input string, cfg *Config) error {
 	section := ""
 	var currentTarget *model.PingTarget
 	scanner := bufio.NewScanner(strings.NewReader(input))
+	lineNumber := 0
 	for scanner.Scan() {
+		lineNumber++
 		line := stripComment(scanner.Text())
 		if line == "" {
 			continue
@@ -226,25 +228,25 @@ func parseSupervisorTOML(input string, cfg *Config) error {
 		}
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
-			return fmt.Errorf("invalid TOML line: %s", line)
+			return fmt.Errorf("line %d: invalid TOML: %s", lineNumber, line)
 		}
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
 		switch section {
 		case "params":
 			if err := setParamsValue(&cfg.Params, key, value); err != nil {
-				return err
+				return fmt.Errorf("line %d: %w", lineNumber, err)
 			}
 		case "targets":
 			if currentTarget == nil {
-				return errors.New("target key found before [[targets]]")
+				return fmt.Errorf("line %d: %w", lineNumber, errors.New("target key found before [[targets]]"))
 			}
 			if err := setTargetValue(currentTarget, key, value); err != nil {
-				return err
+				return fmt.Errorf("line %d: %w", lineNumber, err)
 			}
 		default:
 			if err := setConfigValue(cfg, key, value); err != nil {
-				return err
+				return fmt.Errorf("line %d: %w", lineNumber, err)
 			}
 		}
 	}
@@ -253,14 +255,16 @@ func parseSupervisorTOML(input string, cfg *Config) error {
 
 func parseAgentTOML(input string, cfg *AgentConfig) error {
 	scanner := bufio.NewScanner(strings.NewReader(input))
+	lineNumber := 0
 	for scanner.Scan() {
+		lineNumber++
 		line := stripComment(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "[") {
 			continue
 		}
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
-			return fmt.Errorf("invalid TOML line: %s", line)
+			return fmt.Errorf("line %d: invalid TOML: %s", lineNumber, line)
 		}
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
@@ -270,7 +274,11 @@ func parseAgentTOML(input string, cfg *AgentConfig) error {
 		case "agent_name":
 			cfg.AgentName = parseString(value)
 		case "poll_interval_seconds":
-			cfg.PollIntervalSeconds = mustInt(key, value)
+			n, err := parseInt(key, value)
+			if err != nil {
+				return fmt.Errorf("line %d: %w", lineNumber, err)
+			}
+			cfg.PollIntervalSeconds = n
 		case "public_ipv4_url":
 			cfg.PublicIPv4URL = parseString(value)
 		case "public_ipv6_url":
@@ -281,6 +289,14 @@ func parseAgentTOML(input string, cfg *AgentConfig) error {
 }
 
 func setConfigValue(cfg *Config, key, value string) error {
+	setInt := func(dst *int) error {
+		n, err := parseInt(key, value)
+		if err != nil {
+			return err
+		}
+		*dst = n
+		return nil
+	}
 	switch key {
 	case "listen":
 		cfg.Listen = parseString(value)
@@ -295,15 +311,15 @@ func setConfigValue(cfg *Config, key, value string) error {
 	case "default_range":
 		cfg.DefaultRange = parseString(value)
 	case "retention_days":
-		cfg.RetentionDays = mustInt(key, value)
+		return setInt(&cfg.RetentionDays)
 	case "raw_retention_days":
-		cfg.RawRetentionDays = mustInt(key, value)
+		return setInt(&cfg.RawRetentionDays)
 	case "rollup_interval_minutes":
-		cfg.RollupIntervalMins = mustInt(key, value)
+		return setInt(&cfg.RollupIntervalMins)
 	case "failure_threshold":
-		cfg.FailureThreshold = mustInt(key, value)
+		return setInt(&cfg.FailureThreshold)
 	case "task_interval_seconds":
-		cfg.TaskIntervalSeconds = mustInt(key, value)
+		return setInt(&cfg.TaskIntervalSeconds)
 	default:
 		return fmt.Errorf("unknown config key %q", key)
 	}
@@ -311,17 +327,25 @@ func setConfigValue(cfg *Config, key, value string) error {
 }
 
 func setParamsValue(params *model.PingParams, key, value string) error {
+	setInt := func(dst *int) error {
+		n, err := parseInt(key, value)
+		if err != nil {
+			return err
+		}
+		*dst = n
+		return nil
+	}
 	switch key {
 	case "count":
-		params.Count = mustInt(key, value)
+		return setInt(&params.Count)
 	case "interval_millis":
-		params.IntervalMillis = mustInt(key, value)
+		return setInt(&params.IntervalMillis)
 	case "timeout_millis":
-		params.TimeoutMillis = mustInt(key, value)
+		return setInt(&params.TimeoutMillis)
 	case "enable_ipv6":
 		params.EnableIPv6 = parseBool(value)
 	case "schedule_seconds":
-		params.ScheduleSeconds = mustInt(key, value)
+		return setInt(&params.ScheduleSeconds)
 	default:
 		return fmt.Errorf("unknown params key %q", key)
 	}
@@ -335,7 +359,11 @@ func setTargetValue(target *model.PingTarget, key, value string) error {
 	case "address":
 		target.Address = parseString(value)
 	case "port":
-		target.Port = mustInt(key, value)
+		n, err := parseInt(key, value)
+		if err != nil {
+			return err
+		}
+		target.Port = n
 	case "labels":
 		target.Labels = parseStringArray(value)
 	default:
@@ -383,10 +411,10 @@ func parseBool(value string) bool {
 	return strings.EqualFold(strings.TrimSpace(value), "true")
 }
 
-func mustInt(key, value string) int {
+func parseInt(key, value string) (int, error) {
 	n, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil {
-		panic(fmt.Sprintf("invalid integer for %s: %s", key, value))
+		return 0, fmt.Errorf("invalid integer for %s: %q", key, strings.TrimSpace(value))
 	}
-	return n
+	return n, nil
 }

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PingMon Dashboard</title>
+  <link rel="stylesheet" href="/assets/dashboard.css">
+</head>
+<body data-agent="{{.Agent}}" data-offline-after="{{.OfflineAfterSeconds}}" data-selected-range="{{.SelectedRange}}">
+  <main>
+    <header>
+      <div>
+        <h1>{{if .Agent}}{{.Agent}}{{else}}监测节点{{end}}</h1>
+        <div class="subtle" id="pageSubtitle">{{if .Agent}}最后在线：--{{else}}分布式 TCP 探测概览{{end}}<span class="live-badge" id="liveState">实时</span></div>
+      </div>
+      <form class="page-actions" method="get" action="/dashboard">
+        {{if .Agent}}<input type="hidden" name="agent" value="{{.Agent}}">{{end}}
+        <div class="range-menu" id="rangeMenu">
+          <button class="range-button" type="button" id="rangeButton">{{.SelectedRange}}</button>
+          <div class="range-options" id="rangeOptions">
+            {{range .Ranges}}<button class="range-option {{if eq . $.SelectedRange}}active{{end}}" type="button" data-range="{{.}}">{{.}}</button>{{end}}
+            <div class="range-custom" id="rangeCustomForm">
+              <input id="rangeCustomInput" type="text" value="{{if .CustomRange}}{{.SelectedRange}}{{end}}" placeholder="45m" aria-label="自定义范围">
+              <button type="button" id="rangeCustomApply">应用</button>
+            </div>
+            <div class="range-error" id="rangeError">格式：数字 + m/h/d/w/mo</div>
+          </div>
+        </div>
+        <button type="button" id="refreshButton">刷新</button>
+        <a class="button" href="/logout">退出</a>
+        {{if .Agent}}<button class="danger" type="button" id="deleteAgentButton" hidden>删除结果</button>{{end}}
+        {{if .Agent}}<a class="button" id="backButton" href="/dashboard?range={{.SelectedRange}}">返回</a>{{end}}
+      </form>
+    </header>
+
+    {{if .Agent}}
+      <section class="panel">
+        <h2>节点信息</h2>
+        <div class="detail-grid" id="agentInfo"></div>
+      </section>
+      <section class="panel">
+        <h2>目标延迟</h2>
+        <div class="toolbar" id="labelFilters"></div>
+        <div class="toolbar" id="targetToggles"></div>
+        <div class="toolbar chart-tools" id="chartTools">
+          <button type="button" id="zoomInButton" title="放大">+</button>
+          <button type="button" id="zoomOutButton" title="缩小">-</button>
+          <button type="button" id="zoomResetButton" title="复位">↺</button>
+        </div>
+        <div class="chart-wrap"><div class="chart-surface" id="latency"></div></div>
+      </section>
+      <section class="panel">
+        <h2>告警日志</h2>
+        <div class="subtle log-meta" id="logMeta">仅显示最近的 WARN / ERROR</div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr><th>时间</th><th>级别</th><th>节点 IP</th><th>目标</th><th>地址</th><th>成功率</th><th>平均延迟</th><th>错误</th></tr>
+            </thead>
+            <tbody id="problemLogBody"><tr><td colspan="8">暂无 WARN / ERROR</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    {{else}}
+      <section class="cards" id="agentCards"></section>
+    {{end}}
+  </main>
+  <script src="/assets/dashboard.js" defer></script>
+</body>
+</html>

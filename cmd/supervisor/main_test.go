@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -13,12 +15,119 @@ import (
 
 	"pingmon/internal/config"
 	"pingmon/internal/model"
+
+	"github.com/gorilla/websocket"
 )
 
 type heartbeatCall struct {
 	agent   string
 	agentIP string
 	seenAt  time.Time
+}
+
+func TestDashboardTemplateParsesWithoutLegacyHelpers(t *testing.T) {
+	if _, err := template.New("dashboard").Parse(dashboardHTML); err != nil {
+		t.Fatalf("parse dashboard template: %v", err)
+	}
+}
+
+func TestDashboardSessionIsSignedAndExpires(t *testing.T) {
+	s := &server{
+		cfg:     config.Config{DashboardUser: "admin", DashboardPassword: "secret"},
+		authKey: []byte("01234567890123456789012345678901"),
+	}
+	token := s.dashboardSession("admin", time.Now().Add(time.Hour))
+	if strings.Contains(token, base64.StdEncoding.EncodeToString([]byte("admin:secret"))) {
+		t.Fatal("session token contains encoded credentials")
+	}
+	if !s.validDashboardCookie(token) {
+		t.Fatal("fresh session token was rejected")
+	}
+	if s.validDashboardCookie(token + "tampered") {
+		t.Fatal("tampered session token was accepted")
+	}
+	if s.validDashboardCookie(s.dashboardSession("admin", time.Now().Add(-time.Second))) {
+		t.Fatal("expired session token was accepted")
+	}
+}
+
+func TestDashboardLoginFlowAvoidsBasicAuthPrompt(t *testing.T) {
+	s := &server{
+		cfg:     config.DefaultConfig(),
+		authKey: []byte("01234567890123456789012345678901"),
+		tpl:     template.Must(template.New("dashboard").Parse(dashboardHTML)),
+	}
+
+	dashboardRequest := httptest.NewRequest(http.MethodGet, "/dashboard?range=24h", nil)
+	dashboardResponse := httptest.NewRecorder()
+	s.handleDashboard(dashboardResponse, dashboardRequest)
+	if dashboardResponse.Code != http.StatusSeeOther {
+		t.Fatalf("dashboard status = %d, want redirect", dashboardResponse.Code)
+	}
+	if got := dashboardResponse.Header().Get("WWW-Authenticate"); got != "" {
+		t.Fatalf("unexpected browser auth challenge %q", got)
+	}
+
+	loginRequest := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=admin&password=admin&next=%2Fdashboard"))
+	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginResponse := httptest.NewRecorder()
+	s.handleLogin(loginResponse, loginRequest)
+	if loginResponse.Code != http.StatusSeeOther {
+		t.Fatalf("login status = %d, want redirect: %s", loginResponse.Code, loginResponse.Body.String())
+	}
+	cookies := loginResponse.Result().Cookies()
+	if len(cookies) != 1 || !s.validDashboardCookie(cookies[0].Value) {
+		t.Fatalf("login cookie is missing or invalid: %+v", cookies)
+	}
+
+	authenticatedRequest := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	authenticatedRequest.AddCookie(cookies[0])
+	authenticatedResponse := httptest.NewRecorder()
+	s.handleDashboard(authenticatedResponse, authenticatedRequest)
+	if authenticatedResponse.Code != http.StatusOK {
+		t.Fatalf("authenticated dashboard status = %d", authenticatedResponse.Code)
+	}
+}
+
+func TestDashboardAssetsAreSeparated(t *testing.T) {
+	if strings.Contains(dashboardHTML, "<style>") || strings.Contains(dashboardHTML, "<script>") {
+		t.Fatal("dashboard template still contains inline CSS or JavaScript")
+	}
+	if !strings.Contains(dashboardHTML, "/assets/dashboard.css") || !strings.Contains(dashboardHTML, "/assets/dashboard.js") {
+		t.Fatal("dashboard template does not reference separated assets")
+	}
+	if strings.TrimSpace(dashboardCSS) == "" || strings.TrimSpace(dashboardJS) == "" {
+		t.Fatal("embedded dashboard assets are empty")
+	}
+}
+
+func TestWebSocketBroadcast(t *testing.T) {
+	s := &server{
+		cfg:     config.Config{DashboardUser: "admin", DashboardPassword: "secret"},
+		authKey: []byte("01234567890123456789012345678901"),
+		hub:     newWebsocketHub(),
+	}
+	httpServer := httptest.NewServer(gzipHandler(s.requireDashboardAuth(s.handleWebSocket)))
+	defer httpServer.Close()
+
+	header := http.Header{}
+	header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("admin:secret")))
+	header.Set("Accept-Encoding", "gzip")
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(httpServer.URL, "http"), header)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	_, connected, err := conn.ReadMessage()
+	if err != nil || string(connected) != "connected" {
+		t.Fatalf("initial websocket message = %q, %v", connected, err)
+	}
+	s.hub.broadcast("refresh")
+	_, message, err := conn.ReadMessage()
+	if err != nil || string(message) != "refresh" {
+		t.Fatalf("broadcast websocket message = %q, %v", message, err)
+	}
 }
 
 type fakeStore struct {
@@ -40,11 +149,6 @@ func (s *fakeStore) ListAgentStatuses() ([]model.AgentStatus, error) {
 
 func (s *fakeStore) DeleteAgent(agent string) error {
 	s.deleted = append(s.deleted, agent)
-	return nil
-}
-
-func (s *fakeStore) SaveResult(result model.Result) error {
-	s.results = append(s.results, result)
 	return nil
 }
 
@@ -173,13 +277,14 @@ func TestHandleDashboardResultsStreamsFromDB(t *testing.T) {
 }
 
 func TestDashboardKeepsDetailChartVisibleWithoutRangeData(t *testing.T) {
+	assets := dashboardHTML + dashboardJS
 	for _, want := range []string{
 		"当前周期暂无数据",
 		"const span = Math.max(minChartGapMs, parseRangeMillis(selectedRange));",
 		"this.emptyState.style.display = hasVisibleData ? 'none' : 'flex';",
 	} {
-		if !strings.Contains(dashboardHTML, want) {
-			t.Fatalf("dashboard HTML missing empty detail chart behavior %q", want)
+		if !strings.Contains(assets, want) {
+			t.Fatalf("dashboard assets missing empty detail chart behavior %q", want)
 		}
 	}
 }
@@ -218,7 +323,7 @@ func TestHandleDashboardResultsLandingStreamsAllAgents(t *testing.T) {
 	}
 }
 
-func TestDashboardMemCacheServesFromCacheAfterFirstRequest(t *testing.T) {
+func TestDashboardStreamsEachRequestedRange(t *testing.T) {
 	now := time.Now().UTC()
 	results := []model.Result{
 		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "198.51.100.10", Port: 443, CheckedAt: now, SuccessCount: 1, AverageLatencyMS: 10, SuccessRate: 1},
@@ -226,7 +331,7 @@ func TestDashboardMemCacheServesFromCacheAfterFirstRequest(t *testing.T) {
 		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "db", Address: "198.51.100.20", Port: 5432, CheckedAt: now.Add(-2 * time.Hour), SuccessCount: 1, AverageLatencyMS: 5, SuccessRate: 1},
 	}
 	store := &fakeStore{streamedResults: results}
-	s := &server{cfg: config.DefaultConfig(), store: store, dashMem: newDashMemCache()}
+	s := &server{cfg: config.DefaultConfig(), store: store}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=24h&agent=agent-1", nil)
 	rr := httptest.NewRecorder()
@@ -250,19 +355,19 @@ func TestDashboardMemCacheServesFromCacheAfterFirstRequest(t *testing.T) {
 	if len(secondGot) != 2 {
 		t.Fatalf("second request (1h) returned %d rows, want 2", len(secondGot))
 	}
-	if store.resultsSinceCalls != firstCalls {
-		t.Fatalf("second request hit DB (%d calls, want %d)", store.resultsSinceCalls, firstCalls)
+	if store.resultsSinceCalls != firstCalls+1 {
+		t.Fatalf("second request calls = %d, want %d", store.resultsSinceCalls, firstCalls+1)
 	}
 }
 
-func TestDashboardMemCacheLongRangeBypassesCache(t *testing.T) {
+func TestDashboardStreamsLongRange(t *testing.T) {
 	now := time.Now().UTC()
 	store := &fakeStore{
 		streamedResults: []model.Result{
 			{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "198.51.100.10", Port: 443, CheckedAt: now, SuccessCount: 1, AverageLatencyMS: 10, SuccessRate: 1},
 		},
 	}
-	s := &server{cfg: config.DefaultConfig(), store: store, dashMem: newDashMemCache()}
+	s := &server{cfg: config.DefaultConfig(), store: store}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=365d&agent=agent-1", nil)
 	rr := httptest.NewRecorder()
@@ -276,14 +381,14 @@ func TestDashboardMemCacheLongRangeBypassesCache(t *testing.T) {
 	}
 }
 
-func TestDashboardMemCacheInvalidatesOnNewData(t *testing.T) {
+func TestDashboardRefreshesAfterNewData(t *testing.T) {
 	now := time.Now().UTC()
 	store := &fakeStore{
 		streamedResults: []model.Result{
 			{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "198.51.100.10", Port: 443, CheckedAt: now, SuccessCount: 1, AverageLatencyMS: 10, SuccessRate: 1},
 		},
 	}
-	s := &server{cfg: config.DefaultConfig(), store: store, dashMem: newDashMemCache(), hub: newWebsocketHub()}
+	s := &server{cfg: config.DefaultConfig(), store: store, hub: newWebsocketHub()}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=24h&agent=agent-1", nil)
 	rr := httptest.NewRecorder()
@@ -775,7 +880,7 @@ func TestAggregateRowsByTime_BucketNanosTooSmall(t *testing.T) {
 	}
 }
 
-func TestAggregateRowsByTime_CachePathServesFilteredRows(t *testing.T) {
+func TestDashboardStreamsRequestedRange(t *testing.T) {
 	now := time.Now().UTC()
 	results := []model.Result{
 		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "192.0.2.1", Port: 443, CheckedAt: now, SuccessCount: 1, AverageLatencyMS: 10, SuccessRate: 1},
@@ -784,7 +889,7 @@ func TestAggregateRowsByTime_CachePathServesFilteredRows(t *testing.T) {
 		{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "192.0.2.1", Port: 443, CheckedAt: now.Add(-4 * time.Hour), SuccessCount: 0, FailureCount: 3, AverageLatencyMS: 0, SuccessRate: 0, Error: "refused"},
 	}
 	store := &fakeStore{streamedResults: results}
-	s := &server{cfg: config.DefaultConfig(), store: store, dashMem: newDashMemCache()}
+	s := &server{cfg: config.DefaultConfig(), store: store}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=24h&agent=agent-1", nil)
 	rr := httptest.NewRecorder()

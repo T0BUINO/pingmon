@@ -10,6 +10,71 @@ import (
 	"pingmon/internal/model"
 )
 
+func TestStreamResultsSinceFutureReturnsNoResults(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pingmon.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.db.Close()
+
+	if err := store.SaveResult(model.Result{
+		Agent:        "agent-1",
+		TargetName:   "web",
+		Address:      "198.51.100.10",
+		Port:         443,
+		CheckedAt:    time.Now().Add(-time.Hour),
+		SuccessCount: 1,
+		SuccessRate:  1,
+	}); err != nil {
+		t.Fatalf("SaveResult: %v", err)
+	}
+
+	count := 0
+	err = store.StreamResultsSince(time.Now().Add(time.Hour), "", func(model.Result) error {
+		count++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamResultsSince: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("StreamResultsSince returned %d future results, want 0", count)
+	}
+}
+
+func TestStreamResultsSincePaginatesDenseWindow(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pingmon.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.db.Close()
+
+	checkedAt := "2026-06-27T00:00:00Z"
+	if _, err := store.db.Exec(`INSERT INTO result_series (agent, agent_ip, target_name, address, port, labels)
+VALUES ('agent-1', '', 'web', '192.0.2.1', 443, 'null')`); err != nil {
+		t.Fatalf("insert series: %v", err)
+	}
+	if _, err := store.db.Exec(`WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?
+)
+INSERT INTO results (series_id, checked_at, success_count, failure_count, average_latency_ms, success_rate, error)
+SELECT 1, ?, 1, 0, 1, 1, '' FROM seq`, maxResultsPerWindow+1, checkedAt); err != nil {
+		t.Fatalf("insert dense results: %v", err)
+	}
+
+	count := 0
+	err = store.StreamResultsSince(time.Date(2026, 6, 26, 23, 0, 0, 0, time.UTC), "agent-1", func(model.Result) error {
+		count++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamResultsSince: %v", err)
+	}
+	if count != maxResultsPerWindow+1 {
+		t.Fatalf("streamed %d results, want %d", count, maxResultsPerWindow+1)
+	}
+}
+
 func TestSQLiteRollupAndCompactedResults(t *testing.T) {
 	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pingmon.db"))
 	if err != nil {
