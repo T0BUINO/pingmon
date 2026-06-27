@@ -166,7 +166,7 @@ func (s *fakeStore) SaveResults(results []model.Result, seenAt time.Time) ([]mod
 
 func TestHandleDeleteAgentDeletesAgentData(t *testing.T) {
 	store := &fakeStore{}
-	s := &server{cfg: config.DefaultConfig(), store: store, hub: newWebsocketHub()}
+	s := &server{cfg: config.DefaultConfig(), store: store, hub: newWebsocketHub(), resultsCache: newResultsCache(time.Minute, 16)}
 	req := httptest.NewRequest(http.MethodDelete, "/api/agents?agent=agent-1", nil)
 	rr := httptest.NewRecorder()
 
@@ -388,12 +388,18 @@ func TestDashboardRefreshesAfterNewData(t *testing.T) {
 			{Agent: "agent-1", AgentIP: "203.0.113.1", TargetName: "web", Address: "198.51.100.10", Port: 443, CheckedAt: now, SuccessCount: 1, AverageLatencyMS: 10, SuccessRate: 1},
 		},
 	}
-	s := &server{cfg: config.DefaultConfig(), store: store, hub: newWebsocketHub()}
+	s := &server{cfg: config.DefaultConfig(), store: store, hub: newWebsocketHub(), resultsCache: newResultsCache(time.Minute, 16)}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=24h&agent=agent-1", nil)
 	rr := httptest.NewRecorder()
 	s.handleResults(rr, req)
 	callsAfterFirst := store.resultsSinceCalls
+	cachedReq := httptest.NewRequest(http.MethodGet, "/api/results?dashboard=1&range=24h&agent=agent-1", nil)
+	cachedRR := httptest.NewRecorder()
+	s.handleResults(cachedRR, cachedReq)
+	if store.resultsSinceCalls != callsAfterFirst {
+		t.Fatalf("dashboard cache miss: calls = %d, want %d", store.resultsSinceCalls, callsAfterFirst)
+	}
 
 	body := `{"agent":"agent-1","agent_ip":"203.0.113.1","target_name":"web","address":"198.51.100.10","port":443,"checked_at":"2026-06-20T10:00:00Z","success_count":1,"failure_count":0,"average_latency_ms":1,"success_rate":1}`
 	reportReq := httptest.NewRequest(http.MethodPost, "/api/report", strings.NewReader(body))
@@ -825,11 +831,11 @@ func TestAggregateRowsByTime_PreservesEveryTargetSeries(t *testing.T) {
 				AverageLatencyMS: float64(target + sample%10),
 				SuccessRate:      1,
 			}
-			data, err := marshalDashboardResult(result)
+			row, err := newAgentRow(result)
 			if err != nil {
 				t.Fatal(err)
 			}
-			rows = append(rows, agentRow{checkedAt: checkedAt.UnixNano(), data: data})
+			rows = append(rows, row)
 		}
 	}
 
@@ -852,6 +858,18 @@ func TestAggregateRowsByTime_PreservesEveryTargetSeries(t *testing.T) {
 		if count < 2 {
 			t.Errorf("series %q has %d point(s), want at least 2", target, count)
 		}
+	}
+}
+
+func TestResultsCacheEvictsWhenCapacityExceeded(t *testing.T) {
+	cache := newResultsCache(time.Minute, 2)
+	cache.set(resultsCacheKey{selectedRange: "1h"}, []byte("one"))
+	cache.set(resultsCacheKey{selectedRange: "2h"}, []byte("two"))
+	cache.set(resultsCacheKey{selectedRange: "3h"}, []byte("three"))
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+	if len(cache.entries) != 2 {
+		t.Fatalf("cache entries = %d, want 2", len(cache.entries))
 	}
 }
 

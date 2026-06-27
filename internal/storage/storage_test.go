@@ -42,6 +42,24 @@ func TestStreamResultsSinceFutureReturnsNoResults(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreUsesSingleConnectionPool(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pingmon.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.db.Close()
+	if got := store.db.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("MaxOpenConnections = %d, want 1", got)
+	}
+	var cacheSize int
+	if err := store.db.QueryRow("PRAGMA cache_size").Scan(&cacheSize); err != nil {
+		t.Fatalf("PRAGMA cache_size: %v", err)
+	}
+	if cacheSize != -8192 {
+		t.Fatalf("cache_size = %d, want -8192", cacheSize)
+	}
+}
+
 func TestStreamResultsSincePaginatesDenseWindow(t *testing.T) {
 	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pingmon.db"))
 	if err != nil {

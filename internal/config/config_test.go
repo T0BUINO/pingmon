@@ -30,3 +30,17 @@ func TestLoadAgentInvalidIntegerReturnsError(t *testing.T) {
 		t.Fatalf("LoadAgent error = %v, want field-specific integer error", err)
 	}
 }
+
+func TestLoadAgentProbeConcurrency(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.toml")
+	if err := os.WriteFile(path, []byte("probe_concurrency = 7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadAgent(path, "toml")
+	if err != nil {
+		t.Fatalf("LoadAgent: %v", err)
+	}
+	if cfg.ProbeConcurrency != 7 {
+		t.Fatalf("ProbeConcurrency = %d, want 7", cfg.ProbeConcurrency)
+	}
+}

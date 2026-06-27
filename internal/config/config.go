@@ -33,6 +33,7 @@ type AgentConfig struct {
 	SupervisorURL       string `json:"supervisor_url"`
 	AgentName           string `json:"agent_name"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds"`
+	ProbeConcurrency    int    `json:"probe_concurrency"`
 	PublicIPv4URL       string `json:"public_ipv4_url"`
 	PublicIPv6URL       string `json:"public_ipv6_url"`
 }
@@ -69,6 +70,7 @@ func DefaultAgentConfig() AgentConfig {
 		SupervisorURL:       "http://127.0.0.1:8080",
 		AgentName:           host,
 		PollIntervalSeconds: 30,
+		ProbeConcurrency:    20,
 		PublicIPv4URL:       "https://api-ipv4.ip.sb/ip",
 		PublicIPv6URL:       "https://api-ipv6.ip.sb/ip",
 	}
@@ -122,6 +124,9 @@ func LoadAgent(path, format string) (AgentConfig, error) {
 	}
 	if cfg.PollIntervalSeconds <= 0 {
 		cfg.PollIntervalSeconds = 30
+	}
+	if cfg.ProbeConcurrency <= 0 {
+		cfg.ProbeConcurrency = 20
 	}
 	if cfg.AgentName == "" {
 		cfg.AgentName = DefaultAgentConfig().AgentName
@@ -279,6 +284,12 @@ func parseAgentTOML(input string, cfg *AgentConfig) error {
 				return fmt.Errorf("line %d: %w", lineNumber, err)
 			}
 			cfg.PollIntervalSeconds = n
+		case "probe_concurrency":
+			n, err := parseInt(key, value)
+			if err != nil {
+				return fmt.Errorf("line %d: %w", lineNumber, err)
+			}
+			cfg.ProbeConcurrency = n
 		case "public_ipv4_url":
 			cfg.PublicIPv4URL = parseString(value)
 		case "public_ipv6_url":

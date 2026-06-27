@@ -73,6 +73,7 @@ type agentStatusView struct {
 }
 
 const resultsCacheTTL = 2 * time.Second
+const resultsCacheMaxEntries = 256
 const dashboardSessionLifetime = 12 * time.Hour
 
 var websocketUpgrader = websocket.Upgrader{
@@ -126,7 +127,7 @@ func main() {
 		store:        store,
 		tpl:          tpl,
 		hub:          newWebsocketHub(),
-		resultsCache: newResultsCache(resultsCacheTTL),
+		resultsCache: newResultsCache(resultsCacheTTL, resultsCacheMaxEntries),
 		authKey:      authKey,
 	}
 	go s.startRetentionCleaner()
@@ -154,6 +155,7 @@ func main() {
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      2 * time.Minute,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 	log.Fatal(httpServer.ListenAndServe())
 }
@@ -225,6 +227,7 @@ func (s *server) handleReport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.resultsCache.clear()
 	s.hub.broadcastJSON(websocketEvent{Type: "results", Results: saved})
 	limit := s.cfg.FailureThreshold + 1
 	seenTargets := make(map[string]bool, len(saved))
@@ -488,7 +491,19 @@ func (s *server) writeDashboardResults(w http.ResponseWriter, selectedRange, age
 	since := time.Now().Add(-rangeDuration(selectedRange))
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "private, max-age=5")
-	s.serveStreamDirect(w, since, agent)
+	cacheKey := resultsCacheKey{selectedRange: selectedRange, agent: agent, dashboard: true}
+	if data, ok := s.resultsCache.get(cacheKey); ok {
+		writeJSONBytes(w, data)
+		return
+	}
+	data, err := s.dashboardResultsData(since, agent)
+	if err != nil {
+		log.Printf("stream dashboard results: %v", err)
+		http.Error(w, "stream dashboard results", http.StatusInternalServerError)
+		return
+	}
+	s.resultsCache.set(cacheKey, data)
+	writeJSONBytes(w, data)
 }
 
 func (s *server) streamResultsSince(since time.Time, agent string, fn func(model.Result) error) error {
@@ -630,7 +645,10 @@ func (h *websocketHub) runWriter(c *wsClient) {
 }
 
 func (h *websocketHub) broadcast(message string) {
-	payload := []byte(message)
+	h.broadcastBytes([]byte(message))
+}
+
+func (h *websocketHub) broadcastBytes(payload []byte) {
 	h.mu.Lock()
 	clients := make([]*wsClient, 0, len(h.clients))
 	for c := range h.clients {
@@ -654,7 +672,7 @@ func (h *websocketHub) broadcastJSON(event websocketEvent) {
 		h.broadcast("refresh")
 		return
 	}
-	h.broadcast(string(payload))
+	h.broadcastBytes(payload)
 }
 
 func (s *server) requireDashboardAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -808,9 +826,6 @@ func (s *server) cleanOldData() {
 	if rolled > 0 || deletedRaw > 0 || deletedRollups > 0 {
 		s.resultsCache.clear()
 		log.Printf("retention cleanup rolled=%d deleted_raw=%d deleted_rollups=%d", rolled, deletedRaw, deletedRollups)
-		if err := s.store.Vacuum(); err != nil {
-			log.Printf("retention vacuum failed: %v", err)
-		}
 	}
 }
 
@@ -831,11 +846,19 @@ func gzipHandler(next http.Handler) http.Handler {
 		}
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Add("Vary", "Accept-Encoding")
-		gz := gzip.NewWriter(w)
-		defer gz.Close()
+		gz := gzipWriterPool.Get().(*gzip.Writer)
+		gz.Reset(w)
+		defer func() {
+			_ = gz.Close()
+			gzipWriterPool.Put(gz)
+		}()
 		next.ServeHTTP(&gzipResponseWriter{Writer: gz, ResponseWriter: w}, r)
 	})
 }
+
+var gzipWriterPool = sync.Pool{New: func() any {
+	return gzip.NewWriter(io.Discard)
+}}
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -866,6 +889,7 @@ func staticAsset(contentType, content string) http.HandlerFunc {
 type resultsCacheKey struct {
 	selectedRange string
 	agent         string
+	dashboard     bool
 }
 
 type resultsCacheEntry struct {
@@ -874,15 +898,21 @@ type resultsCacheEntry struct {
 }
 
 type resultsCache struct {
-	mu      sync.RWMutex
-	ttl     time.Duration
-	entries map[resultsCacheKey]resultsCacheEntry
+	mu         sync.RWMutex
+	ttl        time.Duration
+	maxEntries int
+	entries    map[resultsCacheKey]resultsCacheEntry
 }
 
-func newResultsCache(ttl time.Duration) *resultsCache {
+func newResultsCache(ttl time.Duration, maxEntries ...int) *resultsCache {
+	max := resultsCacheMaxEntries
+	if len(maxEntries) > 0 {
+		max = maxEntries[0]
+	}
 	return &resultsCache{
-		ttl:     ttl,
-		entries: make(map[resultsCacheKey]resultsCacheEntry),
+		ttl:        ttl,
+		maxEntries: max,
+		entries:    make(map[resultsCacheKey]resultsCacheEntry),
 	}
 }
 
@@ -913,9 +943,25 @@ func (c *resultsCache) set(key resultsCacheKey, data []byte) {
 		return
 	}
 	c.mu.Lock()
+	now := time.Now()
+	for existingKey, entry := range c.entries {
+		if !now.Before(entry.expiresAt) {
+			delete(c.entries, existingKey)
+		}
+	}
+	if c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
+		var oldestKey resultsCacheKey
+		var oldestExpiry time.Time
+		for existingKey, entry := range c.entries {
+			if oldestExpiry.IsZero() || entry.expiresAt.Before(oldestExpiry) {
+				oldestKey, oldestExpiry = existingKey, entry.expiresAt
+			}
+		}
+		delete(c.entries, oldestKey)
+	}
 	c.entries[key] = resultsCacheEntry{
 		data:      append([]byte(nil), data...),
-		expiresAt: time.Now().Add(c.ttl),
+		expiresAt: now.Add(c.ttl),
 	}
 	c.mu.Unlock()
 }

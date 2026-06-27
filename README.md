@@ -62,11 +62,18 @@ agent 配置见 [`configs/agent.toml`](configs/agent.toml)：
 supervisor_url = "http://127.0.0.1:8080"
 agent_name = "agent-1"
 poll_interval_seconds = 30
+probe_concurrency = 20
 public_ipv4_url = "https://api-ipv4.ip.sb/ip"
 public_ipv6_url = "https://api-ipv6.ip.sb/ip"
 ```
 
-agent 优先采用 supervisor 下发的 `schedule_seconds`；拉取失败、任务为空或周期无效时，回退到 `poll_interval_seconds`。公网 IP 查询失败不会中断探测，supervisor 会使用 HTTP 来源地址兜底。
+agent 优先采用 supervisor 下发的 `schedule_seconds`；拉取失败、任务为空或周期无效时，回退到 `poll_interval_seconds`。`probe_concurrency` 默认是 `20`，用于限制同时执行的 TCP 目标探测数。公网 IP 查询结果会缓存 15 分钟；查询失败不会中断探测，有旧缓存时会继续复用，否则 supervisor 会使用 HTTP 来源地址兜底。
+
+## 1C1G / 低资源部署建议
+
+在 1 核 1 GiB、同时还运行其他服务的机器上，建议给 supervisor 和 agent 设置 `GOMAXPROCS=1`，并按同机服务余量设置 `GOMEMLIMIT=128MiB` 或 `192MiB`。这可以降低 Go 运行时瞬时占满单核和内存增长过快的概率。
+
+配置方面可从以下保守值开始：将 `raw_retention_days` 调为 `7` 或 `14`，将 `[params].schedule_seconds` 调为 `60`，并将 `[params].count` 调为 `1` 或 `2`。agent 的 `probe_concurrency` 默认值为 `20`；目标很多或网络超时较长时可继续下调，以减少同时存在的连接和 goroutine。SQLite 自动保留清理不会执行完整 `VACUUM`；如确有回收文件空间的需求，应在维护窗口显式执行。
 
 ### 命令行参数
 

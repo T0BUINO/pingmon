@@ -20,6 +20,16 @@ import (
 var supervisorHTTPClient = &http.Client{Timeout: 10 * time.Second}
 var publicIPHTTPClient = &http.Client{Timeout: 3 * time.Second}
 
+const agentIPCacheTTL = 15 * time.Minute
+
+var agentIPCache struct {
+	sync.Mutex
+	ipv4URL   string
+	ipv6URL   string
+	value     string
+	expiresAt time.Time
+}
+
 func main() {
 	supervisor := flag.String("supervisor", "", "optional supervisor base URL override, for example http://127.0.0.1:8080")
 	configPath := flag.String("config", "", "optional JSON or TOML agent config")
@@ -60,27 +70,51 @@ func runCycle(supervisor string, cfg config.AgentConfig) (int, error) {
 		return cfg.PollIntervalSeconds, err
 	}
 	sleepSeconds := nextPollInterval(tasks, cfg.PollIntervalSeconds)
-	var wg sync.WaitGroup
-	results := make(chan model.Result, len(tasks))
-	for _, task := range tasks {
-		task := task
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results <- tcpPing(cfg.AgentName, task)
-		}()
-	}
-	wg.Wait()
-	close(results)
-	batch := make([]model.Result, 0, len(tasks))
-	for result := range results {
-		result.AgentIP = agentIP
-		batch = append(batch, result)
-	}
+	batch := probeTasks(cfg, tasks, agentIP, tcpPing)
 	if len(batch) == 0 {
 		return sleepSeconds, nil
 	}
 	return sleepSeconds, uploadResults(supervisor, batch)
+}
+
+func probeTasks(cfg config.AgentConfig, tasks []model.Task, agentIP string, probe func(string, model.Task) model.Result) []model.Result {
+	concurrency := cfg.ProbeConcurrency
+	if concurrency <= 0 {
+		concurrency = 20
+	}
+	if concurrency > len(tasks) {
+		concurrency = len(tasks)
+	}
+	if concurrency == 0 {
+		return nil
+	}
+	jobs := make(chan model.Task)
+	results := make(chan model.Result, len(tasks))
+	var wg sync.WaitGroup
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range jobs {
+				result := probe(cfg.AgentName, task)
+				result.AgentIP = agentIP
+				results <- result
+			}
+		}()
+	}
+	go func() {
+		for _, task := range tasks {
+			jobs <- task
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+	batch := make([]model.Result, 0, len(tasks))
+	for result := range results {
+		batch = append(batch, result)
+	}
+	return batch
 }
 
 func nextPollInterval(tasks []model.Task, fallback int) int {
@@ -124,6 +158,20 @@ func fetchTasks(supervisor, agent, agentIP string) ([]model.Task, error) {
 }
 
 func fetchAgentIP(cfg config.AgentConfig) string {
+	now := time.Now()
+	agentIPCache.Lock()
+	if agentIPCache.ipv4URL == cfg.PublicIPv4URL && agentIPCache.ipv6URL == cfg.PublicIPv6URL &&
+		agentIPCache.value != "" && now.Before(agentIPCache.expiresAt) {
+		value := agentIPCache.value
+		agentIPCache.Unlock()
+		return value
+	}
+	stale := ""
+	if agentIPCache.ipv4URL == cfg.PublicIPv4URL && agentIPCache.ipv6URL == cfg.PublicIPv6URL {
+		stale = agentIPCache.value
+	}
+	agentIPCache.Unlock()
+
 	type lookup struct {
 		version int
 		ip      string
@@ -144,17 +192,30 @@ func fetchAgentIP(cfg config.AgentConfig) string {
 			ipv6 = result.ip
 		}
 	}
+	value := ""
 	switch {
 	case ipv4 != "" && ipv6 != "":
-		return ipv4 + " / " + ipv6
+		value = ipv4 + " / " + ipv6
 	case ipv4 != "":
-		return ipv4
+		value = ipv4
 	case ipv6 != "":
-		return ipv6
+		value = ipv6
 	default:
 		log.Printf("public ip lookup failed for both IPv4 and IPv6 endpoints")
-		return ""
+		if stale != "" {
+			agentIPCache.Lock()
+			agentIPCache.expiresAt = now.Add(agentIPCacheTTL)
+			agentIPCache.Unlock()
+		}
+		return stale
 	}
+	agentIPCache.Lock()
+	agentIPCache.ipv4URL = cfg.PublicIPv4URL
+	agentIPCache.ipv6URL = cfg.PublicIPv6URL
+	agentIPCache.value = value
+	agentIPCache.expiresAt = now.Add(agentIPCacheTTL)
+	agentIPCache.Unlock()
+	return value
 }
 
 func fetchPublicIP(endpoint string) (string, error) {

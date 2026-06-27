@@ -55,6 +55,8 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	store := &SQLiteStore{db: db}
 	if err := store.init(); err != nil {
 		_ = db.Close()
@@ -68,8 +70,8 @@ func sqliteDSN(path string) string {
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "synchronous(NORMAL)")
-	q.Add("_pragma", "temp_store(MEMORY)")
-	q.Add("_pragma", "cache_size(-65536)")
+	q.Add("_pragma", "temp_store(FILE)")
+	q.Add("_pragma", "cache_size(-8192)")
 	q.Add("_pragma", "wal_autocheckpoint(1000)")
 	return path + "?" + q.Encode()
 }
@@ -247,6 +249,14 @@ func (s *SQLiteStore) SaveResults(results []model.Result, seenAt time.Time) ([]m
 		return nil, err
 	}
 	defer tx.Rollback()
+	insertResult, err := tx.Prepare(`
+INSERT INTO results (
+	series_id, checked_at, success_count, failure_count, average_latency_ms, success_rate, error
+) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return nil, err
+	}
+	defer insertResult.Close()
 	heartbeats := make(map[string]string, len(results))
 	for i := range results {
 		result := results[i]
@@ -258,10 +268,7 @@ func (s *SQLiteStore) SaveResults(results []model.Result, seenAt time.Time) ([]m
 		if err != nil {
 			return nil, err
 		}
-		if _, err := tx.Exec(`
-INSERT INTO results (
-	series_id, checked_at, success_count, failure_count, average_latency_ms, success_rate, error
-) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		if _, err := insertResult.Exec(
 			seriesID, result.CheckedAt.UTC().Format(time.RFC3339Nano), result.SuccessCount,
 			result.FailureCount, result.AverageLatencyMS, result.SuccessRate, result.Error); err != nil {
 			return nil, err
@@ -467,12 +474,33 @@ func (s *SQLiteStore) Vacuum() error {
 }
 
 func (s *SQLiteStore) ConsecutiveFailures(targetName, address string, port int, limit int) (int, error) {
-	query := `
-SELECT r.success_count FROM results r
-JOIN result_series rs ON rs.id = r.series_id
-WHERE rs.target_name = ? AND rs.address = ? AND rs.port = ?
-ORDER BY r.checked_at DESC`
-	args := []any{targetName, address, port}
+	seriesRows, err := s.db.Query(`
+SELECT id FROM result_series
+WHERE target_name = ? AND address = ? AND port = ?`, targetName, address, port)
+	if err != nil {
+		return 0, err
+	}
+	seriesIDs := make([]int64, 0, 4)
+	for seriesRows.Next() {
+		var id int64
+		if err := seriesRows.Scan(&id); err != nil {
+			seriesRows.Close()
+			return 0, err
+		}
+		seriesIDs = append(seriesIDs, id)
+	}
+	err = seriesRows.Err()
+	seriesRows.Close()
+	if err != nil || len(seriesIDs) == 0 {
+		return 0, err
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(seriesIDs)), ",")
+	query := `SELECT success_count FROM results WHERE series_id IN (` + placeholders + `)
+ORDER BY checked_at DESC, id DESC`
+	args := make([]any, len(seriesIDs), len(seriesIDs)+1)
+	for i, id := range seriesIDs {
+		args[i] = id
+	}
 	if limit > 0 {
 		query += "\nLIMIT ?"
 		args = append(args, limit)

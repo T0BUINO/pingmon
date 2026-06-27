@@ -3,11 +3,9 @@ package main
 // Dashboard result streaming and bounded chart aggregation.
 
 import (
-	"bufio"
-	"encoding/json"
-	"log"
-	"net/http"
+	"bytes"
 	"sort"
+	"strconv"
 	"time"
 
 	"pingmon/internal/model"
@@ -25,53 +23,56 @@ func min(a, b int) int {
 type agentRow struct {
 	checkedAt int64
 	data      []byte
+	result    model.Result
+	seriesKey string
+	latency   float64
 }
 
-func (s *server) serveStreamDirect(w http.ResponseWriter, since time.Time, agent string) {
+func newAgentRow(result model.Result) (agentRow, error) {
+	line, err := marshalDashboardResult(result)
+	if err != nil {
+		return agentRow{}, err
+	}
+	return agentRow{
+		checkedAt: result.CheckedAt.UnixNano(),
+		data:      line,
+		result:    result,
+		seriesKey: result.Agent + "\x00" + result.TargetName + "\x00" + result.Address + "\x00" + strconv.Itoa(result.Port),
+		latency:   result.AverageLatencyMS,
+	}, nil
+}
+
+func (s *server) dashboardResultsData(since time.Time, agent string) ([]byte, error) {
 	rows := make([]agentRow, 0, maxChartPoints*2)
 	if err := s.streamResultsSince(since, agent, func(result model.Result) error {
-		line, err := marshalDashboardResult(result)
+		row, err := newAgentRow(result)
 		if err != nil {
 			return err
 		}
-		rows = append(rows, agentRow{
-			checkedAt: result.CheckedAt.UnixNano(),
-			data:      append([]byte(nil), line...),
-		})
+		rows = append(rows, row)
 		if len(rows) >= maxChartPoints*2 {
 			rows = aggregateRowsByTime(rows, since, maxChartPoints)
 		}
 		return nil
 	}); err != nil {
-		log.Printf("stream dashboard results: %v", err)
-		http.Error(w, "stream dashboard results", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 	rows = aggregateRowsByTime(rows, since, maxChartPoints)
-	writeRows(w, rows)
+	return marshalRows(rows), nil
 }
 
-func writeRows(w http.ResponseWriter, rows []agentRow) {
-	bw := bufio.NewWriter(w)
-	if _, err := bw.Write([]byte("[")); err != nil {
-		return
-	}
+func marshalRows(rows []agentRow) []byte {
+	var buf bytes.Buffer
+	buf.Grow(len(rows)*128 + 2)
+	buf.WriteByte('[')
 	for i := range rows {
 		if i > 0 {
-			if _, err := bw.Write([]byte(",")); err != nil {
-				return
-			}
+			buf.WriteByte(',')
 		}
-		if _, err := bw.Write(rows[i].data); err != nil {
-			return
-		}
+		buf.Write(rows[i].data)
 	}
-	if _, err := bw.Write([]byte("]")); err != nil {
-		return
-	}
-	if err := bw.Flush(); err != nil {
-		log.Printf("flush cache response: %v", err)
-	}
+	buf.WriteByte(']')
+	return buf.Bytes()
 }
 
 func aggregateRowsByTime(rows []agentRow, since time.Time, targetCount int) []agentRow {
@@ -90,7 +91,7 @@ func aggregateRowsByTime(rows []agentRow, since time.Time, targetCount int) []ag
 	seriesByKey := make(map[string]int)
 	seriesList := make([]series, 0)
 	for _, row := range rows {
-		key := aggregationSeriesKey(row.data)
+		key := row.seriesKey
 		index, ok := seriesByKey[key]
 		if !ok {
 			index = len(seriesList)
@@ -151,16 +152,6 @@ func aggregateRowsByTime(rows []agentRow, since time.Time, targetCount int) []ag
 	return result
 }
 
-func aggregationSeriesKey(data []byte) string {
-	var parts []json.RawMessage
-	if err := json.Unmarshal(data, &parts); err != nil || len(parts) < 5 {
-		return ""
-	}
-	// Match the browser's target identity, with agent included for safety if
-	// this helper is reused for a multi-agent response later.
-	return string(parts[0]) + "\x00" + string(parts[2]) + "\x00" + string(parts[3]) + "\x00" + string(parts[4])
-}
-
 func aggregateSingleSeries(rows []agentRow, since time.Time, targetCount int) []agentRow {
 	n := len(rows)
 	if n <= targetCount {
@@ -199,7 +190,7 @@ func aggregateSingleSeries(rows []agentRow, since time.Time, targetCount int) []
 
 		var sumLatency float64
 		var validCount int
-		var templateData []byte
+		var template model.Result
 		var fallback agentRow
 		var hasFallback bool
 		var bucketNewest int64
@@ -207,14 +198,11 @@ func aggregateSingleSeries(rows []agentRow, since time.Time, targetCount int) []
 
 		bucketIdx := startIdx
 		for bucketIdx < n && rows[bucketIdx].checkedAt >= bucketStart {
-			lat, ok := extractLatency(rows[bucketIdx].data)
-			if ok {
-				if validCount == 0 {
-					templateData = rows[bucketIdx].data
-				}
-				sumLatency += lat
-				validCount++
+			if validCount == 0 {
+				template = rows[bucketIdx].result
 			}
+			sumLatency += rows[bucketIdx].latency
+			validCount++
 			if !hasFallback {
 				fallback = rows[bucketIdx]
 				hasFallback = true
@@ -228,11 +216,13 @@ func aggregateSingleSeries(rows []agentRow, since time.Time, targetCount int) []
 
 		if validCount > 0 {
 			checkedAt := bucketOldest + (bucketNewest-bucketOldest)/2
-			avgData := buildAggregatedData(templateData, sumLatency/float64(validCount), checkedAt)
-			result = append(result, agentRow{
-				checkedAt: checkedAt,
-				data:      avgData,
-			})
+			template.CheckedAt = time.Unix(0, checkedAt).UTC()
+			template.SuccessCount = 1
+			template.AverageLatencyMS = sumLatency / float64(validCount)
+			row, err := newAgentRow(template)
+			if err == nil {
+				result = append(result, row)
+			}
 		} else if hasFallback {
 			result = append(result, fallback)
 		}
@@ -244,33 +234,4 @@ func aggregateSingleSeries(rows []agentRow, since time.Time, targetCount int) []
 		}
 	}
 	return result
-}
-
-func extractLatency(data []byte) (float64, bool) {
-	var parts []interface{}
-	if err := json.Unmarshal(data, &parts); err != nil {
-		return 0, false
-	}
-	if len(parts) < 10 {
-		return 0, false
-	}
-	lat, ok := parts[9].(float64)
-	return lat, ok
-}
-
-func buildAggregatedData(original []byte, avgLatency float64, checkedAt int64) []byte {
-	var parts []interface{}
-	if err := json.Unmarshal(original, &parts); err != nil {
-		return original
-	}
-	if len(parts) >= 10 {
-		parts[6] = time.Unix(0, checkedAt).UTC().Format(time.RFC3339Nano)
-		parts[7] = float64(1)
-		parts[9] = avgLatency
-	}
-	data, err := json.Marshal(parts)
-	if err != nil {
-		return original
-	}
-	return data
 }
