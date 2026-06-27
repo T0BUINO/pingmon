@@ -228,6 +228,7 @@ function normalizeResultRow(row) {
         this.resizeObserver.observe(this.container);
         this.container.addEventListener('pointermove', event => this.scheduleTooltip(event));
         this.container.addEventListener('pointerleave', () => hideChartTooltip(this));
+        this.container.addEventListener('pointercancel', () => hideChartTooltip(this));
         if (!this.options.deferUpdate) this.update();
       }
       destroy() {

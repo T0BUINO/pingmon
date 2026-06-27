@@ -101,6 +101,18 @@ func TestDashboardAssetsAreSeparated(t *testing.T) {
 	}
 }
 
+func TestMiniChartTouchGesturePolicy(t *testing.T) {
+	if !strings.Contains(dashboardCSS, ".mini-chart.chart-surface { height: 86px; touch-action: pan-y; }") {
+		t.Fatal("mini chart does not preserve vertical scrolling while reserving horizontal gestures")
+	}
+	if strings.Contains(dashboardCSS, ".mini-chart.chart-surface { height: 86px; touch-action: none;") {
+		t.Fatal("mini chart blocks vertical page scrolling")
+	}
+	if !strings.Contains(dashboardJS, "addEventListener('pointercancel', () => hideChartTooltip(this))") {
+		t.Fatal("chart does not clear tooltip state after a cancelled pointer gesture")
+	}
+}
+
 func TestWebSocketBroadcast(t *testing.T) {
 	s := &server{
 		cfg:     config.Config{DashboardUser: "admin", DashboardPassword: "secret"},
