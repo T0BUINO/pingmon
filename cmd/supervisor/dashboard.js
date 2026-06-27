@@ -1108,10 +1108,6 @@ function normalizeResultRow(row) {
       subtitle.innerHTML = '最后在线：' + lastSeenText(statusInfo, summary) + '<span class="live-badge" id="liveState">实时</span>' + agentStateBadgeHTML(state);
       wrap.append(metric('节点名称', (summary && summary.latest.agent) || (statusInfo && statusInfo.agent) || selectedAgent));
       wrap.append(metric('节点 IP', agentIPText(statusInfo, summary)));
-      const connectivityText = statusInfo && statusInfo.connectivity === 'failed'
-        ? '异常（连续 ' + statusInfo.consecutive_failures + ' 轮）'
-        : statusInfo && statusInfo.connectivity === 'checking' ? '检测中' : '正常';
-      wrap.append(metric('网络连通性', connectivityText));
       wrap.append(metric('监测目标', summary ? String(summary.targetCount) : '0'));
       wrap.append(metric('最后在线', lastSeenText(statusInfo, summary)));
     }
