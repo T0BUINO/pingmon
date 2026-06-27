@@ -14,17 +14,17 @@
     let chartFullRange = null;
     let chartViewRange = null;
     let targetVisibility = new Map();
-    let renderDashboardTimer = null;
-    let pendingDashboardRows = null;
+    let liveRefreshTimer = null;
+    let dashboardRefreshSequence = 0;
     let pinchStart = null;
     let panStart = null;
     document.querySelectorAll('.local-time').forEach(cell => {
       const date = new Date(cell.dataset.time);
       if (!Number.isNaN(date.getTime())) cell.textContent = date.toLocaleString();
     });
-    async function loadResults() {
-      const agentParam = selectedAgent ? '&agent=' + encodeURIComponent(selectedAgent) : '';
-      const res = await fetch('/api/results?dashboard=1&range=' + encodeURIComponent(selectedRange) + agentParam);
+    async function loadResults(agent = selectedAgent) {
+      const agentParam = agent ? '&agent=' + encodeURIComponent(agent) : '';
+      const res = await fetch('/api/results?dashboard=1&range=' + encodeURIComponent(selectedRange) + agentParam, {cache: 'no-store'});
       if (!res.ok) throw new Error('结果数据加载失败，状态码：' + res.status);
       const rows = await res.json();
       const normalized = normalizeResultRows(rows);
@@ -935,12 +935,13 @@ function normalizeResultRow(row) {
     function destroyMiniChartSurface(surface) {
       if (!surface) return;
       if (miniChartObserver) miniChartObserver.unobserve(surface);
+      surface.__chartRequest = (surface.__chartRequest || 0) + 1;
       if (surface.__miniChart) {
         miniCharts.delete(surface.__miniChart);
         surface.__miniChart.destroy();
         delete surface.__miniChart;
       }
-      delete surface.__chartRows;
+      delete surface.__chartAgent;
     }
     function renderMiniChart(surface, rows) {
       if (!surface.isConnected) return;
@@ -959,20 +960,28 @@ function normalizeResultRow(row) {
       miniCharts.add(miniChart);
       miniChart.update();
     }
-    function queueMiniChart(surface, rows) {
+    async function loadMiniChart(surface, agent) {
+      if (!surface || !surface.isConnected) return;
+      const request = (surface.__chartRequest || 0) + 1;
+      surface.__chartRequest = request;
+      try {
+        const rows = await loadResults(agent);
+        if (!surface.isConnected || surface.__chartRequest !== request || surface.closest('.agent-card')?.dataset.agent !== agent) return;
+        renderMiniChart(surface, rows);
+      } catch (err) {
+        if (!surface.isConnected || surface.__chartRequest !== request || surface.__miniChart) return;
+        surface.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px">加载失败</div>';
+        console.warn(err);
+      }
+    }
+    function queueMiniChart(surface, agent) {
       if (!surface) return;
       if (surface.__miniChart) {
-        const chartData = buildDatasets(rows);
-        if (!chartData.datasets.length) {
-          destroyMiniChartSurface(surface);
-          surface.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px">暂无数据</div>';
-          return;
-        }
-        surface.__miniChart.setData(chartData);
+        loadMiniChart(surface, agent);
         return;
       }
       if (!('IntersectionObserver' in window)) {
-        scheduleLowPriority(() => renderMiniChart(surface, rows));
+        scheduleLowPriority(() => loadMiniChart(surface, agent));
         return;
       }
       if (!miniChartObserver) {
@@ -980,13 +989,13 @@ function normalizeResultRow(row) {
           entries.forEach(entry => {
             if (!entry.isIntersecting) return;
             if (miniChartObserver) miniChartObserver.unobserve(entry.target);
-            const rows = entry.target.__chartRows || [];
-            delete entry.target.__chartRows;
-            scheduleLowPriority(() => renderMiniChart(entry.target, rows));
+            const agent = entry.target.__chartAgent || '';
+            delete entry.target.__chartAgent;
+            scheduleLowPriority(() => loadMiniChart(entry.target, agent));
           });
         }, {rootMargin: '320px 0px'});
       }
-      surface.__chartRows = rows;
+      surface.__chartAgent = agent;
       miniChartObserver.observe(surface);
     }
     function renderLanding(rows) {
@@ -1049,7 +1058,7 @@ function normalizeResultRow(row) {
         wrap.appendChild(card);
         const chartSurface = card.querySelector('.mini-chart');
         if (agentRows.length) {
-          queueMiniChart(chartSurface, agentRows);
+          queueMiniChart(chartSurface, agent);
         } else if (cacheState === 'building' || cacheState === 'none') {
           destroyMiniChartSurface(chartSurface);
           chartSurface.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px">缓存生成中&hellip;</div>';
@@ -1214,39 +1223,23 @@ function normalizeResultRow(row) {
       renderLabelFilters(currentRows);
       updateDetailChart(currentRows);
     }
-    function scheduleDashboardRender(rows) {
-      pendingDashboardRows = rows;
-      if (renderDashboardTimer !== null) return;
-      renderDashboardTimer = window.setTimeout(() => {
-        renderDashboardTimer = null;
-        const rows = pendingDashboardRows;
-        pendingDashboardRows = null;
-        const scrollX = window.scrollX;
-        const scrollY = window.scrollY;
-        renderDashboardRows(rows);
-        requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
-      }, 120);
-    }
     async function refreshDashboard() {
+      const sequence = ++dashboardRefreshSequence;
       const scrollX = window.scrollX;
       const scrollY = window.scrollY;
       const [rows, agents] = await Promise.all([loadResults(), loadAgents()]);
+      if (sequence !== dashboardRefreshSequence) return;
       currentAgents = agents;
       _agentHash = agentHash(agents);
       renderDashboardRows(rows);
       requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
     }
-    async function applyLiveResults(rows) {
-      rows = normalizeResultRows(rows);
-      if (!rows.length) return;
-      currentRows = mergeRows(currentRows, rows);
-      try {
-        currentAgents = await loadAgents();
-        _agentHash = agentHash(currentAgents);
-      } catch (err) {
-        console.warn(err);
-      }
-      scheduleDashboardRender(currentRows);
+    function scheduleLiveRefresh() {
+      clearTimeout(liveRefreshTimer);
+      liveRefreshTimer = window.setTimeout(() => {
+        liveRefreshTimer = null;
+        refreshDashboard().catch(handleRefreshError);
+      }, 120);
     }
     function handleRefreshError(err) {
       const targetToggles = document.getElementById('targetToggles');
@@ -1401,7 +1394,7 @@ function normalizeResultRow(row) {
         }
         try {
           const message = JSON.parse(event.data);
-          if (message.type === 'results') applyLiveResults(message.results);
+          if (message.type === 'results') scheduleLiveRefresh();
         } catch (err) {
           console.warn('未知实时消息', err);
         }

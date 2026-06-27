@@ -169,6 +169,19 @@ func TestDashboardAssetsAreSeparated(t *testing.T) {
 	}
 }
 
+func TestLandingPageExplainsRangeLimit(t *testing.T) {
+	for _, want := range []string{
+		`class="landing-range-note"`,
+		`role="note"`,
+		"节点总览最多展示最近 24 小时的数据，进入节点详情可查看更多时间范围。",
+		".landing-range-badge",
+	} {
+		if !strings.Contains(dashboardHTML+dashboardCSS, want) {
+			t.Fatalf("dashboard assets missing landing range reminder %q", want)
+		}
+	}
+}
+
 func TestMiniChartTouchGesturePolicy(t *testing.T) {
 	if !strings.Contains(dashboardCSS, ".mini-chart.chart-surface { height: 86px; touch-action: pan-y; }") {
 		t.Fatal("mini chart does not preserve vertical scrolling while reserving horizontal gestures")
@@ -178,6 +191,24 @@ func TestMiniChartTouchGesturePolicy(t *testing.T) {
 	}
 	if !strings.Contains(dashboardJS, "addEventListener('pointercancel', () => hideChartTooltip(this))") {
 		t.Fatal("chart does not clear tooltip state after a cancelled pointer gesture")
+	}
+}
+
+func TestDashboardChartsUseConsistentAggregatedData(t *testing.T) {
+	for _, want := range []string{
+		"async function loadResults(agent = selectedAgent)",
+		"agentParam, {cache: 'no-store'}",
+		"const rows = await loadResults(agent);",
+		"queueMiniChart(chartSurface, agent);",
+		"if (message.type === 'results') scheduleLiveRefresh();",
+		"if (sequence !== dashboardRefreshSequence) return;",
+	} {
+		if !strings.Contains(dashboardJS, want) {
+			t.Fatalf("dashboard JavaScript missing consistent chart data behavior %q", want)
+		}
+	}
+	if strings.Contains(dashboardJS, "applyLiveResults(message.results)") {
+		t.Fatal("dashboard still mixes raw websocket points into aggregated chart data")
 	}
 }
 
